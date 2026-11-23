@@ -1,6 +1,7 @@
 # Nautilus Logo Assets
 
-The README features [the holographic comic mascot](nautilus-mascot.png). Bands of cyan, pink and gold
+The README pairs the [holographic comic mascot](nautilus-mascot.png) with a
+[Nautilus wordmark](nautilus-wordmark.png). Bands of cyan, pink and gold
 catch the ribs of its spiral shell. Each chamber resembles a cargo container,
 a nod to the isolated workloads Nautilus runs. Use the transparent PNG for the illustrated mark
 and the compact SVG marks below for smaller sizes.
@@ -10,6 +11,7 @@ and the compact SVG marks below for smaller sizes.
 | File | Use | Size |
 |---|---|---|
 | `nautilus-mascot.png` | Illustrated project logo for the README and docs | 1254 × 1254 PNG |
+| `nautilus-wordmark.png` | Transparent project name, used beside the mascot or on its own | 1086 × 362 PNG |
 | `logo.svg` | Compact shell mark for light backgrounds | any (vector) |
 | `logo-dark.svg` | Dark backgrounds (salmon `#FF8A73`, septa `#1a1412`) | any (vector) |
 | `logo-icon.svg` | Banner/medium icon (same mark, 2.5 turns) | any (vector) |
@@ -25,6 +27,17 @@ The previous mascot illustration was restyled with ImageGen using this prompt.
 <summary>Full prompt</summary>
 
 > Restyle the attached Nautilus project mascot as a premium holographic manga sticker for a GitHub README. Keep its left-facing chambered nautilus silhouette, curious expressive eye, curled tentacles, and unmistakable spiral shell made of ribbed shipping-container chambers. Redraw it with sweeping, tapered midnight-indigo comic inks, a lively upward tilt, a turquoise face, and a confident little smile. Make the shell the focal point: polished holographic foil with broad curved bands of electric cyan, violet and hot pink, a few warm amber flashes and crisp pearly glints flowing across the ribs. Use bold cel-shadow shapes and a few restrained halftone patches in the shadows. Keep the spiral and face clear at 160 px. Clean contour with a narrow cool-pearl rim for both light and dark backgrounds. One centered mascot, square composition, small clear margin, transparent background. No words, letters, frame, scenery, floating particles or diffuse bloom.
+
+</details>
+
+## Wordmark generation
+
+The wordmark was generated with ImageGen and resized for the README.
+
+<details>
+<summary>Wordmark prompt</summary>
+
+> A standalone horizontal typographic logo for the open-source project Nautilus. Render precisely the single word “Nautilus” in title case, all eight letters in that order, capital N and lowercase autilus, with a clearly dotted i. Lettering is the entire image. Create custom, confident slightly forward-leaning comic display lettering with a large open-counter lowercase a, a flowing rhythm and a distinctive tapered cut at the terminals. The broad strokes carry a coherent holographic foil ribbon of luminous electric cyan, lavender, hot magenta and a few amber reflections. Deliberate dark-indigo ink outlines and a slender pearl highlight at the outer edge, crisp cel-shaded depth and highly legible letter shapes. This wordmark pairs with a cartoon nautilus with an iridescent cargo-chamber shell, but draw only the lettering here: no animal, no standalone icon, no detached shapes or tagline. Keep the overall silhouette compact and horizontal with an approximately 4:1 width-to-height ratio, a nearly straight baseline, all letters and outlines fully visible with a modest safety margin. Transparent canvas with genuine alpha, no background, mockup, aura or cast shadow. Legible as a 260px-wide GitHub README wordmark on white and midnight backgrounds.
 
 </details>
 

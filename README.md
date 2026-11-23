@@ -1,6 +1,7 @@
-# Nautilus
-
-<img src="docs/assets/nautilus-mascot.png" width="160" alt="A turquoise cartoon nautilus with a holographic spiral shell made of shipping containers">
+<h1>
+  <img src="docs/assets/nautilus-mascot.png" width="100" align="middle" alt="">
+  <img src="docs/assets/nautilus-wordmark.png" width="210" align="middle" alt="Nautilus">
+</h1>
 
 Nautilus is a Linux container runtime written in Rust. It implements the Kubernetes Container Runtime Interface (CRI v1) and runs both OCI containers and WebAssembly commands. Kubelet and the bundled CLI use the same Unix socket, so you can try either runtime on a single machine before using it with a cluster.
 
