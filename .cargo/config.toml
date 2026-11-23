@@ -1,0 +1,12 @@
+# Nautilus is a Linux-first runtime: libcontainer/wasmtime paths require Linux.
+# Default builds go to the GNU target so `cargo build` works on any Linux box
+# with the standard toolchain (no musl-gcc needed). Cross-compiling from macOS
+# or building a static binary: pass --target / CARGO_BUILD_TARGET explicitly.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

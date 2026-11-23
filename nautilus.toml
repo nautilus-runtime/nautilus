@@ -1,0 +1,169 @@
+# Nautilus 容器运行时默认配置文件
+# 此文件包含 Nautilus 的所有配置选项和默认值
+
+[runtime]
+# 运行时基本配置
+state_dir = "/var/lib/nautilus"              # 状态数据存储目录
+log_level = "info"                          # 日志级别: error, warn, info, debug, trace
+max_containers = 1000                       # 最大容器数量
+default_runtime = "runc"                    # 默认容器运行时
+runc_path = "/usr/bin/runc"
+worker_threads = 4                          # 工作线程数量
+
+[runtime.runc]
+# runc 运行时配置
+path = "/usr/bin/runc"                      # runc 二进制路径(仅 driver="exec" 时使用)
+root = "/run/nautilus/runc"                 # 容器状态根目录
+driver = "libcontainer"                     # libcontainer=进程内(默认);exec=子进程兜底
+systemd_cgroup = true                       # 使用 systemd cgroup 管理
+
+[runtime.sandboxes]
+# 多沙箱路由配置:CRI runtime_handler -> 隔离后端
+# 内置 handler:"runc"(OCI 容器)、"wasi"/"wasm"(进程内 wasmtime)
+default_handler = ""                    # 空 runtime_handler 请求使用的默认后端
+wasm_enabled = true                         # 注册 wasmtime WASM 后端
+
+[storage]
+registry_mirror = ""
+# 存储配置
+root_dir = "/var/lib/nautilus/storage"      # 存储根目录
+image_dir = "/var/lib/nautilus/images"      # 镜像存储目录
+container_dir = "/var/lib/nautilus/containers" # 容器存储目录
+tmp_dir = "/tmp/nautilus"                   # 临时文件目录
+max_image_size = "10GB"                     # 单个镜像最大大小
+gc_threshold = 0.8                          # 垃圾回收触发阈值
+cache_size = "512MB"                        # 存储缓存大小
+
+[storage.overlay]
+# OverlayFS 存储驱动配置
+mount_options = ["nodev"]                   # 挂载选项
+ignore_chown_errors = false                 # 忽略 chown 错误
+
+[storage.gc]
+# 垃圾回收配置
+enable = true                               # 启用垃圾回收
+interval = "1h"                             # 垃圾回收间隔
+threshold = 0.8                             # 磁盘使用率阈值
+max_unused_age = "24h"                      # 未使用资源最大保留时间
+
+[network]
+netns_dir = "/var/run/nautilus/netns"
+# 网络配置
+cni_config_dir = "/etc/cni/net.d"           # CNI 配置目录
+cni_bin_dir = "/opt/cni/bin"                # CNI 插件目录
+default_network = "bridge"                  # 默认网络类型
+bridge_name = "nautilus0"                   # 网桥名称
+subnet = "172.20.0.0/16"                    # 子网地址
+gateway = "172.20.0.1"                      # 网关地址
+
+[network.dns]
+# DNS 配置
+nameservers = ["8.8.8.8", "8.8.4.4"]       # DNS 服务器
+search_domains = ["cluster.local"]          # 搜索域
+options = ["ndots:5"]                       # DNS 选项
+
+[network.firewall]
+# 防火墙配置
+enable_iptables = true                      # 启用 iptables 规则
+masquerade = true                           # 启用 NAT 伪装
+
+[cri]
+# CRI 服务配置
+listen_address = "unix:///var/run/nautilus/nautilus.sock" # 监听地址
+max_concurrent_streams = 1000               # 最大并发流数量
+request_timeout = "30s"                     # 请求超时时间
+stream_idle_timeout = "4h"                  # 流空闲超时时间
+max_recv_message_size = "16MB"              # 最大接收消息大小
+max_send_message_size = "16MB"              # 最大发送消息大小
+
+[security]
+enabled = true
+selinux = false
+apparmor = false
+seccomp = false
+audit = false
+no_new_privileges = true
+seccomp_profile_path = ""
+seccomp_profile_root = "/var/lib/kubelet/seccomp"
+policies_dir = "/etc/nautilus/security"
+# 安全配置
+enable_selinux = false                      # 启用 SELinux 支持
+enable_apparmor = false                     # 启用 AppArmor 支持
+allow_privileged = false                    # 允许特权容器
+read_only_root_filesystem = false           # 只读根文件系统
+
+# 默认容器能力
+default_capabilities = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FSETID",
+    "FOWNER",
+    "MKNOD",
+    "NET_RAW",
+    "SETGID",
+    "SETUID",
+    "SETFCAP",
+    "SETPCAP",
+    "NET_BIND_SERVICE",
+    "SYS_CHROOT",
+    "KILL",
+    "AUDIT_WRITE"
+]
+
+# 禁用的系统调用
+disabled_syscalls = [
+    "reboot",
+    "swapon",
+    "swapoff"
+]
+
+[debug]
+# 调试配置
+enable_pprof = false                       # 启用性能分析
+pprof_address = "localhost:6060"            # 性能分析服务地址
+enable_debug_api = false                   # 启用调试 API
+debug_api_address = "localhost:8080"        # 调试 API 地址
+
+# 环境变量配置
+[environment]
+# 容器默认环境变量
+default_env = [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "TERM=xterm"
+]
+
+# 代理配置
+[proxy]
+# HTTP 代理设置
+http_proxy = ""                             # HTTP 代理地址
+https_proxy = ""                            # HTTPS 代理地址
+no_proxy = "localhost,127.0.0.1,::1"       # 不使用代理的地址
+
+# 注册表配置
+[registry]
+# 默认镜像注册表
+default_registry = "docker.io"              # 默认注册表
+insecure_registries = []                    # 不安全的注册表列表
+registry_mirrors = []                       # 注册表镜像列表
+
+# 认证配置
+[auth]
+# 镜像拉取认证
+config_file = "/root/.docker/config.json"   # Docker 配置文件路径
+credential_helpers = []                     # 凭据助手列表
+
+# 资源限制
+[limits]
+# 系统资源限制
+max_open_files = 1048576                    # 最大打开文件数
+max_processes = 1048576                     # 最大进程数
+max_memory_usage = "80%"                    # 最大内存使用率
+max_cpu_usage = "80%"                       # 最大 CPU 使用率
+
+[policy]
+enabled = false
+path = ""
+hooks = ["run_pod_sandbox", "create_container", "start_container"]
+fail_closed = false
+fuel_limit = 10000000
+timeout_ms = 100

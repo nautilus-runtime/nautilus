@@ -1,0 +1,500 @@
+//! Native OCI registry client.
+//!
+//! Pulls images over the OCI distribution protocol (rustls, no docker CLI)
+//! into a content-addressed layer cache under `<image_dir>/layers/`, verifies
+//! digests while streaming, and materializes rootfs trees with whiteout rules.
+//! This is the foundation of the single-binary edge story: no container CLI
+//! anywhere on the host.
+
+use crate::core::{Config, Error, Result};
+use oci_distribution::client::{ClientConfig, ClientProtocol};
+use oci_distribution::manifest::OciImageManifest;
+use oci_distribution::{secrets::RegistryAuth, Client, Reference};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+
+/// Workload defaults extracted from the image config (typed).
+pub struct ImageWorkload {
+    pub entrypoint: Vec<String>,
+    pub cmd: Vec<String>,
+    pub env: Vec<String>,
+    pub working_dir: String,
+    pub user: String,
+}
+
+/// A fully cached image: blobs on disk, manifest resolved for this platform.
+struct CachedImage {
+    manifest: OciImageManifest,
+    config: oci_distribution::config::ConfigFile,
+    /// Digest of the resolved platform manifest (`sha256:...`), the digest
+    /// half of a `repo@digest` reference. Empty for cache files written
+    /// before this field existed.
+    manifest_digest: String,
+    blobs: Vec<(PathBuf, String)>, // (path, media_type) in layer order
+}
+
+fn client() -> Client {
+    Client::new(ClientConfig {
+        protocol: ClientProtocol::Https,
+        ..Default::default()
+    })
+}
+
+fn parse_ref(image_ref: &str) -> Result<Reference> {
+    image_ref
+        .parse::<Reference>()
+        .map_err(|e| Error::Image(format!("invalid image reference {image_ref:?}: {e}")))
+}
+
+/// Rewrite a docker.io image reference onto a registry mirror (e.g. for
+/// deployments where the upstream registry is unreachable). Non-default
+/// registries pass through untouched.
+fn apply_mirror(image_ref: &str, mirror: &str) -> String {
+    let mut s = image_ref.trim();
+    for prefix in ["https://", "http://"] {
+        s = s.strip_prefix(prefix).unwrap_or(s);
+    }
+    for prefix in ["docker.io/", "index.docker.io/", "registry-1.docker.io/"] {
+        s = s.strip_prefix(prefix).unwrap_or(s);
+    }
+    // Official images live under the implicit "library/" namespace.
+    let repo = if !s.contains('/') {
+        format!("library/{s}")
+    } else {
+        s.to_string()
+    };
+    format!("{mirror}/{repo}")
+}
+
+/// Resolve an image reference, honoring the configured registry mirror.
+pub(super) fn resolve_ref(config: &Config, image_ref: &str) -> Result<Reference> {
+    let mirror = config.storage.registry_mirror.trim();
+    if mirror.is_empty() {
+        return parse_ref(image_ref);
+    }
+    let mirrored = apply_mirror(image_ref, mirror);
+    tracing::debug!(from = %image_ref, to = %mirrored, "using registry mirror");
+    parse_ref(&mirrored)
+}
+
+fn layer_cache_dir(config: &Config) -> PathBuf {
+    let dir = config.storage.image_dir.join("layers");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn blob_path(cache_dir: &Path, digest: &str) -> PathBuf {
+    cache_dir.join(format!("{}.blob", digest.replace(':', "-")))
+}
+
+/// Cache file for a resolved manifest + image config, keyed by reference.
+pub(super) fn manifest_cache_path(config: &Config, reference: &Reference) -> PathBuf {
+    let dir = config.storage.image_dir.join("manifests");
+    let _ = std::fs::create_dir_all(&dir);
+    let safe: String = reference
+        .whole()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' })
+        .collect();
+    dir.join(format!("{safe}.json"))
+}
+
+/// Try to serve the image fully offline: cached manifest+config AND every
+/// layer blob present. Returns None when anything is missing.
+async fn load_cached(config: &Config, reference: &Reference) -> Option<CachedImage> {
+    let text = tokio::fs::read_to_string(manifest_cache_path(config, reference))
+        .await
+        .ok()?;
+    let file: CachedManifestFile = serde_json::from_str(&text).ok()?;
+    let cache_dir = layer_cache_dir(config);
+    let mut blobs = Vec::with_capacity(file.manifest.layers.len());
+    for desc in &file.manifest.layers {
+        let path = blob_path(&cache_dir, &desc.digest);
+        if !path.exists() {
+            return None; // incomplete — fall through to a network fetch
+        }
+        blobs.push((path, desc.media_type.clone()));
+    }
+    Some(CachedImage {
+        manifest: file.manifest,
+        config: file.config,
+        manifest_digest: file.manifest_digest.clone(),
+        blobs,
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedManifestFile {
+    manifest: OciImageManifest,
+    config: oci_distribution::config::ConfigFile,
+    #[serde(default)]
+    manifest_digest: String,
+}
+
+/// AsyncWriter that hashes what it forwards, for on-the-fly digest checks.
+struct HashingWriter<'a, W: AsyncWrite + Unpin> {
+    inner: &'a mut W,
+    hasher: Sha256,
+}
+
+impl<'a, W: AsyncWrite + Unpin> AsyncWrite for HashingWriter<'a, W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                self.hasher.update(&buf[..n]);
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+impl CachedImage {
+    /// Resolve the platform manifest and make sure every layer blob is in the
+    /// content-addressed cache (streaming download + sha256 verify).
+    async fn fetch(
+        config: &Config,
+        client: &Client,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        publish_ref: bool,
+    ) -> Result<Self> {
+        // Platform-aware resolution: an index (multi-arch) is reduced to the
+        // matching image manifest by the client.
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(reference, auth)
+            .await
+            .map_err(|e| Error::Image(format!("pull manifest {reference}: {e}")))?;
+
+        // Fetch and parse the image configuration object.
+        let cfg_desc = &manifest.config;
+        let mut cfg_bytes = Vec::with_capacity(cfg_desc.size.max(0) as usize);
+        client
+            .pull_blob(reference, cfg_desc, &mut cfg_bytes)
+            .await
+            .map_err(|e| Error::Image(format!("pull image config: {e}")))?;
+        let config_file: oci_distribution::config::ConfigFile = serde_json::from_slice(&cfg_bytes)
+            .map_err(|e| Error::Image(format!("parse image config: {e}")))?;
+
+        // Stream each layer into the cache, verifying its digest.
+        let cache_dir = layer_cache_dir(config);
+        let mut blobs = Vec::with_capacity(manifest.layers.len());
+        for desc in &manifest.layers {
+            let path = blob_path(&cache_dir, &desc.digest);
+            if !path.exists() {
+                let (file, tmp) = tempfile::NamedTempFile::new_in(&cache_dir)?.into_parts();
+                let mut file = tokio::fs::File::from_std(file);
+                let mut hw = HashingWriter {
+                    inner: &mut file,
+                    hasher: Sha256::new(),
+                };
+                client
+                    .pull_blob(reference, desc, &mut hw)
+                    .await
+                    .map_err(|e| Error::Image(format!("pull layer {}: {e}", desc.digest)))?;
+                hw.inner
+                    .flush()
+                    .await
+                    .map_err(|e| Error::Image(format!("flush layer blob: {e}")))?;
+                hw.inner
+                    .shutdown()
+                    .await
+                    .map_err(|e| Error::Image(format!("close layer blob: {e}")))?;
+
+                let got = format!("sha256:{:x}", hw.hasher.finalize());
+                if got != desc.digest {
+                    return Err(Error::Image(format!(
+                        "layer digest mismatch: want {}, got {got}",
+                        desc.digest
+                    )));
+                }
+                tmp.persist(&path).map_err(|e| e.error)?;
+            }
+            blobs.push((path, desc.media_type.clone()));
+        }
+
+        // Persist manifest+config so future materializations are offline.
+        let cache_file = CachedManifestFile {
+            manifest: manifest.clone(),
+            config: config_file.clone(),
+            manifest_digest: manifest_digest.clone(),
+        };
+        let json = serde_json::to_vec(&cache_file)?;
+        let immutable = Reference::with_digest(reference.registry().to_owned(), reference.repository().to_owned(), manifest_digest.clone());
+        super::atomic_write(&manifest_cache_path(config, &immutable), &json).await?;
+        if publish_ref && reference != &immutable {
+            super::atomic_write(&manifest_cache_path(config, reference), &json).await?;
+        }
+
+        Ok(Self {
+            manifest,
+            config: config_file,
+            manifest_digest,
+            blobs,
+        })
+    }
+
+    fn workload(&self) -> ImageWorkload {
+        let cfg = self.config.config.as_ref();
+        ImageWorkload {
+            entrypoint: cfg
+                .and_then(|c| c.entrypoint.clone())
+                .unwrap_or_default(),
+            cmd: cfg.and_then(|c| c.cmd.clone()).unwrap_or_default(),
+            env: cfg.and_then(|c| c.env.clone()).unwrap_or_default(),
+            user: cfg.and_then(|c| c.user.clone()).unwrap_or_default(),
+            working_dir: cfg
+                .and_then(|c| c.working_dir.clone())
+                .unwrap_or_else(|| "/".into()),
+        }
+    }
+}
+
+/// Make sure all layers of `image_ref` are present in the local cache.
+/// Used by CRI PullImage (prefetch only); `auth` comes from the CRI
+/// AuthConfig (Anonymous for public registries).
+pub async fn prefetch_layers(config: &Config, image_ref: &str, auth: RegistryAuth) -> Result<String> {
+    let reference = resolve_ref(config, image_ref)?;
+    if cached_for_pull(config, &reference).await?.is_some() {
+        return Ok(reference.whole());
+    }
+    let cached = CachedImage::fetch(config, &client(), &reference, &auth, false).await?;
+    Ok(Reference::with_digest(reference.registry().to_owned(), reference.repository().to_owned(), cached.manifest_digest).whole())
+}
+
+/// After the index intent is durable, publish the downloaded immutable
+/// manifest under its requested reference. This operation can be replayed.
+pub(super) async fn publish_cached(
+    config: &Config, image_ref: &str, requested: &str, pinned: &str,
+) -> Result<ImageFacts> {
+    let pinned = parse_ref(pinned)?;
+    let requested = parse_ref(requested)?;
+    let cached = load_cached(config, &pinned).await.ok_or_else(|| Error::Image(format!("missing cached manifest for {pinned}")))?;
+    if requested != pinned {
+        let data = tokio::fs::read(manifest_cache_path(config, &pinned)).await?;
+        super::atomic_write(&manifest_cache_path(config, &requested), &data).await?;
+    }
+    Ok(cached.facts(image_ref))
+}
+
+async fn cached_for_pull(config: &Config, reference: &Reference) -> Result<Option<CachedImage>> {
+    if reference.digest().is_some() {
+        return Ok(load_cached(config, reference).await);
+    }
+    // Older stores cached a manifest only under its tag. Preserve its digest
+    // alias before the registry refresh replaces the tag's file.
+    let tagged = manifest_cache_path(config, reference);
+    match tokio::fs::read(&tagged).await {
+        Ok(json) => {
+            if let Ok(old) = serde_json::from_slice::<CachedManifestFile>(&json) {
+                if !old.manifest_digest.is_empty() {
+                    let pinned = Reference::with_digest(reference.registry().to_owned(), reference.repository().to_owned(), old.manifest_digest);
+                    let alias = manifest_cache_path(config, &pinned);
+                    if !alias.exists() { super::atomic_write(&alias, &json).await?; }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    // A mutable tag must always be looked up in the registry on explicit pull.
+    Ok(None)
+}
+
+/// Registry-level facts derivable from the cached manifest/config without
+/// unpacking: the config-blob digest IS docker's IMAGE ID, and `created` is
+/// the image build time shown by `docker images`.
+pub struct ImageFacts {
+    pub config_digest: String,
+    /// Digest of the resolved platform manifest — pairs with the repo part
+    /// of the reference to form `repo@sha256:...` (CRI RepoDigests). Empty
+    /// when unavailable (legacy cache); digest references carry it in the
+    /// ref itself.
+    pub manifest_digest: String,
+    /// Build time from the image config (already parsed by oci-distribution).
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    /// Compressed layer bytes per the manifest — known right after fetch,
+    /// before any unpacking (feeds CRI Image.size which must be non-zero).
+    pub size: u64,
+    /// Image config `User` (e.g. "1002" or "nobody"), for CRI Image.uid/username.
+    pub user: String,
+}
+
+/// Fetch (offline when possible) manifest+config for `image_ref` and extract
+/// the docker-parity identity fields. Offline cache hits never need network;
+/// misses fetch with the given `auth` (Anonymous for status enrichment, the
+/// CRI credential set during PullImage).
+pub async fn image_facts(config: &Config, image_ref: &str, auth: RegistryAuth) -> Result<ImageFacts> {
+    let reference = resolve_ref(config, image_ref)?;
+    let cached = match load_cached(config, &reference).await {
+        Some(c) => c,
+        None => {
+            let c = client();
+            CachedImage::fetch(config, &c, &reference, &auth, true).await?
+        }
+    };
+    Ok(cached.facts(image_ref))
+}
+
+impl CachedImage {
+    fn facts(&self, image_ref: &str) -> ImageFacts {
+        let size = self.manifest.layers.iter().map(|d| d.size.max(0) as u64).sum::<u64>()
+            + self.manifest.config.size.max(0) as u64;
+        // A digest reference already names the manifest digest; legacy caches
+        // that never stored it can still serve RepoDigests for such refs.
+        let manifest_digest = if !self.manifest_digest.is_empty() {
+            self.manifest_digest.clone()
+        } else {
+            image_ref
+                .split_once('@')
+                .map(|(_, d)| d.to_string())
+                .unwrap_or_default()
+        };
+        ImageFacts {
+            config_digest: self.manifest.config.digest.clone(),
+            manifest_digest,
+            created: self.config.created,
+            size,
+            user: self
+                .config
+                .config
+                .as_ref()
+                .and_then(|c| c.user.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Recursively sum regular-file sizes under `root` (symlinks skipped).
+fn dir_size(root: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(path),
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(md) = entry.metadata() {
+                        total += md.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// Materialize the image rootfs into `rootfs_dir` and return workload defaults.
+pub async fn materialize_rootfs(
+    config: &Config,
+    image_ref: &str,
+    rootfs_dir: &Path,
+) -> Result<ImageWorkload> {
+    let reference = resolve_ref(config, image_ref)?;
+    // Offline fast path: cached manifest+config and every layer blob present.
+    let cached = match load_cached(config, &reference).await {
+        Some(c) => c,
+        None => {
+            // Container creation has no CRI AuthConfig; the image is expected
+            // to be pulled (with credentials) beforehand — anonymous covers
+            // public registries.
+            let c = client();
+            CachedImage::fetch(
+                config,
+                &c,
+                &reference,
+                &RegistryAuth::Anonymous,
+                true,
+            )
+            .await?
+        }
+    };
+
+    // Extraction is sync CPU/IO work — keep it off the async workers.
+    let work = cached.blobs.clone();
+    let root = rootfs_dir.to_path_buf();
+    let layers_meta = work
+        .iter()
+        .map(|(p, m)| (p.to_string_lossy().to_string(), m.clone()))
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        for (path, media_type) in &layers_meta {
+            let blob = std::fs::read(path)
+                .map_err(|e| Error::Image(format!("read {}: {e}", path)))?;
+            crate::storage::unpack::apply_layer(&root, &blob, media_type)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Runtime(format!("extract worker join failed: {e}")))??;
+
+    // Persist docker-parity display facts next to the image store: uncompressed
+    // rootfs size (docker's SIZE column), config-digest image id and build time.
+    let size_bytes = dir_size(rootfs_dir);
+    let meta = serde_json::json!({
+        "image_id": cached.manifest.config.digest,
+        "created": cached.config.created.map(|c| c.to_rfc3339()),
+        "size": size_bytes,
+    });
+    let sidecar = config
+        .storage
+        .image_dir
+        .join(format!("{}.nmeta", crate::storage::image::safe_image_name(&cached.manifest.config.digest)));
+    let _ = super::atomic_write(&sidecar, meta.to_string().as_bytes()).await;
+
+    tracing::info!(
+        image = %image_ref,
+        layers = cached.manifest.layers.len(),
+        "rootfs materialized from native pull"
+    );
+    Ok(cached.workload())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_pull_refreshes_tags_but_preserves_offline_digest_and_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.image_dir = dir.path().to_owned();
+        let tag = parse_ref("example.test/work:stable").unwrap();
+        let manifest_digest = format!("sha256:{}", "a".repeat(64));
+        let file = CachedManifestFile {
+            manifest: OciImageManifest::default(),
+            config: Default::default(),
+            manifest_digest: manifest_digest.clone(),
+        };
+        std::fs::write(manifest_cache_path(&cfg, &tag), serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(cached_for_pull(&cfg, &tag).await.unwrap().is_none());
+        let pinned = parse_ref(&format!("example.test/work@{manifest_digest}")).unwrap();
+        assert_eq!(cached_for_pull(&cfg, &pinned).await.unwrap().unwrap().manifest_digest, manifest_digest);
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        materialize_rootfs(&cfg, &tag.whole(), &rootfs).await.unwrap();
+        materialize_rootfs(&cfg, &pinned.whole(), &rootfs).await.unwrap();
+    }
+}

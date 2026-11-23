@@ -1,0 +1,82 @@
+# Nautilus CRI 测试容器
+FROM debian:12-slim
+
+# 设置代理环境变量
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+
+# 配置 apt 重试和超时
+RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::https::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libseccomp-dev \
+    libsystemd-dev \
+    git \
+    curl \
+    wget \
+    jq \
+    bc \
+    iptables \
+    iproute2 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* || \
+    (apt-get clean && apt-get update --fix-missing && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libseccomp-dev \
+    libsystemd-dev \
+    git \
+    curl \
+    wget \
+    jq \
+    bc \
+    iptables \
+    iproute2 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*)
+
+# 安装 Go
+RUN wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz && \
+    rm go1.21.5.linux-amd64.tar.gz
+ENV PATH=$PATH:/usr/local/go/bin
+
+# 安装 Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 安装 runc
+RUN wget -q https://github.com/opencontainers/runc/releases/download/v1.1.10/runc.amd64 && \
+    mv runc.amd64 /usr/bin/runc && \
+    chmod +x /usr/bin/runc
+
+# 安装 CNI 插件
+RUN mkdir -p /opt/cni/bin && \
+    wget -q https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz && \
+    tar -C /opt/cni/bin -xzf cni-plugins-linux-amd64-v1.3.0.tgz && \
+    rm cni-plugins-linux-amd64-v1.3.0.tgz
+
+# 安装 critest
+RUN git clone --depth 1 https://github.com/kubernetes-sigs/cri-tools.git /tmp/cri-tools && \
+    cd /tmp/cri-tools && \
+    make critest && \
+    cp build/bin/linux/amd64/critest /usr/local/bin/ && \
+    chmod +x /usr/local/bin/critest && \
+    rm -rf /tmp/cri-tools
+
+# 创建工作目录
+WORKDIR /workspace
+
+# 创建测试脚本
+COPY scripts/critest_runner.sh /usr/local/bin/critest_runner.sh
+RUN chmod +x /usr/local/bin/critest_runner.sh
+
+# 设置入口点
+ENTRYPOINT ["/usr/local/bin/critest_runner.sh"]

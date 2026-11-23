@@ -1,0 +1,106 @@
+[package]
+name = "nautilus"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nautilus Team"]
+description = "High-performance CRI-compatible container runtime"
+license = "Apache-2.0"
+repository = "https://github.com/bevisy/nautilus"
+
+[[bin]]
+name = "nautilusd"
+path = "src/main.rs"
+
+[[bin]]
+name = "nautilus"
+path = "src/bin/nautilus.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1.15"
+futures = "0.3.30"
+
+# gRPC and serialization
+tonic = "0.12.2"
+prost = "0.13.1"
+# UDS connector for the nautilus client (service_fn + TokioIo over tokio UnixStream)
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+spdystream-rs = "0.1"
+# SPDY stream handlers exchange frames in these types (http::HeaderMap for
+# send_reply, bytes::Bytes for write_data) — kept in lockstep with what
+# tonic/spdystream-rs already resolve to.
+http = "1"
+bytes = "1"
+
+# Logging and tracing
+log = "0.4.22"
+env_logger = "0.11.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Route `log`-crate records (spdystream-rs internals) into tracing output.
+tracing-log = "0.2"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.0", features = ["derive"] }
+
+# State management
+sled = "0.34"
+
+# Container runtime
+oci-spec = "0.10"
+nix = { version = "0.27", features = ["signal", "process", "sched", "mount", "fs"] }
+libc = "0.2"
+
+# Native image distribution (no docker CLI dependency)
+# Pure-rust TLS: rustls with system-native root certificates.
+oci-distribution = { version = "0.11", default-features = false, features = [
+    "rustls-tls-native-roots",
+] }
+flate2 = "1"
+zstd = "0.13"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.8"
+pathrs = "0.2.5"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async utilities
+arc-swap = "1.6"
+tokio-util = "0.7"
+
+# Metrics
+prometheus = "0.13"
+
+# UUID generation
+uuid = { version = "1.0", features = ["v4"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random number generation
+rand = "0.8"
+
+# Multi-sandbox backends
+async-trait = "0.1"
+wasmtime = "26"
+wasmtime-wasi = "26"
+libcontainer = "0.7"
+
+[build-dependencies]
+tonic-build = "0.12.2"
+
+
+[patch.crates-io]
+# NOTE: pins b51cb5c ("clone child probe") and 6a0d9e8 ("SIGCHLD init clone")
+# are REGRESSED — tenant-exec waitpid and the workload reaper both hit ECHILD
+# (children reaped/reparented outside the daemon), failing execSync and ~30
+# dependent critest cases. Last known-good rev is 2867015 (2026-08-27 bisect).
+libcontainer = { git = "https://github.com/Bevisy/youki.git", package = "libcontainer", rev = "2b4cdda" }
