@@ -1,8 +1,8 @@
 # Nautilus Logo Assets
 
-The README features [the full-color mascot](nautilus-mascot.png). Its spiral
-shell has ribbed chambers shaped like cargo containers, a nod to the isolated
-workloads Nautilus runs. Use the transparent PNG for the illustrated mark
+The README features [the holographic comic mascot](nautilus-mascot.png). Bands of cyan, pink and gold
+catch the ribs of its spiral shell. Each chamber resembles a cargo container,
+a nod to the isolated workloads Nautilus runs. Use the transparent PNG for the illustrated mark
 and the compact SVG marks below for smaller sizes.
 
 ## Files
@@ -19,12 +19,12 @@ and the compact SVG marks below for smaller sizes.
 
 ## Mascot generation
 
-The illustrated mark was generated with ImageGen using this prompt.
+The previous mascot illustration was restyled with ImageGen using this prompt.
 
 <details>
 <summary>Full prompt</summary>
 
-> Logo-brand. Design one polished original mascot mark for Nautilus, a Rust implementation of the Kubernetes Container Runtime Interface that runs isolated OCI containers and Wasm workloads. A lively little chambered nautilus cephalopod in side profile, expressive eye and a few short curling tentacles, carrying an oversized coiled shell. Build the spiral from distinct colorful chambers following its curvature; a few outer chambers resemble tiny stackable cargo containers through simple broad ribs. Make the organic shell and the container idea read as one shape. Rust-orange and coral shell, turquoise body, sunny yellow and indigo accent chambers, deep ink outlines, minimal flat cel shading. A spirited illustrated open-source mascot, crafted silhouette legible at 96 px. Square composition, centered with small breathing room, entire mark visible, genuine transparent background. No scenery, lettering, labels, text, official tech logos or extra emblems.
+> Restyle the attached Nautilus project mascot as a premium holographic manga sticker for a GitHub README. Keep its left-facing chambered nautilus silhouette, curious expressive eye, curled tentacles, and unmistakable spiral shell made of ribbed shipping-container chambers. Redraw it with sweeping, tapered midnight-indigo comic inks, a lively upward tilt, a turquoise face, and a confident little smile. Make the shell the focal point: polished holographic foil with broad curved bands of electric cyan, violet and hot pink, a few warm amber flashes and crisp pearly glints flowing across the ribs. Use bold cel-shadow shapes and a few restrained halftone patches in the shadows. Keep the spiral and face clear at 160 px. Clean contour with a narrow cool-pearl rim for both light and dark backgrounds. One centered mascot, square composition, small clear margin, transparent background. No words, letters, frame, scenery, floating particles or diffuse bloom.
 
 </details>
 
