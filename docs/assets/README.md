@@ -1,7 +1,8 @@
 # Nautilus Logo Assets
 
-The README pairs the [holographic comic mascot](nautilus-mascot.png) with a
-[Nautilus wordmark](nautilus-wordmark.png). Bands of cyan, pink and gold
+The README uses the [horizontal logo](nautilus-logo-horizontal.png), with the
+[mascot](nautilus-mascot.png) on the left and the [Nautilus wordmark](nautilus-wordmark.png)
+on the right. Bands of cyan, pink and gold
 catch the ribs of its spiral shell. Each chamber resembles a cargo container,
 a nod to the isolated workloads Nautilus runs. Use the transparent PNG for the illustrated mark
 and the compact SVG marks below for smaller sizes.
@@ -10,6 +11,7 @@ and the compact SVG marks below for smaller sizes.
 
 | File | Use | Size |
 |---|---|---|
+| `nautilus-logo-horizontal.png` | Mascot and wordmark together for the README header | 1272 × 416 PNG |
 | `nautilus-mascot.png` | Illustrated project logo for the README and docs | 1254 × 1254 PNG |
 | `nautilus-wordmark.png` | Transparent project name, used beside the mascot or on its own | 1086 × 362 PNG |
 | `logo.svg` | Compact shell mark for light backgrounds | any (vector) |
