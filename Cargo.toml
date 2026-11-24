@@ -27,7 +27,8 @@ prost = "0.13.1"
 # UDS connector for the nautilus client (service_fn + TokioIo over tokio UnixStream)
 tower = { version = "0.4", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-spdystream-rs = "0.1"
+# Local 0.1.2 carries the per-stream RST signal needed by CRI port forwarding.
+spdystream-rs = { version = "=0.1.2", path = "vendor/spdystream-rs" }
 # SPDY stream handlers exchange frames in these types (http::HeaderMap for
 # send_reply, bytes::Bytes for write_data) — kept in lockstep with what
 # tonic/spdystream-rs already resolve to.
