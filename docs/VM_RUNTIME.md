@@ -1,6 +1,6 @@
 # Pod 级虚机运行时
 
-设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。当前实现提供节点探针。面向 kubelet 的 handler 在完成容器、网络与恢复验收后启用。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
+设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。当前实现提供节点探针、自研 guest agent 的启动身份校验，以及实验性的 Pod VM 生命周期管理。面向 kubelet 的 handler 在完成容器、网络与恢复验收后启用。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
 
 ## 所有权与协议
 
@@ -15,7 +15,7 @@
 
 ### guest 启动身份
 
-`guest/build-initramfs.sh OUTPUT [KERNEL_RELEASE]` 构建自研 guest agent 的 initramfs。该程序作为 PID 1，在端口 4082 接受来自宿主 CID 2 的 `IDENTIFY 1` 请求。它从内核命令行读取 sandbox ID 与每次启动的 nonce，从 guest 的 procfs 读取 boot ID。宿主核对 sandbox ID 和 nonce，校验 boot ID 的格式并将它返回。生命周期管理器将在 #3 把它与持久化的 boot ID 比对。探针使用的示例 initramfs 与此镜像分别构建。
+`guest/build-initramfs.sh OUTPUT [KERNEL_RELEASE]` 构建自研 guest agent 的 initramfs。该程序作为 PID 1，在端口 4082 接受来自宿主 CID 2 的 `IDENTIFY 1` 请求。它从内核命令行读取 sandbox ID 与每次启动的 nonce，从 guest 的 procfs 读取 boot ID。宿主核对 sandbox ID 和 nonce，校验 boot ID 的格式并将它返回。生命周期管理器在首次成功握手时持久化 boot ID，之后每次接管都与该值比对。探针使用的示例 initramfs 与此镜像分别构建。
 
 | 输入或事件 | 可观察结果 |
 | --- | --- |
@@ -30,6 +30,23 @@
 3. `CreateContainer` 在同一 VM 内准备 OCI rootfs 和配置。`StartContainer` 才启动容器进程。`ExecSync`、streaming、状态和日志操作均定位该 guest 中的目标容器。容器停止后保存真实退出码、时间和日志。
 4. daemon 重启时，用持久化的 sandbox ID、受管理的私有 socket、进程身份及 guest 标识重新确认所有权。仅凭 PID 可能命中已被复用的进程。身份不匹配或 guest 失联时报告 NOTREADY，并保留能够安全回收的记录。
 5. `StopPodSandbox` 终止工作负载并释放网络；`RemovePodSandbox` 还要移除剩余容器及 VM 存储。以 sandbox 为粒度串行化状态变更。清理途中失败时保留重试信息，资源释放完毕后才删除持久化记录。
+
+### 首版使用系统级 systemd 托管 VMM
+
+启用实验性 VM 生命周期需要可使用 KVM 的 Linux 节点、运行中的系统级 systemd、可用的 `systemd-run` 和 `systemctl`，以及有权创建和停止临时服务的 nautilusd。普通 OCI 和 WASI 节点可沿用原配置。
+
+每个 sandbox attempt 使用独立的临时服务。systemd 在 nautilusd 退出后继续持有 VMM 的进程组。Nautilus 在 `runtime.state_dir/vms` 记录 sandbox ID、启动 nonce、systemd InvocationID、私有目录及 socket 的文件身份和 guest boot ID。启动恢复时，匹配已登记的 VM 后重新连接，继续回收中断的创建或删除。遇到身份冲突时保留记录，在 CRI 中报告 NOTREADY，避免停止其他工作负载。
+
+实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。成功验证时 `guestReachable` 为 true，确认缺失时为 false。状态查询发生错误时该字段为 null，`error` 给出原因。已启动的实验 Pod 保持 NOTREADY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
+
+```sh
+NAUTILUS_VM_VMM=/opt/cloud-hypervisor/bin/cloud-hypervisor \
+NAUTILUS_VM_KERNEL=/opt/nautilus/guest/vmlinuz \
+NAUTILUS_VM_INITRAMFS=/opt/nautilus/guest/agent.cpio.gz \
+cargo test --locked --test vm_pod_lifecycle_test -- --include-ignored --nocapture
+```
+
+在 Linux 5.15.0-191 + Cloud Hypervisor v54.1 和 Linux 6.12.118 + v55.0 两种宿主上，已用提交 `af327ce` 跑通上述生命周期测试。通过 PodManager 创建两台 VM，再从真实 `nautilusd` 的 CRI socket 核对两个 boot ID。强制终止和重启 daemon 后，两个 ID 均保持一致。并发停止、删除第一个 Pod 后，第二台 VM 仍可访问；独立关闭第二个 VMM 后，CRI 观察到退出，重复删除回收了私有目录和端点。运行时与镜像服务的回归结果见 [CRI 验证记录](CRITEST_RESULTS.md)。
 
 ## 节点探针
 

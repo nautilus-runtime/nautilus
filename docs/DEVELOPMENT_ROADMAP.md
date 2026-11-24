@@ -61,7 +61,7 @@
 
 ### 远期(设计预留)
 
-- **Pod 级 microVM 后端**：首个 VMM 为 Cloud Hypervisor。已开始实现节点探针，按 Pod 持有 VM、自研 guest agent、OCI 容器、网络和 kubelet 验收分步交付。见 [VM 设计与任务依赖](VM_RUNTIME.md)。
+- **Pod 级 microVM 后端**：首个 VMM 为 Cloud Hypervisor。节点探针和 guest agent 启动身份协议已合入。实验性的 Pod VM 由 systemd 托管，在容器、网络及 kubelet 验收完成后开放 RuntimeClass。见 [VM 设计与任务依赖](VM_RUNTIME.md)。
 - **机密计算(CoCo)**:依赖 microVM 后端先行
 - **企业级**:安全审计、兼容性认证、长稳(7x24)测试
 

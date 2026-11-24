@@ -101,6 +101,10 @@ impl NautilusRuntimeService {
 }
 
 impl NautilusRuntimeService {
+    pub async fn recover_vm_pods(&self) -> crate::core::Result<()> {
+        self.pod_manager.recover_vm_pods().await
+    }
+
     async fn release_pod_resources(
         &self,
         pod_id: &str,
@@ -129,8 +133,8 @@ impl NautilusRuntimeService {
         let Some(pod) = self.pod_manager.get_pod_state(id).await? else {
             return Ok(());
         };
-        if pod.status == PodStatus::Running {
-            self.pod_manager.stop_pod(id, None).await?;
+        if pod.status == PodStatus::Running || pod.runtime_handler == "vm" {
+            self.pod_manager.stop_pod_locked(id, None).await?;
         }
         let network = pod.network_namespace.zip(pod.netns_holder_pid).map(|(netns_path, holder_pid)| {
             crate::network::PodNetInfo { netns_path, holder_pid, ip: pod.network_ip }
@@ -478,13 +482,13 @@ impl RuntimeService for NautilusRuntimeService {
                     }
                 }
             }
-            self.pod_manager.start_pod(&pod_id).await.map_err(Status::from)
+            self.pod_manager.start_pod_locked(&pod_id).await.map_err(Status::from)
         }.await;
         if let Err(error) = setup {
             self.release_pod_resources(&pod_id, network.as_ref(), pause_pid, ipc_pid).await.map_err(|cleanup| {
                 Status::internal(format!("{error}; sandbox {pod_id} retained for cleanup: {cleanup}"))
             })?;
-            self.pod_manager.remove_pod(&pod_id).await.map_err(|cleanup| {
+            self.pod_manager.remove_pod_locked(&pod_id).await.map_err(|cleanup| {
                 Status::internal(format!("{error}; failed to remove incomplete sandbox {pod_id}: {cleanup}"))
             })?;
             return Err(error);
@@ -523,7 +527,7 @@ impl RuntimeService for NautilusRuntimeService {
                 return Ok(Response::new(RemovePodSandboxResponse {}));
             }
             self.stop_sandbox(&id).await?;
-            self.pod_manager.remove_pod(&id).await.map_err(Status::from)?;
+            self.pod_manager.remove_pod_locked(&id).await.map_err(Status::from)?;
         }
         Ok(Response::new(RemovePodSandboxResponse {}))
     }
@@ -538,6 +542,15 @@ impl RuntimeService for NautilusRuntimeService {
             .ok_or_else(|| Status::not_found(format!("pod sandbox {} not found", req.pod_sandbox_id)))?;
 
         let state = sandbox_state(&pod.status);
+        let mut info = HashMap::new();
+        if req.verbose && pod.runtime_handler == "vm" {
+            let details = match self.pod_manager.vm_store().status(&pod.id).await {
+                Ok(Some(id)) => serde_json::json!({ "guestReachable": true, "bootId": id }),
+                Ok(None) => serde_json::json!({ "guestReachable": false }),
+                Err(error) => serde_json::json!({ "guestReachable": null, "error": error.to_string() }),
+            };
+            info.insert("nautilus.vm".into(), details.to_string());
+        }
 
         Ok(Response::new(PodSandboxStatusResponse {
             status: Some(runtime::v1::PodSandboxStatus {
@@ -561,7 +574,7 @@ impl RuntimeService for NautilusRuntimeService {
                 annotations: pod.annotations,
                 runtime_handler: pod.runtime_handler,
             }),
-            info: HashMap::new(),
+            info,
             containers_statuses: Vec::new(),
             timestamp: 0,
         }))

@@ -8,8 +8,8 @@
 Nautilus 是 Rust 实现的 Kubernetes CRI 兼容容器运行时,差异化方向是
 **多沙箱统一运行时**:单二进制(~10MB 级、空闲 PSS 实测 10 MiB)同时纳管
 runc 容器与 WASM 工作负载，生命周期策略用 Wasm 进程内热插拔。
-Pod 级 microVM 采用 Cloud Hypervisor 与自研 guest agent，当前先提供独立的节点探针；
-CRI handler 的接入与验证见 [VM 运行时设计](VM_RUNTIME.md)。
+Pod 级 microVM 采用 Cloud Hypervisor 与自研 guest agent。实验性生命周期由系统级 systemd 托管 VMM，nautilusd 重启后按 guest 启动身份接管。
+节点探针、实验入口及 CRI handler 的接入进度见 [VM 运行时设计](VM_RUNTIME.md)。
 
 | 问题 | 回答 |
 |---|---|

@@ -242,6 +242,30 @@ impl StateManager {
         Ok(pods)
     }
 
+    /// A single undecodable Pod must not prevent other VMs from being recovered at startup.
+    pub(crate) async fn vm_pods_for_recovery(&self) -> Result<Vec<PodState>> {
+        let db = self.db.read().await;
+        let mut attempts = Vec::new();
+        for entry in db.scan_prefix(b"pod:") {
+            let (key, value) = entry?;
+            let pod: PodState = match serde_json::from_slice(&value) {
+                Ok(pod) => pod,
+                Err(error) => {
+                    tracing::warn!(key=%String::from_utf8_lossy(&key), %error, "Skipping unreadable Pod during VM recovery");
+                    continue;
+                }
+            };
+            if pod.runtime_handler == "vm" && pod.status != PodStatus::Succeeded {
+                if key.strip_prefix(b"pod:") == Some(pod.id.as_bytes()) {
+                    attempts.push(pod);
+                } else {
+                    tracing::warn!(key=%String::from_utf8_lossy(&key), "Pod ID does not match its state key");
+                }
+            }
+        }
+        Ok(attempts)
+    }
+
     /// List containers in a specific pod
     pub async fn list_containers_in_pod(&self, pod_id: &str) -> Result<Vec<ContainerState>> {
         let containers = self.list_containers().await?;
