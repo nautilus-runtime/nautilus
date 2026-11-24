@@ -75,6 +75,20 @@ cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
 
 使用 `bash guest/pack-initramfs.sh tests/fixtures/vm_resources_init.c /tmp/resources.cpio.gz` 构建资源测试 guest。将 `NAUTILUS_VM_RESOURCE_TEST_INITRAMFS` 指向该镜像后执行 `cargo test --locked --test vm_resources_test -- --ignored`，同时设置 VMM 和内核路径。guest 会核对在线 CPU 和可用物理内存，宿主测试会检查 VMM 配置及所在 cgroup。Linux 5.15.0-191、systemd 249、Cloud Hypervisor v54.1 上，1.5 CPU、448 MiB 内存加 0.1 CPU、64 MiB 开销，实测得到 2 个 vCPU、448 MiB guest RAM、`cpu.max=160000 100000` 和 `memory.max=536870912`。
 
+
+### Pod VM 网络
+
+`PodNet::reserve_vm` 为每个 sandbox attempt 持久化 CNI 配置、插件目录和网络命名空间的设备号及 inode。该 namespace 由 bind mount 持有。`attach_vm` 执行 CNI ADD，从实际 veth 读取 MAC、MTU 和 IPv4 路由，在同一 namespace 内创建 `nttap0`，用 tc 的 ingress redirect 将 veth 与 TAP 双向连接。VMM 服务通过 `NetworkNamespacePath` 进入该 namespace，以 `--net tap=nttap0,mac=<CNI MAC>` 打开 TAP。IP 由 guest 持有，宿主 veth 上不保留该地址。
+
+当前支持显式配置的 CNI bridge、host-local IPAM、可选前置 loopback、单个 IPv4 地址及普通直连/网关路由。guest resolver 优先使用 CRI 的 DNS 配置，其次为 CNI result 中的 DNS，缺省时使用 `[network.dns]`。guest 构建需静态 BusyBox（可用 `NAUTILUS_GUEST_BUSYBOX` 指定）及匹配内核的 virtio_net 驱动，节点需要 iproute2 的 ip、tc 和 util-linux 的 nsenter。guest PID 1 应用地址、路由、MTU、loopback 和 resolver 后开始受理身份和网络握手。宿主调用 `VmNetwork::verify_guest`，核对本次 boot ID 和完整的已应用配置，再发布 READY。拒绝的配置包括多地址、IPv6 以及带高级属性的路由。
+
+停止 VMM 后按 sandbox ID 调用 `teardown_vm`。启动失败、重启恢复或重复删除也走同一路径，即使 Pod 状态还未记录 namespace 路径。网络日志保留原始配置以供 CNI DEL 重试。绑定的 namespace 身份不符时保留记录，防止误拆其他 Pod。两台 guest 的网络验收在独立的 Linux mount 和 network namespace 中运行，环境变量 `NAUTILUS_CNI_BIN_DIR`、`NAUTILUS_VM_VMM`、`NAUTILUS_VM_KERNEL`、`NAUTILUS_VM_INITRAMFS` 分别指定 CNI 插件和 VM 资产。测试使用 dnsmasq、cpio、gzip，命令如下：
+
+```sh
+sudo --preserve-env=NAUTILUS_CNI_BIN_DIR,NAUTILUS_VM_VMM,NAUTILUS_VM_KERNEL,NAUTILUS_VM_INITRAMFS \
+  unshare -mn --propagation private cargo test --locked --test vm_network_test -- --include-ignored --nocapture
+```
+
 ## 节点探针
 
 本地执行 `nautilus vm probe` 会启动一台使用 1 个 vCPU、384 MiB 内存的临时 VM，经 guest 端口 4081 交换 `PING 1` 和 `PONG 1`，然后回收子进程和 socket。它可以在 nautilusd 启动之前运行。测试 guest 仅应答就绪请求，无网络、持久磁盘或执行任意命令的接口。

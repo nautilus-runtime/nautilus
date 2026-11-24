@@ -157,7 +157,7 @@ async fn wait_for_guest(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
-async fn connect_guest(socket: &Path, port: u32) -> io::Result<BufReader<UnixStream>> {
+pub(crate) async fn connect_guest(socket: &Path, port: u32) -> io::Result<BufReader<UnixStream>> {
     let mut stream = BufReader::new(UnixStream::connect(socket).await?);
     stream
         .get_mut()

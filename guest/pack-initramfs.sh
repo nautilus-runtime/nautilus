@@ -18,14 +18,24 @@ mkdir -p "$work/modules"
 "${CC:-cc}" -std=c11 -D_GNU_SOURCE -Os -static -Wall -Wextra -Werror -o "$work/init" -I "$sources" "$init_source"
 
 # Capture modprobe errors. A built-in driver contributes no module file.
-extra_drivers=()
+drivers=(virtio_pci vmw_vsock_virtio_transport)
+if [[ "$init_source" == "$sources/init.c" ]]; then
+    drivers+=(virtio_net)
+    mkdir -p "$work/bin"
+    busybox=${NAUTILUS_GUEST_BUSYBOX:-$(command -v busybox)}
+    if readelf -l "$busybox" | grep -q INTERP; then
+        echo "Pod guest needs a static BusyBox (NAUTILUS_GUEST_BUSYBOX)" >&2
+        exit 1
+    fi
+    install -m 0755 "$busybox" "$work/bin/busybox"
+fi
 if [[ ${WORKLOAD_GUEST:-0} == 1 ]]; then
     mkdir -p "$work/bin"
     install -m 0755 "$GUEST_AGENT_BIN" "$work/bin/nautilus-agent"
     install -m 0755 "$GUEST_RUNC_BIN" "$work/bin/runc"
-    extra_drivers+=(virtiofs)
+    drivers+=(virtiofs)
 fi
-for driver in virtio_pci vmw_vsock_virtio_transport "${extra_drivers[@]}"; do
+for driver in "${drivers[@]}"; do
     modprobe --set-version "$release" --show-depends "$driver" >>"$work/deps"
 done
 awk '$1 == "insmod" && !seen[$2]++ { print $2 }' "$work/deps" >"$work/files"
