@@ -298,6 +298,19 @@ fn private_namespace() -> nix::Result<()> {
     )
 }
 
+// A concurrent init can briefly retain a reference to the view across fork/exec.
+fn retry_busy(mut operation: impl FnMut() -> nix::Result<()>) -> nix::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        match operation() {
+            Err(Errno::EBUSY) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(crate) fn with_view<T: Send>(
     bundle: &Path,
     action: impl FnOnce() -> Result<T> + Send,
@@ -322,22 +335,13 @@ pub(crate) fn with_view<T: Send>(
             .spawn(|| {
                 private_namespace().map_err(std::io::Error::from)?;
                 // A just-stopped init may still be releasing its superblock.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-                loop {
-                    match mount_view(&bundle, &tree, flags) {
-                        Ok(()) => break,
-                        Err(Errno::EBUSY) if std::time::Instant::now() < deadline => {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
-                        Err(e) => {
-                            return Err(Error::Storage(format!("mount writable rootfs: {e}")))
-                        }
-                    }
-                }
+                retry_busy(|| mount_view(&bundle, &tree, flags))
+                    .map_err(|e| Error::Storage(format!("mount writable rootfs: {e}")))?;
                 let result = action();
                 // The running container keeps its own root mount. Other descendants
                 // (e.g. an stdin holder) must not keep a second mount on this upper.
-                umount(&bundle.join("rootfs"))
+                let root = bundle.join("rootfs");
+                retry_busy(|| umount(&root))
                     .map_err(|e| Error::Storage(format!("unmount writable rootfs: {e}")))?;
                 result
             })
@@ -575,6 +579,19 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        // An open directory on the mounted view makes umount return EBUSY.
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _handle = rx.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(35));
+            });
+            with_view(&bundles[0], || {
+                tx.send(File::open(&root)?).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
         retire(temp.path(), "config").unwrap();
         with_view(&bundles[0], || {
             assert_eq!(fs::read(root.join("file"))?, b"copied up");
