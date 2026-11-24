@@ -237,16 +237,23 @@ func prepare(id, private string) (process, error) {
 		if !ok || !validID(sub) || m.Type != "bind" || !absolute(m.Destination) || m.Destination == "/" || destinations[m.Destination] || len(m.Options) != 2 || m.Options[0] != "bind" || (m.Options[1] != "ro" && m.Options[1] != "rw") {
 			return s.Process, errors.New("invalid volume mount")
 		}
-		for _, reserved := range []string{"/proc", "/sys", "/dev"} {
-			if m.Destination == reserved || strings.HasPrefix(m.Destination, reserved+"/") {
-				return s.Process, errors.New("reserved mount target")
-			}
-		}
-		destinations[m.Destination] = true
 		m.Source = filepath.Join(share, m.Source)
 		if err = secureExport(m.Source, boundVolume); err != nil {
 			return s.Process, err
 		}
+		if m.Destination == "/dev/termination-log" {
+			info, err := os.Stat(m.Source)
+			if err != nil || !info.Mode().IsRegular() {
+				return s.Process, errors.New("termination log must be a regular file")
+			}
+		} else {
+			for _, reserved := range []string{"/proc", "/sys", "/dev"} {
+				if m.Destination == reserved || strings.HasPrefix(m.Destination, reserved+"/") {
+					return s.Process, fmt.Errorf("reserved mount target %s", m.Destination)
+				}
+			}
+		}
+		destinations[m.Destination] = true
 		m.Options = append(m.Options, "nosuid", "nodev", "noexec")
 		mounts = append(mounts, m)
 	}
