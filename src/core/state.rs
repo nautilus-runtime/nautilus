@@ -52,6 +52,8 @@ pub struct ContainerState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmContainer {
     pub preparing: bool,
+    #[serde(default)]
+    pub logs_complete: bool,
     pub relative_log: String,
     pub cursor: crate::runtime::vm_log::Cursor,
 }

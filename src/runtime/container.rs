@@ -200,7 +200,7 @@ impl ContainerManager {
         let (log_file, log_relpath, log_captured) = if sandbox_kind == "vm" {
             let target = crate::runtime::vm_log::Target::new(std::path::Path::new(&pod_log_dir), std::path::Path::new(log_path),
                 &self._config.storage.container_dir, &container_id)?;
-            vm = Some(crate::core::state::VmContainer { preparing: true, relative_log: log_path.into(), cursor: target.prepare()? });
+            vm = Some(crate::core::state::VmContainer { preparing: true, logs_complete: false, relative_log: log_path.into(), cursor: target.prepare()? });
             (target.path().to_owned(), String::new(), false)
         } else if !pod_log_dir.is_empty() && !log_path.is_empty()
         {

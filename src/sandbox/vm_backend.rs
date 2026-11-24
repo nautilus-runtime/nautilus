@@ -213,10 +213,7 @@ impl SandboxBackend for VmBackend {
         match self.call(id, Operation::Remove).await {
             Err(Error::Io(e))
                 if e.kind() == io::ErrorKind::NotFound
-                    && self.store.status(&self.pod).await?.is_none() =>
-            {
-                ()
-            }
+                    && self.store.status(&self.pod).await?.is_none() => {}
             other => {
                 other?;
             }

@@ -86,6 +86,7 @@ impl ContainerManager {
         state: &mut ContainerState,
         backend: &VmBackend,
         drain: bool,
+        mut changed: bool,
     ) -> Result<()> {
         let target = self.log_target(state).await?;
         loop {
@@ -108,8 +109,18 @@ impl ContainerManager {
                     Ok((reply.stdout()?, next))
                 })
                 .await?;
-            vm.cursor = next;
-            self.save_guest(state).await?;
+            if vm.cursor != next {
+                vm.cursor = next;
+                changed = true;
+            }
+            if drain && !more && !vm.logs_complete {
+                vm.logs_complete = true;
+                changed = true;
+            }
+            if changed {
+                self.save_guest(state).await?;
+                changed = false;
+            }
             if !drain || !more {
                 return Ok(());
             }
@@ -139,9 +150,9 @@ impl ContainerManager {
         }
         let backend = VmBackend::new(self._config.clone(), &state.pod_id);
         let reply = backend.call(id, op).await?;
-        observe(&mut state, reply)?;
+        let changed = observe(&mut state, reply)?;
         let exited = state.status == ContainerStatus::Stopped;
-        self.sync_guest(&mut state, &backend, exited).await
+        self.sync_guest(&mut state, &backend, exited, changed).await
     }
 
     async fn remove_guest_locked(&self, state: &ContainerState) -> Result<()> {
@@ -154,17 +165,17 @@ impl ContainerManager {
         let _guard = self.vm_operations.lock(id).await;
         if let Some(mut state) = self.state_manager.get_container_state(id).await? {
             if state.vm.as_ref().is_some_and(|v| !v.preparing)
-                && state.status != ContainerStatus::Stopped
+                && !state.vm.as_ref().unwrap().logs_complete
             {
                 let backend = VmBackend::new(self._config.clone(), &state.pod_id);
-                if let Some(_) =
-                    crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"))
-                        .status(&state.pod_id)
-                        .await?
+                if crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"))
+                    .status(&state.pod_id)
+                    .await?
+                    .is_some()
                 {
                     let reply = backend.call(id, Operation::Stop { timeout_ms: 0 }).await?;
                     observe(&mut state, reply)?;
-                    self.sync_guest(&mut state, &backend, true).await?;
+                    self.sync_guest(&mut state, &backend, true, true).await?;
                 }
             }
             self.remove_guest_locked(&state).await?;
@@ -188,7 +199,7 @@ impl ContainerManager {
                 loop {
                     if let Ok(records) = manager.state_manager.list_containers().await {
                         stream::iter(records).filter(|s| std::future::ready(
-                            s.vm.as_ref().is_some_and(|v| !v.preparing) && s.status != ContainerStatus::Stopped
+                            s.vm.as_ref().is_some_and(|v| !v.preparing && !v.logs_complete)
                         )).for_each_concurrent(8, |state| {
                             let manager = &manager;
                             async move {
@@ -206,7 +217,7 @@ impl ContainerManager {
     }
 }
 
-fn observe(state: &mut ContainerState, reply: Reply) -> Result<()> {
+fn observe(state: &mut ContainerState, reply: Reply) -> Result<bool> {
     let invalid = || {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -216,7 +227,7 @@ fn observe(state: &mut ContainerState, reply: Reply) -> Result<()> {
     let timestamp = |n: Option<i64>| n.filter(|v| *v > 0).map(DateTime::from_timestamp_nanos);
     let started = timestamp(reply.started_at);
     let finished = timestamp(reply.finished_at);
-    state.status = match reply.state.as_deref() {
+    let status = match reply.state.as_deref() {
         Some("created") if started.is_none() && finished.is_none() => ContainerStatus::Created,
         Some("running") if started.is_some() && finished.is_none() => ContainerStatus::Running,
         Some("exited") if finished.is_some() && reply.exit_code.is_some() => {
@@ -224,10 +235,18 @@ fn observe(state: &mut ContainerState, reply: Reply) -> Result<()> {
         }
         _ => return Err(invalid()),
     };
-    state.created_at = timestamp(reply.created_at).ok_or_else(invalid)?;
+    let created = timestamp(reply.created_at).ok_or_else(invalid)?;
+    let changed = state.status != status
+        || state.created_at != created
+        || state.started_at != started
+        || state.finished_at != finished
+        || state.exit_code != reply.exit_code
+        || state.pid.is_some();
+    state.status = status;
+    state.created_at = created;
     state.started_at = started;
     state.finished_at = finished;
     state.exit_code = reply.exit_code;
     state.pid = None;
-    Ok(())
+    Ok(changed)
 }
