@@ -134,6 +134,15 @@ with child(
     assert p.returncode == 35 or b"35" in stderr, (stderr, p.returncode)
 
 
+# Binary stdio spans many SPDY and vsock frames in both directions.
+payload = bytes(range(256)) * (12 * 1024)
+echo = subprocess.run(
+    base + ["exec", "-i", target, "/bin/busybox", "cat"],
+    input=payload, capture_output=True, timeout=20, check=True,
+)
+assert echo.stdout == payload, (len(payload), len(echo.stdout))
+
+
 def terminal(args, exchange):
     master, slave = pty.openpty()
     try:

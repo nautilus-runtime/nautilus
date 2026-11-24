@@ -53,8 +53,15 @@ impl Stream {
     }
 
     /// Push data received from the remote into this stream's receive buffer.
-    pub(crate) fn push_data(&self, data: Bytes) {
-        let _ = self.data_tx.try_send(data);
+    pub(crate) async fn push_data(&self, data: Bytes) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = self.wait_remote_reset() => Err(Error::StreamClosed),
+            result = self.data_tx.send(data) => result.map_err(|_| Error::StreamClosed),
+        }
     }
 
     /// Mark remote side as closed (FIN received).

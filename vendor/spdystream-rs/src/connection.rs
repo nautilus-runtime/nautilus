@@ -205,15 +205,25 @@ impl Connection {
                         }
                         Frame::Data(df) => {
                             let fin = (df.flags & DATA_FLAG_FIN) != 0;
-                            msg.stream.push_data(df.data.clone());
+                            // The socket reader can run ahead of the guest. Keep the
+                            // bounded queue and apply backpressure instead of dropping
+                            // a full frame. A stalled stream receives an explicit reset.
+                            let delivery = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                msg.stream.push_data(df.data.clone()),
+                            ).await;
+                            if matches!(delivery, Ok(Err(_))) {
+                                continue;
+                            }
+                            if delivery.is_err() {
+                                msg.stream.reset_remote();
+                                let _ = msg.stream.reset(RstStatus::FlowControlError).await;
+                                streams.lock().await.remove(&msg.stream.stream_id);
+                                continue;
+                            }
                             if fin {
                                 msg.stream.close_remote();
                             }
-                        }
-                        Frame::RstStream(_) => {
-                            msg.stream.reset_remote();
-                            let mut guard = streams.lock().await;
-                            guard.remove(&msg.stream.stream_id);
                         }
                         Frame::SynReply(sr) => {
                             msg.stream.replied.store(true, Ordering::Release);
@@ -362,13 +372,8 @@ impl Connection {
                         }
 
                         Frame::RstStream(ref rs) => {
-                            let sid = rs.stream_id;
-                            let stream = conn2.streams.lock().await.get(&sid).cloned();
-                            if let Some(stream) = stream {
-                                let worker_idx = (sid as usize) % N_WORKERS;
-                                let _ = worker_txs2[worker_idx]
-                                    .send(WorkerMsg { frame, stream })
-                                    .await;
+                            if let Some(stream) = conn2.streams.lock().await.remove(&rs.stream_id) {
+                                stream.reset_remote();
                             }
                         }
 
@@ -925,7 +930,7 @@ mod tests {
         .expect("timeout data")
         .expect("read data");
         if let Frame::Data(df) = data_frame {
-            s.push_data(df.data);
+            s.push_data(df.data).await.unwrap();
             s.close_remote();
         } else {
             panic!("expected Data frame");

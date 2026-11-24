@@ -64,6 +64,8 @@ exec 和 attach 的 `stream` 带有可选布尔值 `stdin`、`stdout`、`stderr`
 - `mounts[]` 只接受 `{"type":"bind","source":"volumes/<UUID>","destination":"/absolute/path","options":["bind","ro"]}` 或将最后一项替换成 `rw`。来源相对于该 Pod 的导出根，由宿主按授权准备；agent 要求来源由 root 所有，拒绝符号链接、特殊文件及多硬链接文件，目标必须处于容器 rootfs 内。挂载附加 nosuid/nodev/noexec。guest 拒绝覆盖根目录、/dev、/sys 或 /proc 的请求。宿主需在接受 CRI mount 前确认数据来源、读写和传播语义能够兑现。
 - 容器 init 的日志独立写入该 bundle 的 `container.log`，格式为 `RFC3339Nano stdout|stderr F|P payload\n`。16 KiB 超长行分片使用 `P`。guest 使用独占创建的文件描述符追加与读取，readLog 无路径参数。宿主按 offset 复制到 kubelet 的日志文件。guest 的日志保存在本次 Pod 导出中，生命周期与该 bundle 绑定。
 
+宿主 SPDY 接入使用锁定的 spdystream-rs 0.1.2。Nautilus 在本地副本中为单条转发区分输入半关闭和 RST，并在接收队列满时等待消费。真实 crictl 回归将 3 MiB 二进制输入经 guest 的 cat 原样读回，逐字节比对。[上游源代码](https://github.com/pelagos-containers/spdystream-rs) · [随项目维护的改动](../vendor/spdystream-rs/src/connection.rs)
+
 ## 构建与 KVM 验证
 
 原生 amd64 或 arm64 Linux 上使用 Go 1.24 或更高版本、静态 C 工具链、GNU cpio、curl、kmod、gzip 和目标 guest kernel 的模块。脚本校验 runc v1.5.3 上游发布二进制的 SHA-256。离线时可通过 `GUEST_RUNC_BIN` 提供相同文件，并预先填充 Go 模块缓存；也可用 `GUEST_AGENT_BIN` 提供从本目录交叉编译的静态程序。同一工具链、二进制与 kernel modules 生成一致的归档。
