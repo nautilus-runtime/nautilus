@@ -16,9 +16,32 @@ struct Identity {
     boot_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct StreamOptions {
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub tty: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PortOptions {
+    pub port: u16,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub(crate) enum Operation<'a> {
+    ExecStream {
+        argv: &'a [String],
+        stream: StreamOptions,
+    },
+    Attach {
+        stream: StreamOptions,
+    },
+    PortForward {
+        stream: PortOptions,
+    },
     Create,
     Start,
     Status,
@@ -121,6 +144,19 @@ impl Channel {
     }
 
     pub async fn call(mut self, id: &str, operation: Operation<'_>) -> io::Result<Reply> {
+        self.exchange(id, operation).await
+    }
+
+    pub(super) async fn open_stream(
+        mut self,
+        id: &str,
+        operation: Operation<'_>,
+    ) -> io::Result<BufReader<UnixStream>> {
+        self.exchange(id, operation).await?;
+        Ok(self.stream)
+    }
+
+    async fn exchange(&mut self, id: &str, operation: Operation<'_>) -> io::Result<Reply> {
         if !super::guest::canonical_uuid(id) {
             return Err(invalid("invalid container ID"));
         }

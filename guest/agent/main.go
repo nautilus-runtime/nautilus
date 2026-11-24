@@ -38,6 +38,7 @@ type identity struct {
 	Boot    string `json:"bootId"`
 }
 type request struct {
+	Stream *streamOptions `json:"stream,omitempty"`
 	identity
 	ID        string   `json:"requestId"`
 	Container string   `json:"containerId"`
@@ -132,6 +133,10 @@ func (s *server) serve(f *os.File) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		// A host disconnect cancels this connection's exec, including descendants.
+		if req.Op == "execStream" || req.Op == "attach" || req.Op == "portForward" {
+			s.stream(f, req)
+			return
+		}
 		if req.Op == "exec" {
 			go func() { var scratch [1]byte; f.Read(scratch[:]); cancel() }()
 		}
@@ -173,6 +178,23 @@ func run() error {
 		if err := mount(fs.typ, fs.source, fs.path, fs.flags); err != nil && !errors.Is(err, unix.EBUSY) {
 			return fmt.Errorf("mount %s: %w", fs.path, err)
 		}
+	}
+	// Pods using guest loopback only also support port forwarding.
+	fdNet, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	iface, err := unix.NewIfreq("lo")
+	if err == nil {
+		err = unix.IoctlIfreq(fdNet, unix.SIOCGIFFLAGS, iface)
+	}
+	if err == nil && iface.Uint16()&unix.IFF_UP == 0 {
+		iface.SetUint16(iface.Uint16() | unix.IFF_UP)
+		err = unix.IoctlIfreq(fdNet, unix.SIOCSIFFLAGS, iface)
+	}
+	unix.Close(fdNet)
+	if err != nil {
+		return fmt.Errorf("enable guest loopback: %w", err)
 	}
 	if err := os.MkdirAll("/run/nautilus/shm", 0700); err != nil {
 		return err

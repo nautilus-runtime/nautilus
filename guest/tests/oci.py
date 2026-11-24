@@ -316,6 +316,9 @@ if __name__ == "__main__":
         and b" stderr F firsterr\n" in data
         and b"secondout" not in data
     ), data
+    import streaming
+
+    streaming.run(connect, frame, read_exact, identity, uid, bundle, ok, first)
     for cid in [first, second]:
         assert ok("stop", cid, timeoutMs=0)["state"] == "exited"
         ok("stop", cid, timeoutMs=0)

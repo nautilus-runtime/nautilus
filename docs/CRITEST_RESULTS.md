@@ -16,6 +16,12 @@
 
 `b7eb13f` 的 Linux Rust 测试为 96 通过、0 失败、8 项默认忽略。全库格式检查仍涉及基线的 31 个文件，Clippy 仍报告 29 条诊断。独立运行的真实 CRI 测试使用 Cloud Hypervisor v55.0，覆盖双 Pod 网络与 DNS、两个 OCI 容器、十次 ExecSync、超时和取消、guest 连接中断、daemon 被强制终止后的恢复、日志及重复清理。Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主上另行通过双 Pod 网络测试。[运行步骤](VM_RUNTIME.md)
 
+## 2026-11-24 VM 的交互式 CRI
+
+在 pro6000 的隔离节点使用 crictl v1.37.0、Cloud Hypervisor v55.0 和实际 guest，通过 CRI 单独核对 Exec、Attach、PortForward。修订前标准输入的 3 MiB 二进制内容经 guest cat 只返回 2,387,968 字节。修订后 3,145,728 字节逐字节一致。另验证了独立 stderr、非零退出码、终端尺寸、重连到原 init、客户端断开时取消执行、目标端口不存在、连续转发两个连接和 guest 失联的错误。在单独的 SPDY 测试中，一条流半关闭后仍能读取，将其复位后另一条流仍能传输。
+
+`347c4dc` 上默认 OCI 的未过滤 critest v1.31.1 为 **95 通过、1 失败、17 跳过**，耗时 245.738 秒。唯一失败是 HostNetwork=false 清理快速退出容器时缺失 systemd scope。合入 #25 对应修复后，在最终组合 `a594097` 的新状态目录重跑，结果为 **96 通过、0 失败、17 跳过**，耗时 234.533 秒。单独运行随项目引入的 SPDY 测试，36 项通过。Cloud Hypervisor v55.0 的双 Pod 测试在 15.94 秒内完成卷、流、daemon 恢复和清理的联合验收。[协议及验证步骤](GUEST_OCI_PROTOCOL.md)
+
 ## 2026-11-24 普通 OCI 容器快速退出
 
 在独立的 Debian 13 节点（Linux 6.12.118、systemd 257、cgroup v2）上，提交 `b7eb13f` 的 `HostNetwork is false` 用例第二轮复现清理失败。daemon 已记录 init 的退出码 0，随后 systemd 回收了其 scope，StopContainer 枚举 cgroup 进程时收到 ENOENT。

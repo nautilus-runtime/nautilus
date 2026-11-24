@@ -57,9 +57,6 @@ impl VmBackend {
 
     fn validate(&self, spec: &WorkloadSpec) -> Result<()> {
         let unsupported = |text: &str| Error::Experimental(format!("Pod VM: {text}"));
-        if spec.open_stdin {
-            return Err(unsupported("interactive stdin is unavailable"));
-        }
         if self.config.security.seccomp
             || !self.config.security.seccomp_profile_path.is_empty()
             || self.config.security.enable_apparmor
@@ -176,7 +173,8 @@ impl VmBackend {
         let spec_json = json!({
             "ociVersion":"1.1.0", "mounts":mounts,
             "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
-            "process":{"terminal":false,"user":{"uid":uid,"gid":gid,"additionalGids":groups},
+            "annotations":{"io.nautilus.stdin":spec.open_stdin.to_string(),"io.nautilus.stdinOnce":spec.stdin_once.to_string()},
+            "process":{"terminal":spec.tty,"user":{"uid":uid,"gid":gid,"additionalGids":groups},
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},
             "linux":{"namespaces":[{"type":"mount"},{"type":"pid"}],"resources":resources}
         });

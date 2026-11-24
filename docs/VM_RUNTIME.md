@@ -1,6 +1,6 @@
 # Pod 级虚机运行时
 
-设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。kubelet 的 RuntimeClass 发现、实时宿主卷和流式接口跟踪于 #16。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
+设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。交互式 Exec、Attach 和 PortForward 连接到目标 guest。kubelet 的 RuntimeClass 发现和宿主卷接入跟踪于 #16。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
 
 ## 所有权与协议
 
@@ -106,6 +106,10 @@ sudo --preserve-env=NAUTILUS_CNI_BIN_DIR,NAUTILUS_VM_VMM,NAUTILUS_VM_KERNEL,NAUT
 用 `guest/build-workload-initramfs.sh` 构建工作负载镜像。每个容器独立持有 OCI rootfs、PID namespace 和 guest runc 实例，通过认证的 vsock 连接进行生命周期和 ExecSync 操作。宿主按 guest 提供的日志偏移写入 kubelet 日志。日志文件系统需支持 `O_TMPFILE` 和用户扩展属性，宿主先持久化匿名 inode 的身份，再发布 kubelet 使用的文件名。[guest 协议](GUEST_OCI_PROTOCOL.md)
 
 `tests/vm_cri_workloads_test.rs` 在独立网络命名空间启动真实 daemon，使用带摘要的本地 OCI 镜像测试两个 Pod、同 Pod 的两个容器、十次连续 exec、日志、超时、断连、daemon 重启和重复删除。运行时设置 `NAUTILUS_VM_VMM`、`NAUTILUS_VM_KERNEL`、`NAUTILUS_VM_INITRAMFS`、`NAUTILUS_VM_VIRTIOFSD`、`NAUTILUS_CNI_BIN_DIR` 和指向静态 BusyBox 的 `NAUTILUS_TEST_BUSYBOX`，再执行 `cargo test --locked --test vm_cri_workloads_test -- --ignored --nocapture`。
+
+在上述测试环境中设置 `NAUTILUS_TEST_CRICTL` 指向上游 crictl v1.37.0，即可同时运行真实客户端的 SPDY 验收。测试先读取一行 stdout，再写入 stdin，检查单独的 stderr 和退出码 35。它还验证终端尺寸变化、两次 attach 连到同一 init PID 1、断连后取消 exec、guest 回环端口的成功连接与拒绝，以及一次性 URL 的重用拒绝。
+
+Kata 4.4.0 将执行、等待进程、读写 stdio 和调整终端尺寸作为 guest agent 操作。Firecracker v1.18.0 的 vsock 为宿主应用和 guest 应用提供双向字节通道。Nautilus 保留 kubelet 的标准 remotecommand 和 port-forward 接口，在已核对启动身份的 vsock 连接内由 guest agent 执行这些操作，转发端口从该 guest 的网络命名空间拨号。[Kata agent 接口](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/libs/protocols/protos/agent.proto#L32-L48) · [Firecracker vsock](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/vsock.md) · [Kubernetes remotecommand v4](https://github.com/kubernetes/client-go/blob/v0.37.2/tools/remotecommand/v4.go)
 
 ## 节点探针
 

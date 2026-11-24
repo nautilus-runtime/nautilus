@@ -102,6 +102,8 @@ pub(crate) struct CreateWorkload<'a> {
     pub stdin: bool,
     pub working_dir: &'a str,
     pub strict_groups: bool,
+    pub tty: bool,
+    pub stdin_once: bool,
     pub attempt: u32,
 }
 
@@ -176,12 +178,12 @@ impl ContainerManager {
         stdin: bool,
     ) -> Result<String> {
         self.create_with_process_options(CreateWorkload { pod_id, name, image, sandbox_kind, command, args,
-            log_path, volumes, env, resources, security, labels, annotations, stdin, working_dir: "", strict_groups: false, attempt: 0 }).await
+            log_path, volumes, env, resources, security, labels, annotations, stdin, working_dir: "", strict_groups: false, tty: false, stdin_once: false, attempt: 0 }).await
     }
 
     pub(crate) async fn create_with_process_options(&self, request: CreateWorkload<'_>) -> Result<String> {
         let CreateWorkload { pod_id, name, image, sandbox_kind, command, args, log_path, volumes, env,
-            resources, security, labels, annotations, stdin, working_dir, strict_groups, attempt } = request;
+            resources, security, labels, annotations, stdin, working_dir, strict_groups, tty, stdin_once, attempt } = request;
         let container_id = StateManager::generate_container_id();
         let open_stdin = stdin;
 
@@ -259,6 +261,8 @@ impl ContainerManager {
         let mut spec = self.workload_spec_with_net(&container_state).await?;
         spec.working_dir = working_dir.to_owned();
         spec.strict_groups = strict_groups;
+        spec.tty = tty;
+        spec.stdin_once = stdin_once;
         spec.entrypoint = command;
         spec.args = args;
         spec.log_relpath = log_relpath;
@@ -296,6 +300,8 @@ impl ContainerManager {
             entrypoint: Vec::new(),
             working_dir: String::new(),
             strict_groups: false,
+            tty: false,
+            stdin_once: false,
             env: state.env.clone(),
             // Host-side capture directory; RuncBackend bind-mounts it into the
             // container at /.nautilus-log. When the CRI log path points into
@@ -523,6 +529,22 @@ impl ContainerManager {
         backend
             .exec_sync(container_id, args, env, cwd, timeout)
             .await
+    }
+
+    /// Connect a stream to the guest identified by its owning Pod and boot.
+    pub(crate) async fn guest_stream(
+        &self,
+        pod: &str,
+        id: &str,
+        operation: crate::vm::workload::Operation<'_>,
+        options: crate::vm::workload::StreamOptions,
+        closed: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::vm::stream::GuestStream> {
+        let owner = crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"));
+        let channel = owner.workload_channel(pod).await.map_err(|err| {
+            std::io::Error::new(err.kind(), format!("connect to Pod VM guest agent: {err}"))
+        })?;
+        crate::vm::stream::open(channel, id, operation, options, closed).await
     }
 
     /// Live-stdio exec for the CRI streaming interfaces. Same container-state
