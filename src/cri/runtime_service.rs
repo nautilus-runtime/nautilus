@@ -1192,31 +1192,6 @@ impl RuntimeService for NautilusRuntimeService {
         let mut filtered_containers = Vec::new();
         
         for container in containers {
-            // Apply filters if provided
-            if let Some(filter) = &req.filter {
-                if !filter.id.is_empty() && container.id != filter.id {
-                    continue;
-                }
-                
-                if !filter.pod_sandbox_id.is_empty() && container.pod_id != filter.pod_sandbox_id {
-                    continue;
-                }
-                
-                if let Some(state) = &filter.state {
-                    let container_state = match container.status {
-                        ContainerStatus::Created => runtime::v1::ContainerState::ContainerCreated,
-                        ContainerStatus::Running => runtime::v1::ContainerState::ContainerRunning,
-                        ContainerStatus::Stopped => runtime::v1::ContainerState::ContainerExited,
-                        ContainerStatus::Paused => runtime::v1::ContainerState::ContainerRunning,
-                        ContainerStatus::Unknown => runtime::v1::ContainerState::ContainerUnknown,
-                    };
-                    
-                    if state.state != container_state as i32 {
-                        continue;
-                    }
-                }
-            }
-            
             let container_status = match container.status {
                 ContainerStatus::Created => runtime::v1::ContainerState::ContainerCreated,
                 ContainerStatus::Running => runtime::v1::ContainerState::ContainerRunning,
@@ -1224,7 +1199,17 @@ impl RuntimeService for NautilusRuntimeService {
                 ContainerStatus::Paused => runtime::v1::ContainerState::ContainerRunning,
                 ContainerStatus::Unknown => runtime::v1::ContainerState::ContainerUnknown,
             };
-            
+
+            if let Some(filter) = &req.filter {
+                if (!filter.id.is_empty() && container.id != filter.id)
+                    || (!filter.pod_sandbox_id.is_empty() && container.pod_id != filter.pod_sandbox_id)
+                    || filter.state.as_ref().is_some_and(|state| state.state != container_status as i32)
+                    || !filter.label_selector.iter().all(|(key, value)| container.labels.get(key) == Some(value))
+                {
+                    continue;
+                }
+            }
+
             let image_id = self.images.container_image_id(&container).await;
             filtered_containers.push(Container {
                 id: container.id,
