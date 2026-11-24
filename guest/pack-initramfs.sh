@@ -18,7 +18,14 @@ mkdir -p "$work/modules"
 "${CC:-cc}" -std=c11 -D_GNU_SOURCE -Os -static -Wall -Wextra -Werror -o "$work/init" -I "$sources" "$init_source"
 
 # Capture modprobe errors. A built-in driver contributes no module file.
-for driver in virtio_pci vmw_vsock_virtio_transport; do
+extra_drivers=()
+if [[ ${WORKLOAD_GUEST:-0} == 1 ]]; then
+    mkdir -p "$work/bin"
+    install -m 0755 "$GUEST_AGENT_BIN" "$work/bin/nautilus-agent"
+    install -m 0755 "$GUEST_RUNC_BIN" "$work/bin/runc"
+    extra_drivers+=(virtiofs)
+fi
+for driver in virtio_pci vmw_vsock_virtio_transport "${extra_drivers[@]}"; do
     modprobe --set-version "$release" --show-depends "$driver" >>"$work/deps"
 done
 awk '$1 == "insmod" && !seen[$2]++ { print $2 }' "$work/deps" >"$work/files"
@@ -33,5 +40,5 @@ while IFS= read -r module; do
     esac
     n=$((n + 1))
 done <"$work/files"
-(cd "$work" && find init modules -print0 | cpio --quiet --null -o -H newc --owner=0:0 | gzip -n) >"$archive"
+(cd "$work" && rm -f deps files && find . -exec touch -h -d @0 {} + && find . -print0 | LC_ALL=C sort -z | cpio --quiet --reproducible --null -o -H newc --owner=0:0 | gzip -n) >"$archive"
 mv -- "$archive" "$output"
