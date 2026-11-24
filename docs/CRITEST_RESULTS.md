@@ -21,6 +21,10 @@
 
 Linux 完整 Rust 测试为 104 通过、0 失败、8 项默认忽略。与主线 `12e7d5c` 对照，全库 `cargo fmt --check` 仍报告相同的 31 个文件，`cargo clippy --locked -- -D warnings` 仍报告相同的 29 项诊断。
 
+复查 KVM 夹具时发现，最后一次重启 daemon 后，CRI 列表已清空，但三个独立运行各留下一对属于内部就绪探针的 VMM 和 virtiofsd 服务。原夹具在探针运行时终止 daemon，并开始删除临时状态目录。加入宿主资源断言后，同一场景在 13.76 秒后如实报错，保留了完整目录。分别在探针运行时发送 SIGKILL 和 SIGTERM，再从原状态目录重启，daemon 均回收了旧服务、网络命名空间、IPAM 租约和归属记录。
+
+修正后的夹具在 CRI 公告 `vm` handler 后继续执行，关闭 daemon 后复查该次测试的资源。真实 KVM 连续三轮通过，耗时 17.84、17.33、17.22 秒。第四轮由另一 daemon 同时运行独立的 VM Pod，用例在 17.11 秒内通过。运行前后的 systemd 服务、网络命名空间、IPAM 租约和归属记录一致，独立 Pod 保持 Ready，VMM 进程 ID 未变。[夹具修复记录](https://github.com/nautilus-runtime/nautilus/issues/34)
+
 ## 2026-11-24 真实 kubelet 和 RuntimeClass
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点验证提交 `58e5ea5`。API server、scheduler、controller-manager、kubelet 与 kubectl 均为 Kubernetes v1.37.2，节点为 Linux 6.12.118、systemd 257.13、Cloud Hypervisor v55.0 和 virtiofsd 1.13.2，guest 为 Linux 5.15.0-191。测试通过 Kubernetes API 提交两个 VM Pod，在三个 Ready 容器上核对日志、镜像 ID、同 Pod 共享和跨 Pod 独立的 boot ID、跨 Pod HTTP、原 init 的交互式 attach、端口转发和 `kubectl exec` 传回的退出码 35。[复验脚本](../tests/kubelet_vm_acceptance.py) [RuntimeClass 和节点配置](VM_RUNTIMECLASS.md)

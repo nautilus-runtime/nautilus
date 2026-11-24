@@ -166,19 +166,31 @@ async fn daemon(root: &Path) -> Result<(Child, Runtime)> {
         .kill_on_drop(true)
         .spawn()?;
     let mut cli = Runtime::new(channel(root));
-    timeout(Duration::from_secs(30), async {
+    timeout(Duration::from_secs(75), async {
         loop {
             if let Some(status) = child.try_wait()? {
                 bail!("daemon startup failed: {status}")
             }
-            if cli.status(StatusRequest::default()).await.is_ok() {
+            // The CRI socket opens while the hidden readiness VM is starting.
+            // Advertising the VM handler follows removal of that probe and its network.
+            if cli
+                .status(StatusRequest::default())
+                .await
+                .is_ok_and(|status| {
+                    status
+                        .into_inner()
+                        .runtime_handlers
+                        .iter()
+                        .any(|handler| handler.name == "vm")
+                })
+            {
                 return Ok::<_, anyhow::Error>(());
             }
             sleep(Duration::from_millis(80)).await;
         }
     })
     .await
-    .context("starting test daemon")??;
+    .context("waiting for test daemon to advertise the VM handler")??;
     Ok((child, cli))
 }
 
@@ -1107,6 +1119,53 @@ async fn cleanup(cli: &mut Runtime) -> Result<()> {
     Ok(())
 }
 
+async fn verify_host_cleanup(root: &Path) -> Result<()> {
+    let units = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=WorkingDirectory",
+            "--value",
+            "nautilus-vm-*.service",
+            "nautilus-virtiofs-*.service",
+        ])
+        .output()
+        .await?;
+    ensure!(
+        units.status.success(),
+        "systemctl show: {}",
+        String::from_utf8_lossy(&units.stderr)
+    );
+    for dir in std::str::from_utf8(&units.stdout)?.lines() {
+        ensure!(
+            !Path::new(dir).starts_with(root),
+            "test VM service still uses {dir}"
+        );
+    }
+
+    // The two owners keep a lock file. host-local keeps its lock and allocation cursor.
+    for (dir, allowed) in [
+        ("state/vms", &[".operations"][..]),
+        ("state/vm-network", &[".operations"][..]),
+        ("netns", &[][..]),
+        ("ipam/ntcriw15", &["lock", "last_reserved_ip.0"][..]),
+    ] {
+        let entries = match fs::read_dir(root.join(dir)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            result => result?,
+        };
+        for entry in entries {
+            let entry = entry?;
+            ensure!(
+                entry.file_type()?.is_file()
+                    && allowed.iter().any(|&name| entry.file_name() == name),
+                "test resource survived cleanup: {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires systemd, KVM, workload guest and bridge CNI plugins"]
 async fn vm_workloads_through_cri_recover_after_daemon_restart() -> Result<()> {
@@ -1137,18 +1196,22 @@ async fn vm_workloads_through_cri_recover_after_daemon_restart() -> Result<()> {
         "enable the isolated host namespace loopback for CRI streaming"
     );
     let dir = tempfile::tempdir_in("/tmp")?;
-    let root = dir.path();
-    let image = configure(root)?;
-    let (mut process, mut cli) = daemon(root).await?;
-    let result = scenario(root, &image, &mut process, &mut cli).await;
+    let image = configure(dir.path())?;
+    // Keep the full journal if startup or teardown fails, even with a mounted netns.
+    let root = dir.into_path();
+    let (mut process, mut cli) = daemon(&root)
+        .await
+        .with_context(|| format!("starting daemon with retained state at {}", root.display()))?;
+    let result = scenario(&root, &image, &mut process, &mut cli).await;
     let cleaned = cleanup(&mut cli).await;
-    let _ = process.kill().await;
-    if let Err(e) = cleaned {
-        let saved = dir.into_path();
+    let stopped = process.kill().await.context("stop test daemon");
+    let released = verify_host_cleanup(&root).await;
+    if let Err(e) = cleaned.and(stopped).and(released) {
         bail!(
             "scenario {result:?}; cleanup {e:#}; retained test state at {}",
-            saved.display()
+            root.display()
         )
     }
+    fs::remove_dir_all(&root)?;
     result
 }
