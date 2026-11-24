@@ -1,6 +1,6 @@
 # Pod 级虚机运行时
 
-设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。当前实现提供节点探针、自研 guest agent 的启动身份校验，以及实验性的 Pod VM 生命周期管理。面向 kubelet 的 handler 在完成容器、网络与恢复验收后启用。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
+设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。kubelet 的 RuntimeClass 发现、实时宿主卷和流式接口跟踪于 #16。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
 
 ## 所有权与协议
 
@@ -97,7 +97,11 @@ sudo --preserve-env=NAUTILUS_CNI_BIN_DIR,NAUTILUS_VM_VMM,NAUTILUS_VM_KERNEL,NAUT
 
 守护进程确认本次启动的身份、完整网络配置和工作负载 agent 的 4083 握手后才发布 READY，并返回该次 attempt 的 Pod IP。运行中 guest 失联会反映在状态及列表；独立的身份探针仍用于旧的开发用 VM。停止时先回收 guest 容器和 VMM，再以已记录的 CNI 配置删除网络。中断的启动或停止可在 daemon 重启时继续清理。
 
-`tests/vm_pod_lifecycle_test.rs` 的 `cri_pod_network_survives_daemon_restart_and_releases_on_stop` 通过真实 CRI socket 验证两台 Pod VM、地址可达、daemon SIGKILL 后 IP 与 boot ID 保持、DEL 失败重试、VMM 意外退出、重复停止与删除。配置 `NAUTILUS_VM_IDENTITY_INITRAMFS` 可额外检查仅具有身份握手的 guest 启动失败后完整回收。通过同一测试的节点使用 Debian Linux 6.12.118、Cloud Hypervisor v54.1，guest 内核为 Ubuntu 5.15.0-191。
+`tests/vm_pod_lifecycle_test.rs` 的 `cri_pod_network_survives_daemon_restart_and_releases_on_stop` 通过真实 CRI socket 验证两台 Pod VM、地址可达、daemon SIGKILL 后 IP 与 boot ID 保持、DEL 失败重试、VMM 意外退出、重复停止与删除。配置 `NAUTILUS_VM_IDENTITY_INITRAMFS` 可额外检查仅具有身份握手的 guest 启动失败后完整回收。通过同一测试的节点使用 Debian Linux 6.12.118，Cloud Hypervisor v54.1 和 v55.0 分别运行通过，guest 内核为 Ubuntu 5.15.0-191。
+
+用 `guest/build-workload-initramfs.sh` 构建工作负载镜像。每个容器独立持有 OCI rootfs、PID namespace 和 guest runc 实例，通过认证的 vsock 连接进行生命周期和 ExecSync 操作。宿主按 guest 提供的日志偏移写入 kubelet 日志。日志文件系统需支持 `O_TMPFILE` 和用户扩展属性，宿主先持久化匿名 inode 的身份，再发布 kubelet 使用的文件名。[guest 协议](GUEST_OCI_PROTOCOL.md)
+
+`tests/vm_cri_workloads_test.rs` 在独立网络命名空间启动真实 daemon，使用带摘要的本地 OCI 镜像测试两个 Pod、同 Pod 的两个容器、十次连续 exec、日志、超时、断连、daemon 重启和重复删除。运行时设置 `NAUTILUS_VM_VMM`、`NAUTILUS_VM_KERNEL`、`NAUTILUS_VM_INITRAMFS`、`NAUTILUS_VM_VIRTIOFSD`、`NAUTILUS_CNI_BIN_DIR` 和指向静态 BusyBox 的 `NAUTILUS_TEST_BUSYBOX`，再执行 `cargo test --locked --test vm_cri_workloads_test -- --ignored --nocapture`。
 
 ## 节点探针
 
