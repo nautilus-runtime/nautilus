@@ -167,10 +167,14 @@ hostNetwork 为 pod 级字段,容器强制继承(跳过 netns/CNI/port-publish)�
 
 #### OCI 根文件系统快照
 
-同一镜像创建多个容器时，默认复用已经解包的文件树。首次创建在
-`storage.container_dir/.snapshots-v1` 内的临时目录按层处理 OCI whiteout、权限和属主，
-完成后原子重命名发布。缓存键包含镜像配置及已解析的平台 manifest 摘要。旧缓存缺少摘要时，
-使用其完整 manifest 派生键。同一缓存分片的文件锁协调并发首次创建和回收。
+启用 OverlayFS 时，`PullImage` 成功返回前会准备好可复用的镜像树。拉取先解析平台 manifest，
+再在 `storage.container_dir/.snapshots-v1` 的临时目录探测挂载能力，按层解包并应用 OCI whiteout、权限和属主。
+解包在镜像索引锁之外进行。成功后写入拉取日志，在分片锁内以原子重命名发布镜像树，再更新标签和索引。
+解包失败会丢弃临时树，原有标签继续可用。进程在提交阶段退出时，下次启动根据日志和本地压缩层完成发布。
+
+缓存键由镜像配置摘要和平台 manifest 摘要组成。旧缓存缺少 manifest 摘要时使用完整 manifest 派生键。
+重复拉取复用已发布的树。正常的 `CreateContainer` 只需固定这棵树并准备容器的可写层。
+对升级前只缓存了压缩层的镜像，或直接发起的创建请求，仍可在创建时补建镜像树。
 
 每个 bundle 独占 OverlayFS 的 upper 和 work。创建和启动分别在短生命周期线程的挂载命名空间内挂载 rootfs，启用 inode 索引以保留硬链接写时复制语义。操作结束即释放该线程的挂载，运行中的容器保留自己的视图。镜像树是只读 lower，
 容器写入及运行时生成的 hosts、resolv.conf 都进入各自的 upper。bundle 和缓存之间的

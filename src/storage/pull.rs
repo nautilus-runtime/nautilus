@@ -270,30 +270,69 @@ impl CachedImage {
 }
 
 /// Make sure all layers of `image_ref` are present in the local cache.
-/// Used by CRI PullImage (prefetch only); `auth` comes from the CRI
-/// AuthConfig (Anonymous for public registries).
+/// Callers that only need compressed layers can skip preparing a runtime snapshot.
 pub async fn prefetch_layers(config: &Config, image_ref: &str, auth: RegistryAuth) -> Result<String> {
+    Ok(fetch_for_pull(config, image_ref, auth).await?.0)
+}
+
+async fn fetch_for_pull(config: &Config, image_ref: &str, auth: RegistryAuth) -> Result<(String, CachedImage)> {
     let reference = resolve_ref(config, image_ref)?;
-    if cached_for_pull(config, &reference).await?.is_some() {
-        return Ok(reference.whole());
+    if let Some(cached) = cached_for_pull(config, &reference).await? {
+        return Ok((reference.whole(), cached));
     }
     let cached = CachedImage::fetch(config, &client(), &reference, &auth, false).await?;
-    Ok(Reference::with_digest(reference.registry().to_owned(), reference.repository().to_owned(), cached.manifest_digest).whole())
+    let pinned = Reference::with_digest(
+        reference.registry().to_owned(), reference.repository().to_owned(), cached.manifest_digest.clone(),
+    );
+    Ok((pinned.whole(), cached))
+}
+
+pub(super) async fn stage_pull(
+    config: &Config, image_ref: &str, auth: RegistryAuth,
+) -> Result<(String, Option<super::snapshot::StagedTree>)> {
+    let (pinned, cached) = fetch_for_pull(config, image_ref, auth).await?;
+    if !config.storage.overlay.enabled {
+        return Ok((pinned, None));
+    }
+    let dir = config.storage.container_dir.clone();
+    let options = config.storage.overlay.mount_options.clone();
+    let image_dir = config.storage.image_dir.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        super::snapshot::stage_pull(&dir, &cached.snapshot_key()?, &options, |dst| cached.unpack(dst, &image_dir))
+    }).await.map_err(|e| Error::Storage(format!("stage rootfs snapshot: {e}")))??;
+    Ok((pinned, Some(staged)))
 }
 
 /// After the index intent is durable, publish the downloaded immutable
 /// manifest under its requested reference. This operation can be replayed.
 pub(super) async fn publish_cached(
     config: &Config, image_ref: &str, requested: &str, pinned: &str,
+    prepare_snapshot: bool, staged: Option<super::snapshot::StagedTree>, update: super::image::IndexGuard,
 ) -> Result<ImageFacts> {
     let pinned = parse_ref(pinned)?;
     let requested = parse_ref(requested)?;
     let cached = load_cached(config, &pinned).await.ok_or_else(|| Error::Image(format!("missing cached manifest for {pinned}")))?;
+    let facts = cached.facts(image_ref);
+    let dir = config.storage.container_dir.clone();
+    let overlay = config.storage.overlay.clone();
+    let image_dir = config.storage.image_dir.clone();
+    let facts = tokio::task::spawn_blocking(move || -> Result<ImageFacts> {
+        let _guard = update;
+        if prepare_snapshot && overlay.enabled {
+            super::snapshot::publish_pull(
+                &dir, &cached.snapshot_key()?, &overlay.mount_options, staged,
+                |dst| cached.unpack(dst, &image_dir),
+            )?;
+        } else {
+            super::snapshot::retain(&dir, &facts.config_digest, &facts.manifest_digest)?;
+        }
+        Ok(facts)
+    }).await.map_err(|e| Error::Storage(format!("publish rootfs snapshot: {e}")))??;
     if requested != pinned {
         let data = tokio::fs::read(manifest_cache_path(config, &pinned)).await?;
         super::atomic_write(&manifest_cache_path(config, &requested), &data).await?;
     }
-    Ok(cached.facts(image_ref))
+    Ok(facts)
 }
 
 async fn cached_for_pull(config: &Config, reference: &Reference) -> Result<Option<CachedImage>> {
@@ -356,6 +395,37 @@ pub async fn image_facts(config: &Config, image_ref: &str, auth: RegistryAuth) -
 }
 
 impl CachedImage {
+    fn snapshot_key(&self) -> Result<String> {
+        // Old manifest-cache entries may lack a digest. Their resolved OCI
+        // manifest still records the ordered layers and configuration.
+        let identity = if self.manifest_digest.is_empty() {
+            serde_json::to_vec(&self.manifest)?
+        } else {
+            self.manifest_digest.as_bytes().to_owned()
+        };
+        Ok(super::snapshot::key(&self.manifest.config.digest, &identity))
+    }
+
+    fn unpack(&self, dst: &Path, image_dir: &Path) -> Result<()> {
+        for (path, media_type) in &self.blobs {
+            crate::storage::unpack::apply_layer(dst, &std::fs::read(path)?, media_type)?;
+        }
+        let meta = serde_json::json!({
+            "image_id": self.manifest.config.digest,
+            "created": self.config.created.map(|c| c.to_rfc3339()),
+            "size": dir_size(dst),
+        });
+        let sidecar = image_dir.join(format!("{}.nmeta",
+            super::image::safe_image_name(&self.manifest.config.digest)));
+        // Size is optional display metadata. Never expose a partial JSON file.
+        if let Ok(mut file) = tempfile::NamedTempFile::new_in(image_dir) {
+            if serde_json::to_writer(&mut file, &meta).is_ok() {
+                let _ = file.persist(sidecar);
+            }
+        }
+        Ok(())
+    }
+
     fn facts(&self, image_ref: &str) -> ImageFacts {
         let size = self.manifest.layers.iter().map(|d| d.size.max(0) as u64).sum::<u64>()
             + self.manifest.config.size.max(0) as u64;
@@ -445,34 +515,11 @@ async fn prepare_root(config: &Config, image_ref: &str, rootfs_dir: &Path, overl
     let image_dir = config.storage.image_dir.clone();
     let options = config.storage.overlay.mount_options.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        // Old manifest-cache entries may lack a digest. Their resolved OCI
-        // manifest still records the ordered layers and configuration.
-        let identity = if cached.manifest_digest.is_empty() {
-            serde_json::to_vec(&cached.manifest)?
+        let key = cached.snapshot_key()?;
+        let unpack = |dst: &Path| cached.unpack(dst, &image_dir);
+        if overlay {
+            super::snapshot::prepare(root.parent().unwrap(), &key, &options, unpack)?;
         } else {
-            cached.manifest_digest.as_bytes().to_owned()
-        };
-        let key = super::snapshot::key(&cached.manifest.config.digest, &identity);
-        let unpack = |dst: &Path| -> Result<()> {
-            for (path, media_type) in &cached.blobs {
-                crate::storage::unpack::apply_layer(dst, &std::fs::read(path)?, media_type)?;
-            }
-            let meta = serde_json::json!({
-                "image_id": cached.manifest.config.digest,
-                "created": cached.config.created.map(|c| c.to_rfc3339()),
-                "size": dir_size(dst),
-            });
-            let sidecar = image_dir.join(format!("{}.nmeta",
-                super::image::safe_image_name(&cached.manifest.config.digest)));
-            // Size is optional display metadata. Never expose a partial JSON file.
-            if let Ok(mut file) = tempfile::NamedTempFile::new_in(&image_dir) {
-                if serde_json::to_writer(&mut file, &meta).is_ok() {
-                    let _ = file.persist(sidecar);
-                }
-            }
-            Ok(())
-        };
-        if !overlay || !super::snapshot::prepare(root.parent().unwrap(), &key, &options, unpack)? {
             unpack(&root)?;
         }
         Ok(())

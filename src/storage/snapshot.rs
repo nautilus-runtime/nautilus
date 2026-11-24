@@ -98,22 +98,15 @@ fn mount_flags(options: &[String]) -> Result<MsFlags> {
     Ok(flags)
 }
 
-/// Install a shared or plain rootfs. Return false for paths requiring the caller
-/// to unpack directly. Mount options that cannot be honored are errors.
-pub(super) fn prepare(
-    bundle: &Path,
-    key: &str,
-    options: &[String],
-    unpack: impl FnOnce(&Path) -> Result<()>,
-) -> Result<bool> {
-    let flags = mount_flags(options)?;
-    let bundle = fs::canonicalize(bundle)?;
-    let store = bundle
-        .parent()
-        .ok_or_else(|| invalid("invalid bundle"))?
-        .join(STORE);
-    if bundle.to_str().is_none()
-        || bundle
+pub(super) enum StagedTree {
+    Existing,
+    New(tempfile::TempDir),
+    Plain,
+}
+
+fn overlay_path(path: &Path, flags: MsFlags) -> Result<bool> {
+    if path.to_str().is_none()
+        || path
             .as_os_str()
             .as_encoded_bytes()
             .iter()
@@ -126,60 +119,143 @@ pub(super) fn prepare(
         }
         return Ok(false);
     }
+    Ok(true)
+}
+
+fn stage_tree(
+    store: &Path,
+    key: &str,
+    flags: MsFlags,
+    unpack: impl FnOnce(&Path) -> Result<()>,
+) -> Result<StagedTree> {
+    if store.join(key).try_exists()? {
+        return Ok(StagedTree::Existing);
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".building-{key}."))
+        .tempdir_in(store)?;
+    let root = staging.path().join("root");
+    fs::create_dir(&root)?;
+    // Probe before extraction so unsupported filesystems only unpack once, at create.
+    let probe = tempfile::tempdir_in(staging.path())?;
+    for name in ["upper", "work", "rootfs"] {
+        fs::create_dir(probe.path().join(name))?;
+    }
+    let supported = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                private_namespace()?;
+                mount_view(probe.path(), staging.path(), flags)?;
+                umount(&probe.path().join("rootfs"))
+            })
+            .join()
+    })
+    .map_err(|_| invalid("snapshot mount probe panicked"))?;
+    probe.close()?;
+    match supported {
+        Ok(()) => {}
+        Err(Errno::ENODEV | Errno::EOPNOTSUPP | Errno::EPERM | Errno::EINVAL | Errno::EXDEV) => {
+            if flags != MsFlags::MS_NODEV {
+                return Err(invalid(
+                    "filesystem cannot apply requested rootfs mount flags",
+                ));
+            }
+            return Ok(StagedTree::Plain);
+        }
+        Err(e) => return Err(Error::Storage(format!("probe OverlayFS: {e}"))),
+    }
+    unpack(&root)?;
+    fs::write(staging.path().join("pin"), key)?;
+    Ok(StagedTree::New(staging))
+}
+
+pub(super) fn stage_pull(
+    dir: &Path,
+    key: &str,
+    options: &[String],
+    unpack: impl FnOnce(&Path) -> Result<()>,
+) -> Result<StagedTree> {
+    let store = dir.join(STORE);
+    // Extraction uses a private staging directory. Recheck the hint under lock at publication.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&store)?;
+    let store = fs::canonicalize(store)?;
+    let flags = mount_flags(options)?;
+    if !overlay_path(&store, flags)? {
+        return Ok(StagedTree::Plain);
+    }
+    stage_tree(&store, key, flags, unpack)
+}
+
+// Called with the shard locked. Another reference may already have published this tree.
+fn install(tree: &Path, staged: StagedTree) -> Result<bool> {
+    match staged {
+        StagedTree::Plain => Ok(false),
+        StagedTree::Existing => Ok(true),
+        StagedTree::New(dir) => {
+            fs::rename(dir.path(), tree)?;
+            Ok(true)
+        }
+    }
+}
+
+pub(super) fn publish_pull(
+    dir: &Path,
+    key: &str,
+    options: &[String],
+    staged: Option<StagedTree>,
+    unpack: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    if matches!(staged, Some(StagedTree::Plain)) {
+        return Ok(());
+    }
+    let store = dir.join(STORE);
     let _lock = lock(&store, key)?;
+    let store = fs::canonicalize(store)?;
     let tree = store.join(key);
     if !tree.try_exists()? {
-        let staging = store.join(format!(".building-{key}"));
-        if staging.try_exists()? {
-            fs::remove_dir_all(&staging)?;
-        }
-        fs::create_dir(&staging)?;
-        let result = (|| -> Result<bool> {
-            fs::create_dir(staging.join("root"))?;
-            unpack(&staging.join("root"))?;
-            // Probe once per published tree, using disposable upper/work dirs.
-            // Never reuse a probe's upper for the container's first mount.
-            let probe = tempfile::tempdir_in(&staging)?;
-            for name in ["upper", "work", "rootfs"] {
-                fs::create_dir(probe.path().join(name))?;
-            }
-            let supported = std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        private_namespace()?;
-                        mount_view(probe.path(), &staging, flags)?;
-                        umount(&probe.path().join("rootfs"))
-                    })
-                    .join()
-            })
-            .map_err(|_| invalid("snapshot mount probe panicked"))?;
-            probe.close()?;
-            match supported {
-                Ok(()) => {}
-                Err(
-                    Errno::ENODEV | Errno::EOPNOTSUPP | Errno::EPERM | Errno::EINVAL | Errno::EXDEV,
-                ) => {
-                    if flags != MsFlags::MS_NODEV {
-                        return Err(invalid(
-                            "filesystem cannot apply requested rootfs mount flags",
-                        ));
-                    }
-                    fs::rename(staging.join("root"), bundle.join("rootfs"))?;
-                    return Ok(false);
+        // Replay after interruption, or a cached tree evicted between staging and commit.
+        let staged = match staged {
+            Some(fresh @ StagedTree::New(_)) => fresh,
+            _ => {
+                let flags = mount_flags(options)?;
+                if !overlay_path(&store, flags)? {
+                    return Ok(());
                 }
-                Err(e) => return Err(Error::Storage(format!("probe OverlayFS: {e}"))),
+                stage_tree(&store, key, flags, unpack)?
             }
-            fs::write(staging.join("pin"), key)?;
-            fs::rename(&staging, &tree)?;
-            Ok(true)
-        })();
-        if staging.try_exists()? {
-            fs::remove_dir_all(&staging)?;
-        }
-        if !result? {
-            // The unpacked tree was installed as an ordinary private rootfs.
-            return Ok(true);
-        }
+        };
+        install(&tree, staged)?;
+    }
+    let retired = tree.join("retired");
+    if retired.try_exists()? {
+        fs::remove_file(retired)?;
+    }
+    Ok(())
+}
+
+/// Attach the shared tree, building on demand for an older store or a direct create.
+pub(super) fn prepare(
+    bundle: &Path,
+    key: &str,
+    options: &[String],
+    unpack: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    let flags = mount_flags(options)?;
+    let bundle = fs::canonicalize(bundle)?;
+    if !overlay_path(&bundle, flags)? {
+        return unpack(&bundle.join("rootfs"));
+    }
+    let store = bundle
+        .parent()
+        .ok_or_else(|| invalid("invalid bundle"))?
+        .join(STORE);
+    let _lock = lock(&store, key)?;
+    let tree = store.join(key);
+    if !install(&tree, stage_tree(&store, key, flags, &unpack)?)? {
+        return unpack(&bundle.join("rootfs"));
     }
     fs::hard_link(tree.join("pin"), bundle.join(PIN))?;
     for name in ["upper", "work"] {
@@ -189,7 +265,7 @@ pub(super) fn prepare(
         bundle.join("overlay-options.json"),
         serde_json::to_vec(options)?,
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn mount_view(bundle: &Path, tree: &Path, flags: MsFlags) -> nix::Result<()> {
@@ -399,6 +475,7 @@ pub async fn recover(container_dir: &Path, state: &StateManager) -> Result<()> {
                 .strip_prefix(".building-")
                 .or_else(|| name.strip_prefix(".deleting-"))
             {
+                let key = key.split_once('.').map_or(key, |(key, _)| key);
                 if valid_key(key) {
                     let _lock = lock(&store, key)?;
                     if entry.path().try_exists()? {
@@ -450,9 +527,12 @@ mod tests {
             .join(STORE)
             .join(format!(".building-{}", key("cfg", b"m")));
         fs::create_dir_all(&staging).unwrap();
+        let interrupted_pull = staging.with_extension("partial");
+        fs::create_dir(&interrupted_pull).unwrap();
         let state = StateManager::new(temp.path().join("state.db")).unwrap();
         recover(&dir, &state).await.unwrap();
         assert!(!staging.exists());
+        assert!(!interrupted_pull.exists());
         assert!(!orphan.exists());
         assert!(legacy.join("rootfs").exists());
     }
@@ -469,14 +549,14 @@ mod tests {
             for bundle in &bundles {
                 fs::create_dir_all(bundle.join("rootfs")).unwrap();
                 scope.spawn(|| {
-                    assert!(prepare(bundle, &key, &["nosuid".into()], |root| {
+                    prepare(bundle, &key, &["nosuid".into()], |root| {
                         count.fetch_add(1, Ordering::SeqCst);
                         fs::write(root.join("file"), b"base")?;
                         fs::hard_link(root.join("file"), root.join("alias"))?;
                         fs::write(root.join("deleted"), b"base")?;
                         Ok(())
                     })
-                    .unwrap());
+                    .unwrap();
                 });
             }
         });

@@ -52,7 +52,13 @@ struct PendingPull {
     image_ref: String,
     requested: String,
     pinned: String,
+    // Older journals committed metadata only and may refer to a non-rootfs artifact.
+    #[serde(default)]
+    prepare_snapshot: bool,
 }
+
+// A blocking publisher can outlive its RPC deadline. Keep its index lock until it exits.
+pub(super) type IndexGuard = Arc<tokio::sync::OwnedMutexGuard<()>>;
 
 #[derive(Debug)]
 pub struct ImageManager {
@@ -60,7 +66,7 @@ pub struct ImageManager {
     image_store_path: PathBuf,
     images: tokio::sync::RwLock<HashMap<String, ImageInfo>>,
     pull_locks: [tokio::sync::Mutex<()>; 32],
-    index_update: tokio::sync::Mutex<()>,
+    index_update: Arc<tokio::sync::Mutex<()>>,
 }
 
 
@@ -80,7 +86,7 @@ impl ImageManager {
             image_store_path,
             images: tokio::sync::RwLock::new(HashMap::new()),
             pull_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
-            index_update: tokio::sync::Mutex::new(()),
+            index_update: Arc::default(),
         }
     }
 
@@ -95,7 +101,8 @@ impl ImageManager {
         // `busybox` next to the real `docker.io/library/busybox:latest`).
         self.load_images_from_disk().await?;
         let removed = self.dedup_images_by_digest().await?;
-        self.recover_pull().await?;
+        let update = Arc::new(self.index_update.clone().lock_owned().await);
+        self.recover_pull(&update).await?;
         if removed > 0 {
             log::info!("image store dedup removed {} stale duplicate record(s)", removed);
         }
@@ -196,18 +203,22 @@ impl ImageManager {
         requested.hash(&mut hash);
         let slot = hash.finish() as usize % self.pull_locks.len();
         let _guard = self.pull_locks[slot].lock().await;
-        let pinned = super::pull::prefetch_layers(&self.config, image_ref, auth).await?;
-        let pending = PendingPull { image_ref: image_ref.to_owned(), requested, pinned };
-        let _update = self.index_update.lock().await;
-        self.recover_pull().await?;
+        // A failed extraction must not enter the replay journal or replace a working tag.
+        let (pinned, staged) = super::pull::stage_pull(&self.config, image_ref, auth).await?;
+        let pending = PendingPull {
+            image_ref: image_ref.to_owned(), requested, pinned,
+            prepare_snapshot: self.config.storage.overlay.enabled,
+        };
+        let update = Arc::new(self.index_update.clone().lock_owned().await);
+        self.recover_pull(&update).await?;
         super::atomic_write(&self.image_store_path.join("pull.pending"), &serde_json::to_vec(&pending)?).await?;
-        self.finish_pull(&pending).await
+        self.finish_pull(&pending, staged, &update).await
     }
 
-    async fn recover_pull(&self) -> Result<()> {
+    async fn recover_pull(&self, update: &IndexGuard) -> Result<()> {
         match fs::read(self.image_store_path.join("pull.pending")).await {
             Ok(data) => {
-                self.finish_pull(&serde_json::from_slice(&data)?).await?;
+                self.finish_pull(&serde_json::from_slice(&data)?, None, update).await?;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -215,13 +226,10 @@ impl ImageManager {
         }
     }
 
-    async fn finish_pull(&self, pending: &PendingPull) -> Result<String> {
-        let facts = super::pull::publish_cached(&self.config, &pending.image_ref, &pending.requested, &pending.pinned).await?;
-        let dir = self.config.storage.container_dir.clone();
-        let image_id = facts.config_digest.clone();
-        let digest = facts.manifest_digest.clone();
-        tokio::task::spawn_blocking(move || super::snapshot::retain(&dir, &image_id, &digest))
-            .await.map_err(|e| Error::Storage(format!("retain rootfs snapshot: {e}")))??;
+    async fn finish_pull(&self, pending: &PendingPull, staged: Option<super::snapshot::StagedTree>, update: &IndexGuard) -> Result<String> {
+        let facts = super::pull::publish_cached(
+            &self.config, &pending.image_ref, &pending.requested, &pending.pinned, pending.prepare_snapshot, staged, update.clone(),
+        ).await?;
         let id = self.record_pull(&pending.image_ref, facts).await?;
         fs::remove_file(self.image_store_path.join("pull.pending")).await?;
         Ok(id)
@@ -421,8 +429,8 @@ impl ImageManager {
     /// IMAGE-ID (`sha256:` full or hex prefix).
     pub async fn remove_image(&self, image_ref: &str, _force: bool) -> Result<()> {
         log::info!("Removing image: {}", image_ref);
-        let _update = self.index_update.lock().await;
-        self.recover_pull().await?;
+        let update = Arc::new(self.index_update.clone().lock_owned().await);
+        self.recover_pull(&update).await?;
 
         let mut images = self.images.write().await;
 
@@ -457,7 +465,11 @@ impl ImageManager {
         // Live bundles keep the unpacked tree pinned until their own removal.
         let dir = self.config.storage.container_dir.clone();
         let image_id = info.image_id.clone();
-        tokio::task::spawn_blocking(move || super::snapshot::retire(&dir, &image_id))
+        let retire_guard = update.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = retire_guard;
+            super::snapshot::retire(&dir, &image_id)
+        })
             .await.map_err(|e| Error::Storage(format!("retire rootfs snapshot: {e}")))??;
         // Full removal of the record.
         let f = self
@@ -661,6 +673,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.image_dir = dir.path().to_owned();
+        config.storage.container_dir = dir.path().join("containers");
         let config = Arc::new(config);
         let store = ImageManager::new(config.clone());
         store.initialize().await.unwrap();
@@ -692,6 +705,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.image_dir = dir.path().to_owned();
+        config.storage.container_dir = dir.path().join("containers");
         let config = Arc::new(config);
         let store = ImageManager::new(config.clone());
         store.initialize().await.unwrap();
@@ -705,12 +719,13 @@ mod tests {
         let data = serde_json::json!({"manifest":manifest,"config":ConfigFile::default(),"manifest_digest":next.manifest_digest});
         let path = super::super::pull::manifest_cache_path(&config, &pinned);
         fs::write(path, data.to_string()).await.unwrap();
-        let intent = PendingPull { image_ref: "busybox".into(), requested: requested.whole(), pinned: pinned.whole() };
+        let intent = serde_json::json!({"image_ref":"busybox", "requested":requested.whole(), "pinned":pinned.whole()});
         let marker = dir.path().join("pull.pending");
         fs::write(&marker, serde_json::to_vec(&intent).unwrap()).await.unwrap();
         // Simulate interruption after the tag cache changed but before the
         // image index was updated. Restart must finish this without network.
-        super::super::pull::publish_cached(&config, "busybox", &intent.requested, &intent.pinned).await.unwrap();
+        let tagged = super::super::pull::manifest_cache_path(&config, &requested);
+        super::super::atomic_write(&tagged, data.to_string().as_bytes()).await.unwrap();
         let restarted = ImageManager::new(config);
         restarted.initialize().await.unwrap();
         for tag in ["busybox", "busybox:latest", "docker.io/library/busybox:latest"] {
@@ -722,10 +737,80 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CAP_SYS_ADMIN and OverlayFS"]
+    async fn pull_publishes_once_and_failed_unpack_leaves_index_retryable() {
+        use oci_distribution::{config::ConfigFile, manifest::{OciDescriptor, OciImageManifest}, secrets::RegistryAuth, Reference};
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.image_dir = temp.path().join("images");
+        cfg.storage.container_dir = temp.path().join("bundles");
+        let cfg = Arc::new(cfg);
+        let manager = ImageManager::new(cfg.clone());
+        manager.initialize().await.unwrap();
+        let facts = facts('a');
+        let image = format!("example.test/demo@{}", facts.manifest_digest);
+        let reference: Reference = image.parse().unwrap();
+        let mut manifest = OciImageManifest::default();
+        manifest.config.digest = facts.config_digest.clone();
+        use sha2::Digest;
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest([0; 1024]));
+        let layer = OciDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+            digest: digest.clone(),
+            size: 1024,
+            ..Default::default()
+        };
+        manifest.layers = vec![layer];
+        let cached = serde_json::json!({"manifest":manifest, "config":ConfigFile::default(), "manifest_digest":facts.manifest_digest});
+        fs::write(super::super::pull::manifest_cache_path(&cfg, &reference), cached.to_string()).await.unwrap();
+        let layers = cfg.storage.image_dir.join("layers");
+        fs::create_dir_all(&layers).await.unwrap();
+        let blob = layers.join(format!("{}.blob", digest.replace(':', "-")));
+        fs::write(&blob, b"not a tar archive").await.unwrap();
+        assert!(manager.pull_image(&image, RegistryAuth::Anonymous, None).await.is_err());
+        assert!(manager.get_image_status(&image).await.unwrap().is_none());
+        assert!(!cfg.storage.image_dir.join("pull.pending").exists());
+
+        // Repair the fixture and retry. A second pull and the first create reuse the same tree.
+        fs::write(&blob, [0; 1024]).await.unwrap();
+        let id = manager.pull_image(&image, RegistryAuth::Anonymous, None).await.unwrap();
+        let key = super::super::snapshot::key(&id, facts.manifest_digest.as_bytes());
+        let tree = cfg.storage.container_dir.join(".snapshots-v1").join(key);
+        let inode = std::fs::metadata(tree.join("pin")).unwrap().ino();
+        assert!(tree.join("root").is_dir());
+        manager.pull_image(&image, RegistryAuth::Anonymous, None).await.unwrap();
+        let bundle = cfg.storage.container_dir.join("worker");
+        fs::create_dir_all(bundle.join("rootfs")).await.unwrap();
+        super::super::pull::prepare_bundle(&cfg, &image, &bundle, true).await.unwrap();
+        assert_eq!(std::fs::metadata(bundle.join("snapshot.v1")).unwrap().ino(), inode);
+        manager.remove_image(&image, false).await.unwrap();
+        assert!(tree.join("retired").exists());
+        manager.pull_image(&image, RegistryAuth::Anonymous, None).await.unwrap();
+        super::super::snapshot::remove(&bundle).unwrap();
+        assert_eq!(std::fs::metadata(tree.join("pin")).unwrap().ino(), inode);
+        assert!(!tree.join("retired").exists());
+        manager.remove_image(&image, false).await.unwrap();
+        assert!(!tree.exists());
+
+        // A crash after the journal write can lose the unpublished staging directory.
+        let intent = PendingPull {
+            image_ref: image.clone(), requested: image.clone(), pinned: image.clone(), prepare_snapshot: true,
+        };
+        fs::write(cfg.storage.image_dir.join("pull.pending"), serde_json::to_vec(&intent).unwrap()).await.unwrap();
+        let restarted = ImageManager::new(cfg);
+        restarted.initialize().await.unwrap();
+        assert!(tree.join("root").is_dir());
+        assert_eq!(restarted.get_image_status(&image).await.unwrap().unwrap().image_id, id);
+    }
+
+    #[tokio::test]
     async fn removed_digest_is_not_exposed_by_internal_storage_key() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.image_dir = dir.path().to_owned();
+        config.storage.container_dir = dir.path().join("containers");
         let store = ImageManager::new(Arc::new(config));
         store.initialize().await.unwrap();
         let first = facts('a');
