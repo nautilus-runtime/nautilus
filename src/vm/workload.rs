@@ -22,8 +22,11 @@ pub(crate) struct StreamOptions {
     pub stdout: bool,
     pub stderr: bool,
     pub tty: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PortOptions {
+    pub port: u16,
 }
 
 #[derive(Serialize)]
@@ -37,7 +40,7 @@ pub(crate) enum Operation<'a> {
         stream: StreamOptions,
     },
     PortForward {
-        stream: StreamOptions,
+        stream: PortOptions,
     },
     Create,
     Start,

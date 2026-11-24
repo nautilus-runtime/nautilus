@@ -28,7 +28,7 @@
 
 use crate::core::state::StateManager;
 use crate::runtime::container::ContainerManager;
-use crate::vm::workload::{Operation, StreamOptions};
+use crate::vm::workload::{Operation, PortOptions, StreamOptions};
 use bytes::Bytes;
 use http::HeaderMap;
 use spdystream_rs::connection::Connection;
@@ -346,7 +346,6 @@ async fn spawn_exec(
             stdout: session.stdout,
             stderr: session.stderr,
             tty: session.tty,
-            port: None,
         };
         let op = match session.kind {
             SessionKind::Exec => Operation::ExecStream {
@@ -608,14 +607,15 @@ async fn handle_pf_stream(
             let options = StreamOptions {
                 stdin: true,
                 stdout: true,
-                port: Some(port),
                 ..Default::default()
             };
             let stream = exec
                 .guest_stream(
                     &pod.id,
                     &pod.id,
-                    Operation::PortForward { stream: options },
+                    Operation::PortForward {
+                        stream: PortOptions { port },
+                    },
                     options,
                     ctx.closed.subscribe(),
                 )
