@@ -370,6 +370,15 @@ async fn scenario(
         create(cli, &id, &pod, mount).await.is_err(),
         "accepted unrestricted host mount"
     );
+    // Fail after the host has accepted the config and begun preparing a guest
+    // bundle. Kubelet retries this same log_path when the immutable image arrives.
+    let mut missing = first_work.clone();
+    missing.image.as_mut().unwrap().image =
+        format!("127.0.0.1:1/test/absent@sha256:{}", "0".repeat(64));
+    ensure!(
+        create(cli, &id, &pod, missing).await.is_err(),
+        "accepted missing image"
+    );
     let a = create(cli, &id, &pod, first_work)
         .await
         .context("create first")?;
@@ -416,7 +425,7 @@ async fn scenario(
     let deadline = cli
         .exec_sync(exec_request(
             &a,
-            "/bin/busybox sleep 4; echo leak > timed-out",
+            "echo started > timeout-started; /bin/busybox sleep 4; echo leak > timed-out",
             1,
         ))
         .await;
@@ -445,7 +454,24 @@ async fn scenario(
     canceled.abort();
     let _ = canceled.await;
     sleep(Duration::from_millis(3200)).await;
-    exec(cli, &a, "test ! -e timed-out && test ! -e canceled").await?;
+    exec(
+        cli,
+        &a,
+        "test -f timeout-started && test ! -e timed-out && test ! -e canceled",
+    )
+    .await?;
+
+    // Disconnect only the primary Pod's host transport while both VMs run. Restore
+    // the original socket inode before propagating either CRI result.
+    let socket = root.join("state/vms").join(&id).join("vsock.sock");
+    let detached = socket.with_file_name("detached-vsock.sock");
+    fs::rename(&socket, &detached)?;
+    let disconnected = exec(cli, &a, "echo unexpected").await;
+    let other_boot = boot_id(cli, &other).await;
+    fs::rename(&detached, &socket)?;
+    ensure!(disconnected.is_err(), "exec accepted a disconnected guest");
+    ensure!(other_boot? == boot_b);
+    exec(cli, &b, "test ! -e count").await?;
 
     daemon_process.kill().await?;
     let (new_daemon, new_client) = daemon(root).await?;
