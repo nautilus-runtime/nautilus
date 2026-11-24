@@ -4,8 +4,8 @@ mod share;
 
 use super::guest::canonical_uuid;
 use super::resources::VmResources;
-use crate::network::vm::VmNetwork;
 use crate::core::config::VmConfig;
+use crate::network::vm::VmNetwork;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -271,7 +271,11 @@ impl PodVmStore {
     }
 
     pub(crate) async fn start_with_network(
-        &self, id: &str, config: &VmConfig, resources: &VmResources, network: Option<&VmNetwork>,
+        &self,
+        id: &str,
+        config: &VmConfig,
+        resources: &VmResources,
+        network: Option<&VmNetwork>,
     ) -> io::Result<String> {
         let lease = self
             .lease(id, Operation::Start)
@@ -392,15 +396,24 @@ impl PodVmStore {
     }
 
     pub(crate) async fn verify_network(&self, id: &str, network: &VmNetwork) -> io::Result<()> {
-        let lease = self.lease(id, Operation::Status).await?
+        let lease = self
+            .lease(id, Operation::Status)
+            .await?
             .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
-        let owner = lease.load(id)?.ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
-        let boot = owner.boot.as_deref().filter(|_| !owner.removing)
+        let owner = lease
+            .load(id)?
+            .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+        let boot = owner
+            .boot
+            .as_deref()
+            .filter(|_| !owner.removing)
             .ok_or_else(|| invalid("VM network has no active boot"))?;
         let (_fd, directory) = lease.open_socket_directory(&owner)?;
         let socket = directory.join("vsock.sock");
         let metadata = fs::symlink_metadata(&socket)?;
-        if !metadata.file_type().is_socket() || Some(FileIdentity::from_meta(&metadata)) != owner.sockets[1] {
+        if !metadata.file_type().is_socket()
+            || Some(FileIdentity::from_meta(&metadata)) != owner.sockets[1]
+        {
             return Err(invalid("VM network endpoint ownership mismatch"));
         }
         network.verify_guest(&socket, boot).await
@@ -693,7 +706,8 @@ impl Lease {
             owner.id, owner.nonce
         );
         if let Some(nic) = network {
-            cmd.arg("--property").arg(format!("NetworkNamespacePath={}", nic.netns_path));
+            cmd.arg("--property")
+                .arg(format!("NetworkNamespacePath={}", nic.netns_path));
             cmdline.push(' ');
             cmdline.push_str(&nic.cmdline);
             if !nic.hostname.is_empty() {

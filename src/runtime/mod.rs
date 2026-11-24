@@ -4,11 +4,12 @@ pub mod pod;
 pub use container::ContainerManager;
 pub use pod::PodManager;
 
-
 pub mod vm_log;
 
 #[derive(Default)]
-pub(crate) struct OperationLocks(std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>);
+pub(crate) struct OperationLocks(
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
 
 impl OperationLocks {
     pub async fn lock(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
