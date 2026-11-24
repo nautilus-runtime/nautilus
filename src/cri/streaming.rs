@@ -247,7 +247,7 @@ struct ConnCtx {
     /// The exec'd process, spawned by whichever channel stream arrives first.
     exec_process: OnceCell<Result<Arc<ExecHandle>, String>>,
     /// portforward's per-request error stream (client creates it first).
-    pf_error_streams: Mutex<HashMap<String, Arc<Stream>>>,
+    pf_error_streams: Mutex<HashMap<(u16, String), Arc<Stream>>>,
     closed: watch::Sender<bool>,
 }
 
@@ -271,22 +271,42 @@ async fn handle_stream(
     exec: Arc<ContainerManager>,
     state: Arc<StateManager>,
 ) {
-    // Stream 1 is the HTTP upgrade request itself (client-go creates it via
-    // CreateStream(req.Header)); it carries no channel data. Ack it so the
-    // client's upgrade RoundTrip completes, then drop it.
-    if s.stream_id == 1 {
-        let _ = s.send_reply(HeaderMap::new(), true).await;
-        return;
-    }
-    if s.send_reply(HeaderMap::new(), false).await.is_err() {
-        return;
-    }
     let stream_type = s
         .headers
         .get("streamType")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    // Some clients open an untyped upgrade stream. Kubernetes client-go
+    // uses stream 1 for its first typed channel, normally the exit status.
+    if s.stream_id == 1 && stream_type.is_empty() {
+        let _ = s.send_reply(HeaderMap::new(), true).await;
+        return;
+    }
+    // client-go awaits the error stream reply before opening its data stream.
+    // Publish the error stream first so a fast guest dial failure is observable.
+    if matches!(session.kind, SessionKind::PortForward) && stream_type == "error" {
+        let key = port_request(&s);
+        let occupied = {
+            use std::collections::hash_map::Entry;
+            match ctx.pf_error_streams.lock().unwrap().entry(key.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(s.clone());
+                    false
+                }
+                Entry::Occupied(_) => true,
+            }
+        };
+        if occupied {
+            let _ = s.reset(RstStatus::RefusedStream).await;
+        } else if s.send_reply(HeaderMap::new(), false).await.is_err() {
+            ctx.pf_error_streams.lock().unwrap().remove(&key);
+        }
+        return;
+    }
+    if s.send_reply(HeaderMap::new(), false).await.is_err() {
+        return;
+    }
     tracing::debug!(stream_id = s.stream_id, %stream_type, "streaming stream open");
 
     match session.kind {
@@ -492,8 +512,7 @@ async fn handle_exec_stream(
             tracing::debug!(stream_id = s.stream_id, %stream_type, "output channel closed, sending FIN");
             let _ = s.write_data(Bytes::new(), true).await;
         }
-        // Terminal resize: needs a pty (not wired); drain and ignore so the
-        // tty-mode client is not disturbed.
+        // The VM guest resizes the original PTY.
         "resize" if session.tty => {
             if let Ok(handle) = ensure_exec(&ctx, &session, &exec).await {
                 if let Some(tx) = &handle.resize {
@@ -542,14 +561,7 @@ async fn guest_resize(s: &Stream, tx: &mpsc::Sender<(u16, u16)>) {
     }
 }
 
-async fn handle_pf_stream(
-    s: Arc<Stream>,
-    stream_type: String,
-    session: Arc<Session>,
-    ctx: Arc<ConnCtx>,
-    state: Arc<StateManager>,
-    exec: Arc<ContainerManager>,
-) {
+fn port_request(s: &Stream) -> (u16, String) {
     let port = s
         .headers
         .get("port")
@@ -562,14 +574,27 @@ async fn handle_pf_stream(
         .and_then(|s| s.to_str().ok())
         .map(str::to_owned)
         .unwrap_or_else(|| port.to_string());
-    if stream_type == "error" {
-        ctx.pf_error_streams.lock().unwrap().insert(key, s);
-        return;
-    }
+    (port, key)
+}
+
+async fn handle_pf_stream(
+    s: Arc<Stream>,
+    stream_type: String,
+    session: Arc<Session>,
+    ctx: Arc<ConnCtx>,
+    state: Arc<StateManager>,
+    exec: Arc<ContainerManager>,
+) {
+    let key = port_request(&s);
+    let port = key.0;
     if stream_type != "data" {
         let _ = s.reset(RstStatus::RefusedStream).await;
         return;
     }
+    let Some(error) = ctx.pf_error_streams.lock().unwrap().remove(&key) else {
+        let _ = s.reset(RstStatus::RefusedStream).await;
+        return;
+    };
     let result: Result<(), String> = async {
         if port == 0 || (!session.ports.is_empty() && !session.ports.contains(&port)) {
             return Err("port was not requested by CRI".into());
@@ -612,11 +637,8 @@ async fn handle_pf_stream(
         }
     }
     .await;
-    let error = ctx.pf_error_streams.lock().unwrap().remove(&key);
-    if let Some(stream) = error {
-        let msg = result.err().unwrap_or_default();
-        let _ = stream.write_data(Bytes::from(msg), true).await;
-    }
+    let msg = result.err().unwrap_or_default();
+    let _ = error.write_data(Bytes::from(msg), true).await;
     let _ = s.write_data(Bytes::new(), true).await;
 }
 
