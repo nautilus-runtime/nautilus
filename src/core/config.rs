@@ -183,6 +183,9 @@ pub struct VmConfig {
     pub vmm: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
+    /// Rust virtiofsd executable for a private, writable Pod export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtiofsd: Option<PathBuf>,
 }
 
 impl Default for SandboxesConfig {

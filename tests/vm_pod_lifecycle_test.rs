@@ -62,6 +62,7 @@ fn vm_config(root: &Path) -> Result<Arc<Config>> {
         vmm: asset("NAUTILUS_VM_VMM")?,
         kernel: asset("NAUTILUS_VM_KERNEL")?,
         initramfs: asset("NAUTILUS_VM_INITRAMFS")?,
+        virtiofsd: std::env::var_os("NAUTILUS_VM_VIRTIOFSD").map(PathBuf::from),
     });
     Ok(Arc::new(config))
 }
@@ -229,6 +230,91 @@ async fn expect_vmm_exit(process: &AsyncFd<OwnedFd>) -> Result<()> {
     Ok(())
 }
 
+async fn check_share(root: &Path, a: &str, b: &str, boot_a: &str, boot_b: &str) -> Result<()> {
+    let store = PodVmStore::new(root.join("vms"));
+    let pods = [
+        (a, b, boot_a, Uuid::new_v4()),
+        (b, a, boot_b, Uuid::new_v4()),
+    ];
+    for (id, other, _, marker) in &pods {
+        let staged = tempfile::tempdir_in(root)?;
+        fs::write(staged.path().join("marker"), format!("{other} {marker}"))?;
+        store.publish_bundle(id, id, staged.path()).await?;
+    }
+    for (id, _, boot, marker) in &pods {
+        let exported = root.join("vms").join(id).join("podfs/containers").join(id);
+        let expected = format!("{boot} {marker}\n");
+        timeout(Duration::from_secs(20), async {
+            while fs::read_to_string(exported.join("observed")).ok().as_ref() != Some(&expected) {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("guest did not confirm isolation and write back its marker")?;
+        let replacement = tempfile::tempdir_in(root)?;
+        ensure!(store
+            .publish_bundle(id, id, replacement.path())
+            .await
+            .is_err());
+        ensure!(replacement.path().is_dir());
+        eprintln!("guest {boot} saw only its own bundle, wrote back marker {marker}");
+    }
+
+    // A replaced export component invalidates this Pod. The failed operation
+    // must leave the staged source and the replacement directory untouched.
+    let containers = root.join("vms").join(a).join("podfs/containers");
+    let saved = containers.with_file_name("saved");
+    let outside = tempfile::tempdir_in(root)?;
+    fs::rename(&containers, &saved)?;
+    std::os::unix::fs::symlink(outside.path(), &containers)?;
+    let staged = tempfile::tempdir_in(root)?;
+    ensure!(store.publish_bundle(a, a, staged.path()).await.is_err());
+    ensure!(store.remove_bundle(a, a).await.is_err());
+    ensure!(store.status(a).await.is_err());
+    ensure!(outside.path().read_dir()?.count() == 0 && staged.path().is_dir());
+    fs::remove_file(&containers)?;
+    fs::rename(saved, &containers)?;
+    for (id, _, _, _) in pods {
+        for _ in 0..2 {
+            store.remove_bundle(id, id).await?;
+        }
+        ensure!(!root
+            .join("vms")
+            .join(id)
+            .join("podfs/containers")
+            .join(id)
+            .exists());
+    }
+    Ok(())
+}
+
+async fn lose_share(id: &str) -> Result<()> {
+    let units = Command::new("systemctl")
+        .args([
+            "list-units",
+            "--state=active",
+            "--type=service",
+            "--no-legend",
+            "--plain",
+            &format!("nautilus-virtiofs-{id}-*.service"),
+        ])
+        .output()
+        .await?;
+    ensure!(units.status.success());
+    let lines = String::from_utf8(units.stdout)?;
+    let names: Vec<_> = lines
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    ensure!(names.len() == 1 && names[0].starts_with(&format!("nautilus-virtiofs-{id}-")));
+    ensure!(Command::new("systemctl")
+        .args(["kill", "--signal=KILL", names[0]])
+        .status()
+        .await?
+        .success());
+    Ok(())
+}
+
 async fn check_recovery(root: &Path, a: &str, b: &str) -> Result<()> {
     let (mut first, mut cri) = start_daemon(root).await?;
     let boot_a = sandbox_guest(&mut cri, a).await?.context("A unavailable")?;
@@ -264,6 +350,18 @@ async fn check_recovery(root: &Path, a: &str, b: &str) -> Result<()> {
         "lost B after daemon restart"
     );
 
+    if std::env::var_os("NAUTILUS_VM_VIRTIOFSD").is_some() {
+        check_share(root, a, b, &boot_a, &boot_b).await?;
+        lose_share(a).await?;
+        timeout(Duration::from_secs(8), async {
+            while !matches!(sandbox_guest(&mut cri, a).await, Ok(None)) {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("CRI did not observe A's lost virtiofsd")?;
+        ensure!(sandbox_guest(&mut cri, b).await?.as_deref() == Some(boot_b.as_str()));
+    }
     let mut retry = cri_client(root);
     tokio::try_join!(stop_sandbox(&mut cri, a), stop_sandbox(&mut retry, a))?;
     expect_vmm_exit(&process_a).await?;
@@ -475,6 +573,7 @@ async fn terminal_vm_start_failure_is_recorded_immediately() -> Result<()> {
         vmm: dir.path().join("missing-vmm"),
         kernel: dir.path().join("kernel"),
         initramfs: dir.path().join("agent"),
+        virtiofsd: None,
     });
     let config = Arc::new(config);
     let state = Arc::new(StateManager::new(dir.path().join("state.db"))?);
@@ -496,5 +595,68 @@ async fn terminal_vm_start_failure_is_recorded_immediately() -> Result<()> {
             .status
             == nautilus::core::PodStatus::Failed
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_pod_cannot_take_ownership_of_a_staged_bundle() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let staged = dir.path().join("bundle");
+    fs::create_dir(&staged)?;
+    let store = PodVmStore::new(dir.path().join("vms"));
+    let pod = Uuid::new_v4().to_string();
+    let container = Uuid::new_v4().to_string();
+    ensure!(store
+        .publish_bundle(&pod, &container, &staged)
+        .await
+        .is_err());
+    ensure!(staged.is_dir() && !dir.path().join("vms").exists());
+    store.remove_bundle(&pod, &container).await?;
+    ensure!(store.remove_bundle(&pod, "../elsewhere").await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root and systemd, KVM, VMM and virtiofsd assets"]
+async fn failed_filesystem_or_vmm_start_releases_the_complete_attempt() -> Result<()> {
+    let work = tempfile::tempdir()?;
+    let store = PodVmStore::new(work.path().join("vms"));
+    let mut config = vm_config(work.path())?
+        .runtime
+        .sandboxes
+        .vm
+        .clone()
+        .unwrap();
+    let backend = asset("NAUTILUS_VM_VIRTIOFSD")?;
+    let vmm = config.vmm.clone();
+    for (executable, daemon) in [
+        (vmm.clone(), work.path().join("missing-virtiofsd")),
+        (vmm, PathBuf::from("/bin/false")),
+        (PathBuf::from("/bin/false"), backend),
+    ] {
+        config.vmm = executable;
+        config.virtiofsd = Some(daemon);
+        let id = Uuid::new_v4().to_string();
+        let error = store
+            .start_configured(&id, &config)
+            .await
+            .expect_err("unexpectedly booted");
+        eprintln!("rolled back {id}: {error}");
+        ensure!(store.status(&id).await?.is_none());
+        ensure!(store.recover(&id).await?.is_none());
+        store.remove(&id).await?;
+        ensure!(!work.path().join("vms").join(&id).exists());
+        let units = Command::new("systemctl")
+            .args([
+                "list-units",
+                "--all",
+                "--no-legend",
+                "--plain",
+                &format!("nautilus-*-{id}-*.service"),
+            ])
+            .output()
+            .await?;
+        ensure!(units.status.success() && units.stdout.is_empty());
+    }
     Ok(())
 }

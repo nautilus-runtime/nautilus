@@ -43,10 +43,31 @@
 NAUTILUS_VM_VMM=/opt/cloud-hypervisor/bin/cloud-hypervisor \
 NAUTILUS_VM_KERNEL=/opt/nautilus/guest/vmlinuz \
 NAUTILUS_VM_INITRAMFS=/opt/nautilus/guest/agent.cpio.gz \
-cargo test --locked --test vm_pod_lifecycle_test -- --include-ignored --nocapture
+cargo test --locked --test vm_pod_lifecycle_test two_pods_survive_owner_restart -- --ignored --nocapture
 ```
 
 在 Linux 5.15.0-191 + Cloud Hypervisor v54.1 和 Linux 6.12.118 + v55.0 两种宿主上，已用提交 `af327ce` 跑通上述生命周期测试。通过 PodManager 创建两台 VM，再从真实 `nautilusd` 的 CRI socket 核对两个 boot ID。强制终止和重启 daemon 后，两个 ID 均保持一致。并发停止、删除第一个 Pod 后，第二台 VM 仍可访问；独立关闭第二个 VMM 后，CRI 观察到退出，重复删除回收了私有目录和端点。运行时与镜像服务的回归结果见 [CRI 验证记录](CRITEST_RESULTS.md)。
+
+### 每个 Pod 的 virtio-fs 导出
+
+在 `[runtime.sandboxes.vm]` 设置 Rust `virtiofsd` 的绝对路径后，宿主先以独立的 systemd 临时服务创建 vhost-user socket，再以共享内存和标签 `podfs` 启动 VMM。每个 Pod 都有独立的导出根 `runtime.state_dir/vms/<sandbox-id>/podfs`。两个服务的 socket、PID 文件、启动令牌、所有权记录及镜像缓存均位于导出之外。未设置该选项时仍支持原先的 guest 身份验证。
+
+宿主在同一文件系统的私有目录准备目录型 OCI bundle，包括 `config.json` 和 `rootfs/`。调用 `PodVmStore::publish_bundle` 后，guest 可以在挂载点下的 `containers/<container-uuid>/` 访问它。宿主固定目录文件描述符、核对目录身份并以不可覆盖的原子重命名发布；`remove_bundle` 可以重复调用。数据目录归 Pod 所有，宿主创建后不解析 guest 可写目录内的链接来寻址宿主资源。
+
+目前导出支持宿主准备的普通目录。CRI 宿主卷需单独实现授权、只读属性和挂载回收，并在 virtiofsd 的挂载命名空间验证可见性；在此之前，VM 工作负载必须拒绝这些挂载请求。
+
+恢复和状态查询核对两个服务的 InvocationID、端点和导出目录身份。Stop/Remove 先停止 VMM，再停止 virtiofsd 并回收数据。身份校验失败时保留记录供重试。系统级 systemd 和 KVM 节点可用以下命令运行双 guest 验证：
+
+```sh
+export NAUTILUS_VM_VMM=/opt/cloud-hypervisor/bin/cloud-hypervisor
+export NAUTILUS_VM_KERNEL="/boot/vmlinuz-$(uname -r)"
+export NAUTILUS_VM_VIRTIOFSD=/usr/libexec/virtiofsd
+export NAUTILUS_VM_INITRAMFS=/tmp/nautilus-share-test.cpio.gz
+tests/fixtures/vm_share/build.sh "$NAUTILUS_VM_INITRAMFS"
+cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
+```
+
+2026-11-24 在 x86_64 Linux 5.15.0-191、Cloud Hypervisor v54.1、virtiofsd 1.13.2 上运行了该测试。两个 guest 同时使用 `podfs`，各自读到本 Pod 的随机标记并回写自己的 boot ID，另一个 Pod 的目录返回 ENOENT。通过 CRI 验证了 nautilusd 被 SIGKILL 后的接管、单个 virtiofsd 意外退出、另一个 VMM 退出和重复 Stop/Remove。缺失 virtiofsd、virtiofsd 启动即退出、VMM 启动即退出均完成回滚。另起未配置 virtiofsd 的两个 Pod 也完成了原身份测试。
 
 ## 节点探针
 
