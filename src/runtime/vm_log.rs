@@ -33,6 +33,7 @@ impl Identity {
 pub struct Cursor {
     parent: Identity,
     file: Identity,
+    claim_id: Option<[u8; 16]>,
     offset: i64,
     // Guest offset corresponding to byte zero of the current host file.
     base: i64,
@@ -44,6 +45,36 @@ pub struct Cursor {
 pub struct Target {
     path: PathBuf,
 }
+
+/// An unnamed inode and its pinned destination. Persist cursor() before publish().
+pub struct Claim {
+    dir: File,
+    file: File,
+    name: std::ffi::OsString,
+    cursor: Cursor,
+}
+
+impl Claim {
+    pub fn cursor(&self) -> Cursor {
+        self.cursor.clone()
+    }
+
+    pub fn publish(&self) -> io::Result<()> {
+        nix::unistd::linkat(
+            None,
+            at(&self.file).as_path(),
+            Some(self.dir.as_raw_fd()),
+            Path::new(&self.name),
+            nix::unistd::LinkatFlags::SymlinkFollow,
+        )?;
+        self.file.sync_all()?;
+        self.dir.sync_all()
+    }
+}
+
+// A lost anonymous inode can be recycled before recovery opens the name.
+// Keep an independent random claim token on the inode as well as dev/ino.
+const CLAIM_XATTR: &std::ffi::CStr = c"user.nautilus.log-claim";
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -172,16 +203,95 @@ impl Target {
         Ok(None)
     }
 
-    pub fn prepare(&self) -> io::Result<Cursor> {
+    pub fn claim(&self) -> io::Result<Claim> {
         let dir = self.parent(true)?;
-        let file = self.open(&dir, true)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_TMPFILE)
+            .open(at(&dir))?;
+        let token = *uuid::Uuid::new_v4().as_bytes();
+        if unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                CLAIM_XATTR.as_ptr(),
+                token.as_ptr().cast(),
+                token.len(),
+                libc::XATTR_CREATE,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         file.sync_all()?;
-        dir.sync_all()?;
-        Ok(Cursor {
+        let cursor = Cursor {
             parent: Identity::of(&dir)?,
             file: Identity::of(&file)?,
+            claim_id: Some(token),
             ..Cursor::default()
+        };
+        Ok(Claim {
+            dir,
+            file,
+            name: self.path.file_name().unwrap().to_owned(),
+            cursor,
         })
+    }
+
+    pub fn prepare(&self) -> io::Result<Cursor> {
+        let claim = self.claim()?;
+        claim.publish()?;
+        Ok(claim.cursor())
+    }
+
+    /// Recovery may encounter another creator's log when our anonymous inode
+    /// was never linked. Leave it with its owner and finish the failed create.
+    pub fn discard_if_owned(&self, cursor: &Cursor) -> io::Result<()> {
+        if !cursor.is_bound() {
+            return Ok(());
+        }
+        let dir = match self.parent(false) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+        if Identity::of(&dir)? != cursor.parent {
+            return Ok(());
+        }
+        let path = at(&dir).join(self.path.file_name().unwrap());
+        let meta = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+        if !meta.is_file() || (meta.dev(), meta.ino()) != (cursor.file.dev, cursor.file.ino) {
+            return Ok(());
+        }
+        let file = self.open(&dir, false)?;
+        if Identity::of(&file)? != cursor.file {
+            return Ok(());
+        }
+        if let Some(token) = cursor.claim_id {
+            let mut found = [0u8; 16];
+            let len = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    CLAIM_XATTR.as_ptr(),
+                    found.as_mut_ptr().cast(),
+                    found.len(),
+                )
+            };
+            if len < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::ENODATA) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            if len != found.len() as isize || found != token {
+                return Ok(());
+            }
+        }
+        self.discard_unstarted(cursor)
     }
 
     /// Release an empty file claimed by an unsuccessful CreateContainer. A
@@ -247,6 +357,7 @@ impl Target {
         Ok(Cursor {
             parent: cursor.parent,
             file: identity,
+            claim_id: None,
             base: cursor.offset,
             offset: cursor.offset,
             tail: Vec::new(),
@@ -312,6 +423,10 @@ impl Target {
 }
 
 impl Cursor {
+    pub fn is_bound(&self) -> bool {
+        self.file != Identity::default()
+    }
+
     fn verify(&self, file: &File) -> io::Result<u64> {
         if self.base < 0 || self.offset < self.base {
             return Err(invalid("invalid VM log cursor"));
@@ -436,6 +551,27 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(rotated).unwrap(), b"line\n");
         assert!(std::fs::read(target.path()).unwrap().is_empty());
+    }
+    #[test]
+    fn interrupted_claims_only_discard_the_published_inode() {
+        let work = tempfile::tempdir().unwrap();
+        let t = target(work.path());
+        let unpublished = t.claim().unwrap();
+        let cursor = unpublished.cursor();
+        assert!(cursor.is_bound() && !Cursor::default().is_bound());
+        assert!(!t.path().exists());
+        drop(unpublished); // Process exit before publication.
+        let other = t.claim().unwrap();
+        other.publish().unwrap();
+        t.discard_if_owned(&cursor).unwrap();
+        assert!(t.path().exists());
+        t.discard_if_owned(&other.cursor()).unwrap();
+        assert!(!t.path().exists());
+        let live = t.claim().unwrap();
+        live.publish().unwrap();
+        std::fs::write(t.path(), b"keep").unwrap();
+        assert!(t.discard_if_owned(&live.cursor()).is_err());
+        assert_eq!(std::fs::read(t.path()).unwrap(), b"keep");
     }
     #[test]
     fn failed_create_releases_only_the_empty_file_it_claimed() {
