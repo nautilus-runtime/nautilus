@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int only_entry(const char *dir, const char *wanted)
+static int entries(const char *dir, const char *first, const char *second)
 {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -18,11 +18,11 @@ static int only_entry(const char *dir, const char *wanted)
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (strcmp(e->d_name, wanted)) { count = -1; break; }
+        if (strcmp(e->d_name, first) && (!second || strcmp(e->d_name, second))) { count = -1; break; }
         count++;
     }
     closedir(d);
-    return count == 1;
+    return count == (second ? 2 : 1);
 }
 
 static int check(void)
@@ -34,7 +34,7 @@ static int check(void)
     fclose(f);
     char *id = ok ? strstr(line, "nautilus.sandbox_id=") : NULL;
     if (!id || sscanf(id, "nautilus.sandbox_id=%36[0-9a-f-]", own) != 1) return 0;
-    if (!only_entry("/probe", "containers") || !only_entry("/probe/containers", own)) return 0;
+    if (!entries("/probe", "containers", "volumes") || !entries("/probe/containers", own, NULL)) return 0;
     snprintf(path, sizeof(path), "/probe/containers/%s/marker", own);
     f = fopen(path, "r");
     if (!f) return 0;

@@ -33,7 +33,7 @@
 - `process` 接受 `args`、`env`、规范的绝对 `cwd`、数字 `user.uid/gid/additionalGids`。要求 `terminal=false` 和 `noNewPrivileges=true`，能力集仅接受空集合。exec 复用该进程的环境、安全设置、用户和目录。guest 拒绝未实现的配置字段。
 - `linux.namespaces` 必须包含 `mount` 和 `pid`。每种类型最多一次，只接受 `{"type":"…"}`。默认共享 Pod guest 的 network、IPC、UTS；增加 `ipc` 或 `uts` 可请求容器私有的对应 namespace。Pod IPC 共享 `/dev/shm`，私有 IPC 使用单独的 tmpfs。`linux.resources` 支持 `cpu.{shares,quota,period}` 与 `memory.limit`，由 runc 写入该容器自己的 cgroup。
 - agent 提供 proc、私有 dev tmpfs、shm 和 mqueue，屏蔽敏感 proc 节点并将内核参数只读挂载，设备访问使用拒绝优先的规则。guest 中配置了 DNS 时，容器默认使用 guest 的只读 `/etc/resolv.conf`。
-- `mounts[]` 只接受 `{"type":"bind","source":"volumes/<UUID>","destination":"/absolute/path","options":["bind","ro"]}` 或将最后一项替换成 `rw`。来源相对于该 Pod 的导出根，由宿主按授权准备；agent 要求来源由 root 所有，拒绝符号链接、特殊文件及多硬链接文件，目标必须处于容器 rootfs 内。挂载附加 nosuid/nodev/noexec。guest 拒绝覆盖根目录、/dev、/sys 或 /proc 的请求。宿主需在接受 CRI mount 前确认数据来源、读写和传播语义能够兑现。
+- `mounts[]` 只接受 `{"type":"bind","source":"volumes/<UUID>","destination":"/absolute/path","options":["bind","ro"]}` 或将最后一项替换成 `rw`。来源是宿主为本容器在该 Pod 的只读卷目录中创建的不透明标识。agent 拒绝选择器中的符号链接和特殊文件，保留获授权文件的 UID/GID 与硬链接语义。目标必须处于容器 rootfs 内。挂载附加 nosuid/nodev/noexec。guest 拒绝覆盖根目录、/dev、/sys 或 /proc 的请求。宿主需在接受 CRI mount 前确认数据来源、读写和传播语义能够兑现。
 - 容器 init 的日志独立写入该 bundle 的 `container.log`，格式为 `RFC3339Nano stdout|stderr F|P payload\n`。16 KiB 超长行分片使用 `P`。guest 使用独占创建的文件描述符追加与读取，readLog 无路径参数。宿主按 offset 复制到 kubelet 的日志文件。guest 的日志保存在本次 Pod 导出中，生命周期与该 bundle 绑定。
 
 ## 构建与 KVM 验证

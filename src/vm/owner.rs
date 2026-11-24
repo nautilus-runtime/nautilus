@@ -1,6 +1,7 @@
 //! Durable ownership of experimental per-Pod Cloud Hypervisor services.
 
 mod share;
+mod volume;
 
 use super::guest::canonical_uuid;
 use super::resources::VmResources;
@@ -68,6 +69,9 @@ impl FileIdentity {
 struct Share {
     export: Option<FileIdentity>,
     containers: Option<FileIdentity>,
+    volumes: Option<FileIdentity>,
+    volume_catalog_mount: Option<u64>,
+    bindings: Vec<volume::Binding>,
     invocation: Option<String>,
     socket: Option<FileIdentity>,
     pid_file: Option<FileIdentity>,
