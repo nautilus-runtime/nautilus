@@ -7,17 +7,21 @@
 1. 宿主写入 ASCII `CONNECT 4083\n`，读完 Cloud Hypervisor 的 `OK <port>\n`。
 2. guest 先发 hello。每个帧均为 **4 字节大端无符号长度 + 对应字节数的 UTF-8 JSON**。hello 为 `{"version":1,"sandboxId":"…","nonce":"…","bootId":"…"}`。宿主逐项核对自己的该次启动记录，再发送命令。绑定到同一连接可以在向对端发送 nonce 前识别错误端点。
 3. 宿主发送一个请求，保持连接的写端打开，读取一个应答。每个连接执行一次调用。host 读帧时必须限制应答长度在 1 MiB 内，同时校验协议版本、请求 ID 和 `ok`。guest 限制请求为 1–65536 字节，接收预算 3 秒。错误帧长和传输截断会关闭连接。
-4. 请求包含 hello 的四个字段，以及 `requestId`、`containerId`、`op`。四种 ID 均为小写、带连字符的非零 UUID。`requestId` 由宿主为每次调用生成。VM 重启后，旧 bootId 失效。宿主可关闭 exec 连接取消执行。
+4. 请求包含 hello 的四个字段、`requestId` 和 `op`。容器操作还包含 `containerId`，`podStats` 省略它。四种 ID 均为小写、带连字符的非零 UUID。`requestId` 由宿主为每次调用生成。VM 重启后，旧 bootId 失效。宿主可关闭 exec 连接取消执行。
 
 | op | 额外字段 | 成功应答 |
 | --- | --- | --- |
 | `create` | 无 | 从本 Pod 导出的固定位置读取 bundle，执行 runc create，返回状态。 |
 | `start` | 无 | 启动已经创建的 init 进程，返回状态。对于已经启动过的容器，重试返回当前状态。 |
 | `status` | 无 | 返回 `state`，取值 `created`、`running` 或 `exited`。 |
+| `stats` | 无 | 返回该运行中容器 cgroup 的 `stats`。 |
+| `podStats` | 无 | 返回工作负载父 cgroup 的 `stats` 和以运行中容器 ID 为键的 `containers` 采样表。无运行中容器时可省略表。 |
 | `exec` | `argv` 非空数组，最多 256 项。`timeoutMs` 为 0–300000 的整数。0 表示执行无时间上限。 | 返回 `stdout`、`stderr` 和 `exitCode`。两个流独立用标准带填充 Base64 编码，空流可省略。每个流最多 256 KiB，超限返回错误。 |
 | `stop` | `timeoutMs` 可省略，取值 0–300000。 | 返回退出状态。0 或省略表示立即 SIGKILL，正值表示先 SIGTERM 并允许指定毫秒数的退出时间，超时后 SIGKILL。目标已删除时成功。 |
 | `readLog` | `offset` 非负有符号 64 位整数，`limit` 为 1–262144。 | `stdout` 为从 offset 开始的 CRI 日志字节的 Base64（空时可省略），`nextOffset` 为 offset 加实际读取字节数。可在进程运行时轮询和重试。 |
 | `remove` | 无 | 结束进程、删除 guest 中的 runc 实例、释放私有运行目录。目标不存在时成功。宿主在同步日志且 remove 成功后负责清理导出的 bundle。 |
+
+统计样本的 `timestamp` 为 Unix epoch 纳秒。必填的无符号计数为 `cpuUsageNanos`、`memoryUsageBytes`、`workingSetBytes`、`rssBytes`、`pageFaults` 和 `majorPageFaults`。两次独立采样间隔达到一秒后可提供 `usageNanoCores`，cgroup 有有限的内存上限时提供 `availableBytes`。采样失败返回错误。宿主按样本自身的时间戳填充 CRI 字段。[统计语义](VM_RUNTIME.md#guest-工作负载统计)
 
 状态应答具有 `createdAt`、`startedAt`、`finishedAt`，单位为 Unix epoch 纳秒，尚未发生的时间可省略。`exitCode` 在退出状态或 exec 结果中有效；信号退出取 128 加信号编号。guest 作为 subreaper 对容器 init 执行 wait，退出状态发布前会排空日志管道。宿主根据时间和状态填写 CRI 字段。
 

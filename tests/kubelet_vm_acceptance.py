@@ -219,8 +219,14 @@ def main():
             guest_ids = {raw.split("://", 1)[1] for _, ids, _ in before for raw in ids}
             container_stats = json.loads(run([*cri, "stats", "-o", "json"])).get("stats", [])
             pod_stats = json.loads(run([*cri, "statsp", "-o", "json"])).get("stats", [])
-            assert guest_ids.isdisjoint(s["attributes"]["id"] for s in container_stats)
-            assert set(records).isdisjoint(s["attributes"]["id"] for s in pod_stats)
+            measured = {s["attributes"]["id"]: s for s in container_stats}
+            for cid in guest_ids:
+                assert int(measured[cid]["cpu"]["usageCoreNanoSeconds"]["value"]) > 0
+                assert int(measured[cid]["memory"]["workingSetBytes"]["value"]) > 0
+            measured_pods = {s["attributes"]["id"]: s["linux"] for s in pod_stats}
+            for pid in records:
+                assert int(measured_pods[pid]["cpu"]["usageCoreNanoSeconds"]["value"]) > 0
+                assert measured_pods[pid]["containers"]
             assert all((args.ipam_dir / ip).is_file() for ip, _, _ in before)
             pid = int(run(["systemctl", "show", args.daemon_unit, "-p", "MainPID", "--value"]))
             assert pid > 1 and Path(f"/proc/{pid}/exe").resolve().name.startswith("nautilusd")

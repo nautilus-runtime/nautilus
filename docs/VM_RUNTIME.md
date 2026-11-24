@@ -130,6 +130,16 @@ nautilus vm probe --vmm /opt/cloud-hypervisor/bin/cloud-hypervisor \
 
 2026-11-24 用完整的 Linux x86_64 CLI 和本仓库构造的 initramfs 做了两次 KVM 验证。原生宿主 Linux 5.15.0-191 + VMM v54.1 返回 `PONG 1`；同机启动的临时 Debian Linux 6.12.118 嵌套 KVM 宿主 + VMM v55.0 也返回 `PONG 1`。两次探测的目标 guest 均使用 Linux 5.15.0-191。无效 VMM 可用 `--vmm /bin/false` 验证：命令应快速报告 VMM 已退出，返回非零状态。错误应答与未应答的回归测试可用 `cargo test --locked --lib vm::tests` 运行。
 
+## Guest 工作负载统计
+
+Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 并读取统计。Firecracker v1.18.0 的 metrics 接口由 VMM 输出设备与控制面计数。Nautilus 选用 guest cgroup v2 作为 CRI 工作负载用量来源。宿主 systemd cgroup 继续用于 VMM 的限制和节点运维。[Kata agent StatsContainer](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/agent/src/rpc.rs#L1035-L1073) · [Firecracker metrics](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/metrics.md) · [CRI CPU 和内存字段](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto)
+
+每个容器在 guest 的 `/sys/fs/cgroup/nautilus/<containerId>` 计量，包含该容器的 init 和 exec 后代。Pod 采样读取 `/sys/fs/cgroup/nautilus` 的层级计数，可累计已退出子 cgroup 的 CPU。guest init 和 agent 在该子树之外。一次经启动身份校验的 vsock 请求传回 Pod 及其运行中容器的采样，宿主按已记录的 Pod 归属补上 ID、标签和 attempt。[guest 协议](GUEST_OCI_PROTOCOL.md)
+
+- CPU 累计值将 `cpu.stat usage_usec` 换算成纳秒。第二次采样与前一次至少相隔一秒时，agent 用单调时钟间隔计算平均 nanocores；更密集的请求沿用最近一次已测速率。
+- 使用量为 `memory.current`。工作集为使用量减 `memory.stat inactive_file`，下限为零。RSS 取匿名内存 `anon` 加内核提供的 `swapcached`；随附的 initramfs 不启用 swap，旧内核无该字段时交换缓存为零。次缺页为 `pgfault - pgmajfault`，下限为零，主缺页取 `pgmajfault`。有限的 `memory.max` 减工作集得到可用内存。无限额时省略可用内存。I/O、PSI、网络等可选字段待独立采样后提供。[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- 验收通过真实 daemon 的四个 CRI 统计 RPC，令同一 Pod 的一个容器写入 16 MiB tmpfs 并计算摘要，另一个容器休眠。核对两者 CPU 增量、内存差异、Pod 汇总、列表的 ID 与标签组合筛选，以及另一个 guest 断连期间的可用性。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
+
 ## 交付顺序
 
 | 事项 | 依赖 | 合并前验收 |
