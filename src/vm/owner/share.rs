@@ -6,6 +6,10 @@ const EXPORT: &str = "podfs";
 const SOCKET: &str = "fs.sock";
 const PID_FILE: &str = "fs.sock.pid";
 
+fn no_host_mounts(dir: &Path) -> io::Result<()> {
+    crate::storage::snapshot::check_unmounted(&dir.canonicalize()?).map_err(io::Error::other)
+}
+
 fn endpoint(path: &Path, socket: bool, expected: Option<FileIdentity>) -> io::Result<FileIdentity> {
     let meta = fs::symlink_metadata(path)?;
     let identity = FileIdentity::from_meta(&meta);
@@ -105,9 +109,23 @@ impl Lease {
             Err(e) => return Err(e),
         }
         let export = dir.join(EXPORT);
+        let retired = dir.join(".retired-podfs");
         match fs::symlink_metadata(&export) {
             Ok(meta) if meta.is_dir() && Some(FileIdentity::from_meta(&meta)) == share.export => {
-                fs::remove_dir_all(export)?;
+                let pinned_export = pin_directory(&export, share.export)?;
+                pin_directory(&pinned(&pinned_export).join("containers"), share.containers)?;
+                no_host_mounts(&export)?;
+                // Mark successful ownership verification before recursive deletion.
+                // If deletion is interrupted it may already have removed containers/.
+                nix::fcntl::renameat2(
+                    None,
+                    &export,
+                    None,
+                    &retired,
+                    nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+                )
+                .map_err(io::Error::from)?;
+                File::open(dir)?.sync_all()?;
             }
             // Startup can be interrupted between mkdir and the first identity save.
             // No service could have started then. Only remove empty staging directories.
@@ -122,7 +140,14 @@ impl Lease {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(())
+        match pin_directory(&retired, share.export) {
+            Ok(export) => {
+                no_host_mounts(&pinned(&export))?;
+                fs::remove_dir_all(retired)
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub(super) fn bundles(&self, owner: &Owner) -> io::Result<File> {
@@ -156,6 +181,7 @@ impl PodVmStore {
         if !fs::symlink_metadata(staged)?.is_dir() {
             return Err(invalid("staged bundle is not a directory"));
         }
+        no_host_mounts(staged)?;
         nix::fcntl::renameat2(
             None,
             staged,
@@ -178,6 +204,9 @@ impl PodVmStore {
             return Ok(());
         };
         let bundles = lease.bundles(&owner)?;
+        // Check the whole pinned directory, so an entry replaced by the guest
+        // cannot redirect deletion into a different pre-existing mount in this export.
+        no_host_mounts(&pinned(&bundles))?;
         let path = pinned(&bundles).join(container);
         match fs::remove_dir_all(&path) {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),

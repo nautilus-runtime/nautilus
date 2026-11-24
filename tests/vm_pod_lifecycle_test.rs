@@ -260,6 +260,41 @@ async fn check_share(root: &Path, a: &str, b: &str, boot_a: &str, boot_b: &str) 
         eprintln!("guest {boot} saw only its own bundle, wrote back marker {marker}");
     }
 
+    // An unexpected same-filesystem bind mount is a separate mount even if
+    // st_dev is unchanged. Both publication and cleanup must retain its data.
+    let host = tempfile::tempdir_in(root)?;
+    fs::write(host.path().join("preserved"), "host data")?;
+    let clean = tempfile::tempdir_in(root)?;
+    let staged_mount = clean.path().join("volume");
+    fs::create_dir(&staged_mount)?;
+    let bind = |where_: &Path| -> Result<()> {
+        nix::mount::mount(
+            Some(host.path()),
+            where_,
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
+        Ok(())
+    };
+    bind(&staged_mount)?;
+    let publish = store
+        .publish_bundle(a, &Uuid::new_v4().to_string(), clean.path())
+        .await;
+    nix::mount::umount(&staged_mount)?;
+    ensure!(publish.is_err() && clean.path().is_dir());
+    let in_bundle = root
+        .join("vms")
+        .join(a)
+        .join("podfs/containers")
+        .join(a)
+        .join("volume");
+    fs::create_dir(&in_bundle)?;
+    bind(&in_bundle)?;
+    let remove = store.remove_bundle(a, a).await;
+    nix::mount::umount(&in_bundle)?;
+    ensure!(remove.is_err() && fs::read_to_string(host.path().join("preserved"))? == "host data");
+
     // A replaced export component invalidates this Pod. The failed operation
     // must leave the staged source and the replacement directory untouched.
     let containers = root.join("vms").join(a).join("podfs/containers");
@@ -362,6 +397,18 @@ async fn check_recovery(root: &Path, a: &str, b: &str) -> Result<()> {
         .context("CRI did not observe A's lost virtiofsd")?;
         ensure!(sandbox_guest(&mut cri, b).await?.as_deref() == Some(boot_b.as_str()));
     }
+    if std::env::var_os("NAUTILUS_VM_VIRTIOFSD").is_some() {
+        let containers = vms.join(a).join("podfs/containers");
+        let saved = containers.with_file_name("original-containers");
+        fs::rename(&containers, &saved)?;
+        fs::create_dir(&containers)?;
+        let rejected = stop_sandbox(&mut cri, a).await;
+        ensure!(rejected.is_err() && vms.join(format!("{a}.json")).is_file());
+        fs::remove_dir(&containers)?;
+        fs::rename(saved, &containers)?;
+        ensure!(sandbox_guest(&mut cri, b).await?.as_deref() == Some(boot_b.as_str()));
+    }
+
     let mut retry = cri_client(root);
     tokio::try_join!(stop_sandbox(&mut cri, a), stop_sandbox(&mut retry, a))?;
     expect_vmm_exit(&process_a).await?;
