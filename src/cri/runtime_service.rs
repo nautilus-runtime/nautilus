@@ -518,43 +518,26 @@ impl RuntimeService for NautilusRuntimeService {
         let pod_host_pid = pod_ns.is_some_and(|n| n.pid() as i32 == node_mode);
         let pod_host_ipc = pod_ns.is_some_and(|n| n.ipc() as i32 == node_mode);
 
-        let pod_id = self.pod_manager.reserve_pod(
-            &metadata.namespace,
-            &metadata.name,
-            &metadata.uid,
-            &handler,
-            config.labels,
-            config.annotations,
-            config.log_directory.as_str(),
-            config.hostname.as_str(),
-            &config
-                .dns_config
-                .as_ref()
-                .map(|d| d.servers.clone())
-                .unwrap_or_default(),
-            &config
-                .dns_config
-                .as_ref()
-                .map(|d| d.searches.clone())
-                .unwrap_or_default(),
-            &config
-                .dns_config
-                .as_ref()
-                .map(|d| d.options.clone())
-                .unwrap_or_default(),
-            config
-                .linux
-                .as_ref()
-                .and_then(|l| l.security_context.as_ref())
-                .map(|sc| sc.privileged)
-                .unwrap_or(false),
-            pod_host_network,
-            pod_host_pid,
-            pod_host_ipc,
-            None,
-            config.linux.as_ref().map_or("", |l| l.cgroup_parent.as_str()),
-            false,
-        ).await.map_err(|e| Status::internal(format!("Failed to create pod: {}", e)))?;
+        let dns = config.dns_config.as_ref();
+        let pod_id = self.pod_manager.reserve_pod(crate::core::state::PodState {
+            namespace: metadata.namespace,
+            name: metadata.name,
+            uid: metadata.uid,
+            runtime_handler: handler.clone(),
+            labels: config.labels,
+            annotations: config.annotations,
+            log_directory: config.log_directory,
+            hostname: config.hostname,
+            dns_servers: dns.map(|d| d.servers.clone()).unwrap_or_default(),
+            dns_searches: dns.map(|d| d.searches.clone()).unwrap_or_default(),
+            dns_options: dns.map(|d| d.options.clone()).unwrap_or_default(),
+            privileged: config.linux.as_ref().and_then(|l| l.security_context.as_ref()).is_some_and(|sc| sc.privileged),
+            host_network: pod_host_network,
+            host_pid: pod_host_pid,
+            host_ipc: pod_host_ipc,
+            cgroup_parent: config.linux.as_ref().map(|l| l.cgroup_parent.clone()).unwrap_or_default(),
+            ..Default::default()
+        }).await.map_err(|e| Status::internal(format!("Failed to create pod: {}", e)))?;
 
         let _guard = self.pod_manager.operation_guard(&pod_id).await;
         // A concurrent removal can observe the initial Pending record first.
@@ -1778,6 +1761,8 @@ mod implicit_cleanup_tests {
             sandbox_registry: registry,
             pod_net: Arc::new(PodNet::new(config.clone())),
             policy: Arc::new(crate::policy::PolicyEngine::new(&config)),
+            images: Arc::new(crate::storage::ImageManager::new(config.clone())),
+            vm_ready: Default::default(),
             _config: config,
             _state_manager: state,
         };

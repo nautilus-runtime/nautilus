@@ -167,9 +167,9 @@ impl RuncBackend {
 
         let log_file = spec.output_dir.join(&spec.log_relpath);
 
-        let pid = {
+        let (pid, scope_mem_events, oom_baseline) = {
             let id = id.clone();
-            tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || -> Result<u32> {
+            tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || -> Result<_> {
             let lc = |e: libcontainer::error::LibcontainerError| {
                 Error::Runtime(format!("libcontainer {id}: {e}"))
             };
@@ -215,6 +215,17 @@ impl RuncBackend {
                 .with_systemd(systemd)
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: create: {e}")))?;
+            // The created init is already in its cgroup, but cannot execute user
+            // code until start(). Capture its own path and the parent counter now.
+            let pid = container.pid().map(|p| p.as_raw() as u32).unwrap_or(0);
+            let scope = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok().and_then(|text| {
+                let rel = text.lines().find_map(|line| line.strip_prefix("0::/"))?;
+                Some(Path::new("/sys/fs/cgroup").join(rel).join("memory.events"))
+            });
+            let baseline = scope.as_deref().and_then(|file| {
+                let events = file.parent()?.parent()?.join("memory.events");
+                Some((events.clone(), read_oom_kill(&events)?))
+            });
             container.start().map_err(|e| {
                 Error::Runtime(format!("libcontainer {id}: start: {e}"))
             })?;
@@ -236,7 +247,7 @@ impl RuncBackend {
             // AppArmor is applied by libcontainer's init process from the spec
             // profile before the workload execve; no host-side
             // attr write needed here.
-            Ok(container.pid().map(|p| p.as_raw() as u32).unwrap_or(0))
+            Ok((pid, scope, baseline))
             }))
             .await
             .map_err(|e| Error::Runtime(format!("libcontainer worker join failed: {e}")))?
@@ -245,21 +256,11 @@ impl RuncBackend {
         Self::spawn_output_logger(p_out, &log_file, "stdout");
         Self::spawn_output_logger(p_err, &log_file, "stderr");
 
-        // OOM attribution: snapshot the system-slice counter and watch the
-        // container's own memory.events while its scope exists (systemd
-        // removes the scope right after death, so the reaper cannot read it
-        // post-mortem without racing).
+        // The persistent Pod parent also accounts for OOMs from containers
+        // whose scopes are removed before the watcher can observe their exit.
         let oom_id = spec.id.clone();
-        let scope_mem_events = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
-            .and_then(|text| text.lines().find_map(|line| line.strip_prefix("0::/").map(str::to_owned)))
-            .map(|cgroup| Path::new("/sys/fs/cgroup").join(cgroup).join("memory.events"));
-        if let Some(ref scope) = scope_mem_events {
-            if let Some(parent) = scope.parent().and_then(Path::parent) {
-                let events = parent.join("memory.events");
-                if let Some(base) = read_oom_kill(&events) {
-                    oom_baselines().lock().unwrap().insert(spec.id.clone(), (events, base));
-                }
-            }
+        if let Some(baseline) = oom_baseline {
+            oom_baselines().lock().unwrap().insert(spec.id.clone(), baseline);
         }
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
@@ -860,7 +861,7 @@ pub fn oom_killed(container_id: &str) -> bool {
         return true;
     }
     // Fallback: the container's own cgroup may already be torn down by the
-    // time the reaper runs; compare against the system-slice counter captured
+    // time the reaper runs; compare against the parent cgroup counter captured
     // at start (race-free — the slice outlives every scope).
     let baseline = oom_baselines().lock().unwrap().remove(container_id);
     if let Some((events, base)) = baseline {

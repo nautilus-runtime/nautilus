@@ -69,7 +69,7 @@ pub struct VmPodAttempt {
     pub ready_network: Option<crate::network::vm::VmNetwork>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PodState {
     pub id: String,
     pub namespace: String,
@@ -150,8 +150,9 @@ pub enum ContainerStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PodStatus {
+    #[default]
     Pending,
     Running,
     Succeeded,

@@ -380,6 +380,11 @@ pub struct ImageFacts {
     pub user: String,
 }
 
+pub(super) async fn cached_image_facts(config: &Config, image_ref: &str) -> Option<ImageFacts> {
+    let reference = resolve_ref(config, image_ref).ok()?;
+    Some(load_cached(config, &reference).await?.facts(image_ref))
+}
+
 /// Fetch (offline when possible) manifest+config for `image_ref` and extract
 /// the docker-parity identity fields. Offline cache hits never need network;
 /// misses fetch with the given `auth` (Anonymous for status enrichment, the

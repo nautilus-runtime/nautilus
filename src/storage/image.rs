@@ -361,10 +361,25 @@ impl ImageManager {
             return Err(Error::Image(format!("invalid image config digest {image}")));
         }
         let records = self.images.read().await;
-        let manifest = records.values().find(|record| record.image_id == image)
-            .and_then(|record| record.repo_digests.first())
-            .ok_or_else(|| Error::Image(format!("no pulled manifest for image ID {image}")))?;
-        Ok(manifest.clone())
+        if let Some(manifest) = records.values().filter(|r| r.image_id == image)
+            .find_map(|r| r.repo_digests.first()) {
+            return Ok(manifest.clone());
+        }
+        // Older records stored tags and exposed the config ID lazily through
+        // ImageStatus. Match the actual cached manifest before pinning it.
+        let legacy: Vec<_> = records.values()
+            .filter(|r| r.image_id.is_empty() || (r.image_id == image && r.repo_digests.is_empty()))
+            .flat_map(|r| r.repo_digests.iter().chain(std::iter::once(&r.id)))
+            .cloned().collect();
+        drop(records);
+        for reference in legacy {
+            if let Some(facts) = super::pull::cached_image_facts(&self.config, &reference).await {
+                if facts.config_digest == image && !facts.manifest_digest.is_empty() {
+                    return Ok(format!("{}@{}", repo_part(&reference), facts.manifest_digest));
+                }
+            }
+        }
+        Err(Error::Image(format!("no pulled manifest for image ID {image}")))
     }
 
     /// Get image status/information
@@ -717,6 +732,35 @@ mod tests {
         assert_eq!(restarted.workload_reference(&first).await.unwrap(), old_digest);
         assert!(restarted.workload_reference(&format!("sha256:{}", "0".repeat(64))).await.is_err());
     }
+    #[tokio::test]
+    async fn legacy_image_id_resolves_only_to_its_cached_manifest() {
+        use oci_distribution::{config::ConfigFile, manifest::OciImageManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.image_dir = dir.path().to_owned();
+        let config = Arc::new(config);
+        let store = ImageManager::new(config.clone());
+        store.initialize().await.unwrap();
+        let tag = "example.test/project:old";
+        let id = store.record_pull(tag, facts('a')).await.unwrap();
+        {
+            let mut records = store.images.write().await;
+            let mut legacy = records.drain().next().unwrap().1;
+            legacy.image_id.clear();
+            legacy.repo_digests.clear();
+            legacy.id = tag.into();
+            records.insert(tag.into(), legacy);
+        }
+        let mut manifest = OciImageManifest::default();
+        manifest.config.digest = id.clone();
+        let pinned = facts('b').manifest_digest;
+        let data = serde_json::json!({"manifest": manifest, "config": ConfigFile::default(), "manifest_digest": pinned});
+        let file = super::super::pull::manifest_cache_path(&config, &tag.parse().unwrap());
+        fs::write(file, data.to_string()).await.unwrap();
+        assert_eq!(store.workload_reference(&id).await.unwrap(), format!("example.test/project@{pinned}"));
+        assert!(store.workload_reference(&pinned).await.is_err());
+    }
+
     #[tokio::test]
     async fn refresh_recovers_pending_manifest_and_normalizes_tag_aliases() {
         use oci_distribution::{config::ConfigFile, manifest::OciImageManifest, Reference};

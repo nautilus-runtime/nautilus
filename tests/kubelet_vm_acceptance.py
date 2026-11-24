@@ -107,14 +107,16 @@ def main():
 
     def pod(name, containers, volumes):
         return dict(apiVersion="v1", kind="Pod", metadata={"name": name},
-                    spec=dict(runtimeClassName=namespace, nodeName=args.node, containers=containers,
+                    spec=dict(runtimeClassName=namespace, containers=containers,
                               terminationGracePeriodSeconds=1, volumes=volumes, restartPolicy="Never",
                               automountServiceAccountToken=False))
 
     def snapshot():
         facts = []
         for name, container in [("alpha", "web"), ("beta", "client")]:
-            status = json.loads(kube("get", "pod", name, "-o", "json"))["status"]
+            pod_data = json.loads(kube("get", "pod", name, "-o", "json"))
+            assert pod_data["spec"]["nodeName"] == args.node
+            status = pod_data["status"]
             ids = [c["containerID"] for c in status["containerStatuses"] if c["ready"]]
             assert len(ids) == (2 if name == "alpha" else 1)
             boot = exec_in(name, container, "cat", "/proc/sys/kernel/random/boot_id")
@@ -144,8 +146,10 @@ def main():
     kube("create", "namespace", namespace)
     records = []
     try:
+        node = json.loads(kube("get", "node", args.node, "-o", "json"))
+        hostname = node["metadata"]["labels"]["kubernetes.io/hostname"]
         apply(dict(apiVersion="node.k8s.io/v1", kind="RuntimeClass", metadata={"name": namespace},
-                   handler="vm", overhead={"podFixed": {"memory": "128Mi"}}))
+                   handler="vm", scheduling={"nodeSelector": {"kubernetes.io/hostname": hostname}}, overhead={"podFixed": {"memory": "128Mi"}}))
         with tempfile.TemporaryDirectory(prefix="nautilus-kubelet-") as volume:
             Path(volume, "host.txt").write_text("host-visible\n")
             apply(dict(apiVersion="v1", kind="ConfigMap", metadata={"name": "settings"}, data={"mode": "projected"}))
@@ -164,6 +168,8 @@ def main():
             exercise(before, "projected")
             exec_in("alpha", "web", "sh", "-c", "echo guest-wrote >/public/guest.txt")
             assert Path(volume, "guest.txt").read_text().strip() == "guest-wrote"
+            assert subprocess.run([*k, "exec", "alpha", "-c", "web", "--", "sh", "-c",
+                                   "echo invalid >/settings/mode"], capture_output=True).returncode != 0
             kube("patch", "configmap", "settings", "--type=merge", "-p", '{"data":{"mode":"updated"}}')
             wait(lambda: exec_in("alpha", "web", "cat", "/settings/mode") == "updated", 180)
             for name in ("alpha", "beta"):
