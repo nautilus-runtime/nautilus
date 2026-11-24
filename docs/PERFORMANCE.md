@@ -2,6 +2,32 @@
 
 This benchmark measures how long a CRI client waits for an OCI workload to run on Nautilus and containerd. Run both on the same Linux host. The serial case measures individual request latency. The parallel case shows how that latency changes when several pods start together.
 
+## Independent repeat · 2026-11-24
+
+With the BusyBox image already unpacked, Nautilus completed CreateContainer + StartContainer in **45.7 ms at P95** serially and **80.4 ms** with four concurrent pods. These were 33% and 38% lower than containerd 2.2.2 in the same window. The previous optimized run measured 47.2 and 91.1 ms for Nautilus. The runtime source and locked dependencies were identical at the two tested revisions, `b801cc1` and `240e461`. The difference between windows gives an indication of run-to-run variation. [Raw samples from the repeat](benchmarks/cri-lifecycle-arm64-repeat.csv)
+
+Each latency cell shows **P50 / P95 in milliseconds**. Each runtime completed 50 serial workloads and 48 workloads in 12 batches of four after three warm-up pairs at each concurrency. Throughput counts full lifecycles, including status checks and removal.
+
+| Concurrent pods | Runtime | Pod sandbox | Create container | Start container | Create + start | Pod to ready | Workloads/s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Nautilus | 7.4 / 8.3 | 10.8 / 12.7 | 32.5 / 34.6 | 43.5 / 45.7 | 51.5 / 53.8 | 7.85 |
+| 1 | containerd | 68.2 / 76.9 | 13.5 / 16.4 | 48.4 / 54.0 | 62.9 / 68.4 | 131.4 / 138.9 | 4.39 |
+| 4 | Nautilus | 14.0 / 17.1 | 17.0 / 23.4 | 44.1 / 60.8 | 62.8 / 80.4 | 77.8 / 96.4 | 23.73 |
+| 4 | containerd | 130.4 / 154.5 | 30.1 / 47.9 | 78.8 / 93.8 | 109.5 / 129.4 | 242.3 / 272.4 | 9.63 |
+
+### First use with compressed layers cached
+
+Nautilus built its shared image tree during the first CreateContainer. containerd unpacked during PullImage. For a caller that has already pulled the image, Nautilus took **136.3 ms** at P95 for the first create + start, versus **79.5 ms** for containerd. Counting both the cached pull and the time from pod submission to workload readiness, Nautilus took **151.2 ms** at P95 versus **219.1 ms** for containerd. The last column sums the two intervals within each sample before computing percentiles.
+
+| Runtime | Cached pull | First create | First create + start | Pod to ready | Cached pull + pod to ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Nautilus | 1.2 / 1.3 | 98.2 / 101.0 | 132.6 / 136.3 | 146.2 / 149.9 | 147.5 / 151.2 |
+| containerd | 69.7 / 74.1 | 13.1 / 16.0 | 66.4 / 79.5 | 138.6 / 146.3 | 208.9 / 219.1 |
+
+The runtimes alternated order over 15 serial pairs. Before each sample the driver removed the BusyBox image record, checked that its unpacked tree was absent and verified the cached layer digest. On containerd it also pinned the compressed content against garbage collection and removed the BusyBox snapshot reference and snapshot. Nautilus read the cached manifest locally. containerd resolved the pinned manifest through a loopback registry and transferred no layer data. Snapshot checks confirmed when each runtime unpacked the image. With 15 samples, P95 is the largest observation. The result covers a warm filesystem cache and one 1.90 MB compressed layer.
+
+Both dedicated daemons used the same four ARM64 CPUs, Linux 6.8, ext4 and an isolated systemd manager. Nautilus used the locked release build with rustc 1.98.0 and in-process youki 0.8.0. containerd used its runc v2 shim, runc 1.3.4 and OverlayFS. CPU pressure (`some avg10`) before the serial, four-way and first-use series was 0.00%, 2.65% and 15.34% respectively. All workloads passed readiness, running-state and cleanup checks. Both test endpoints were empty after the run.
+
 ## OCI snapshots and youki 0.8.0 · 2026-11-24
 
 The optimized runtime completed serial warm-image CreateContainer + StartContainer in **47.2 ms at P95**, down from **101.3 ms**. Both runs used the same pinned BusyBox image. The previous runtime unpacked the image for every container. Nautilus now reuses a shared image tree and gives each container its own writable OverlayFS upper directory.
