@@ -89,6 +89,8 @@ def main():
                         help="busybox image with sh, wget and httpd")
     parser.add_argument("--kubectl", default="kubectl", help="uses KUBECONFIG")
     parser.add_argument("--crictl", default="crictl")
+    parser.add_argument("--kubelet-stats", action="store_true",
+                        help="verify the kubelet Summary API with PodAndContainerStatsFromCRI enabled")
     args = parser.parse_args()
     cfg = tomllib.loads(args.config.read_text())
     ep = cfg["cri"]["listen_address"]
@@ -227,6 +229,31 @@ def main():
             for pid in records:
                 assert int(measured_pods[pid]["cpu"]["usageCoreNanoSeconds"]["value"]) > 0
                 assert measured_pods[pid]["containers"]
+            if args.kubelet_stats:
+                exec_in("alpha", "web", "sh", "-c",
+                        "dd if=/dev/zero of=/dev/shm/stats-load bs=1048576 count=16 2>/dev/null && "
+                        "sha256sum /dev/shm/stats-load >/dev/null")
+                def summary_usage():
+                    summary = json.loads(kube("get", "--raw", f"/api/v1/nodes/{args.node}/proxy/stats/summary"))
+                    pods = {p["podRef"]["name"]: p for p in summary["pods"]
+                            if p["podRef"]["namespace"] == namespace}
+                    if set(pods) != {"alpha", "beta"}:
+                        return False
+                    containers = {c["name"]: c for p in pods.values() for c in p["containers"]}
+                    if set(containers) != {"web", "console", "client"}:
+                        return False
+                    for obj in (*pods.values(), *containers.values()):
+                        if obj.get("cpu", {}).get("usageCoreNanoSeconds", 0) <= 0:
+                            return False
+                        if obj.get("memory", {}).get("workingSetBytes", 0) <= 0:
+                            return False
+                    if containers["web"]["memory"]["usageBytes"] < containers["console"]["memory"]["usageBytes"] + (8 << 20):
+                        return False
+                    for name, obj in {**pods, **containers}.items():
+                        print("kubelet summary", name, "cpuNs", obj["cpu"]["usageCoreNanoSeconds"],
+                              "workingSetBytes", obj["memory"]["workingSetBytes"], flush=True)
+                    return True
+                wait(summary_usage, 120)
             assert all((args.ipam_dir / ip).is_file() for ip, _, _ in before)
             pid = int(run(["systemctl", "show", args.daemon_unit, "-p", "MainPID", "--value"]))
             assert pid > 1 and Path(f"/proc/{pid}/exe").resolve().name.startswith("nautilusd")

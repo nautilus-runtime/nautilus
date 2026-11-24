@@ -84,6 +84,8 @@ sudo --preserve-env=KUBECONFIG python3 tests/kubelet_vm_acceptance.py \
   --ipam-dir /var/lib/cni/networks/nautilus
 ```
 
+要验证 kubelet 的实际采样源，在该测试节点的 KubeletConfiguration 中设置 `featureGates.PodAndContainerStatsFromCRI: true`，并在上面的命令追加 `--kubelet-stats`。脚本经 API server 访问 `/api/v1/nodes/<node>/proxy/stats/summary`，核对两个 VM Pod 和三个容器的 CPU、工作集，并比较分别加载和休眠的容器内存。执行者需有读取节点 proxy 的权限。[Kubernetes 节点指标来源](https://kubernetes.io/docs/reference/instrumentation/node-metrics/)
+
 ## 已验证的行为与范围
 
 真实 kubelet 验收使用 Kubernetes v1.37.2 和 Cloud Hypervisor v55.0。两个 VM Pod 中共有三个容器，验证了跨 Pod HTTP、真实退出码、连接原 init 的 attach、guest 回环端口转发、CRI 日志，以及 daemon 重启后 boot ID、Pod IP 和容器身份保持。WASI 和默认 OCI 后端另行回归。[CRI 回归结果](CRITEST_RESULTS.md)
