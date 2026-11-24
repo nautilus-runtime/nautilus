@@ -91,7 +91,7 @@ impl Binding {
     }
 }
 
-fn mount_id(file: &File) -> io::Result<u64> {
+pub(super) fn mount_id(file: &File) -> io::Result<u64> {
     let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
     info.lines()
         .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
