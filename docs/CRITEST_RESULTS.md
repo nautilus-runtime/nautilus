@@ -10,6 +10,12 @@
 
 `b7eb13f` 的 Linux Rust 测试为 96 通过、0 失败、8 项默认忽略。全库格式检查仍涉及基线的 31 个文件，Clippy 仍报告 29 条诊断。独立运行的真实 CRI 测试使用 Cloud Hypervisor v55.0，覆盖双 Pod 网络与 DNS、两个 OCI 容器、十次 ExecSync、超时和取消、guest 连接中断、daemon 被强制终止后的恢复、日志及重复清理。Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主上另行通过双 Pod 网络测试。[运行步骤](VM_RUNTIME.md)
 
+## 2026-11-24 VM 的交互式 CRI
+
+在 pro6000 的隔离节点使用 crictl v1.37.0、Cloud Hypervisor v55.0 和实际 guest，通过 CRI 单独核对 Exec、Attach、PortForward。修订前标准输入的 3 MiB 二进制内容经 guest cat 只返回 2,387,968 字节。修订后 3,145,728 字节逐字节一致。另验证了独立 stderr、非零退出码、终端尺寸、重连到原 init、客户端断开时取消执行、目标端口不存在、连续转发两个连接和 guest 失联的错误。在单独的 SPDY 测试中，一条流半关闭后仍能读取，将其复位后另一条流仍能传输。
+
+`347c4dc` 上默认 OCI 的未过滤 critest v1.31.1 为 **95 通过、1 失败、17 跳过**，耗时 245.738 秒。唯一失败是 HostNetwork=false 清理快速退出容器时缺失 systemd scope，由 #25 跟踪。单独运行随项目引入的 SPDY 测试，36 项通过。[协议及验证步骤](GUEST_OCI_PROTOCOL.md)
+
 ## 2026-11-24 Pod VM 生命周期
 
 PR #10 的生产代码提交为 `af327ce`。用 Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主验证，再用 v55.0 在同机的 Linux 6.12.118、systemd 257 嵌套 KVM 节点复验。每轮启动两个实验性 Pod VM，再通过真实 daemon 的 CRI socket 验证 guest boot ID、强制终止并重启 daemon、并发及重复 Stop/Remove、意外退出后的清理。[实验范围与运行命令](VM_RUNTIME.md#首版使用系统级-systemd-托管-vmm)
