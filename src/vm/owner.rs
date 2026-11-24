@@ -41,13 +41,17 @@ impl FileIdentity {
 
     fn check(path: &Path) -> io::Result<Self> {
         let meta = fs::symlink_metadata(path)?;
+        Self::directory(path, &meta)
+    }
+
+    fn directory(path: &Path, meta: &fs::Metadata) -> io::Result<Self> {
         if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
                 format!("insecure VM directory {}", path.display()),
             ));
         }
-        Ok(Self::from_meta(&meta))
+        Ok(Self::from_meta(meta))
     }
 }
 
@@ -201,15 +205,6 @@ impl PodVmStore {
         let vmm = vmm.canonicalize()?;
         let kernel = kernel.canonicalize()?;
         let initramfs = initramfs.canonicalize()?;
-        match fs::symlink_metadata(&lease.directory) {
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-            Ok(_) => {
-                return Err(invalid(
-                    "VM directory already exists without an ownership record",
-                ))
-            }
-        }
         let mut owner = Owner {
             id: id.into(),
             nonce: Uuid::new_v4().to_string(),
@@ -271,8 +266,8 @@ impl PodVmStore {
             let Some(lease) = self.lease(id, false, RECOVERY_BUDGET).await? else {
                 return Ok(None);
             };
+            lease.discard_draft()?;
             let Some(mut owner) = lease.load(id)? else {
-                lease.discard_draft()?;
                 return Ok(None);
             };
             if !owner.removing && owner.boot.is_some() {
@@ -309,6 +304,20 @@ impl PodVmStore {
 }
 
 impl Lease {
+    // The VMM binds relative paths. Pin its directory so host connects fit
+    // sockaddr_un even when the operator configures a deeply nested state_dir.
+    fn open_socket_directory(&self, owner: &Owner) -> io::Result<(File, PathBuf)> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&self.directory)?;
+        if Some(FileIdentity::directory(&self.directory, &dir.metadata()?)?) != owner.directory {
+            return Err(invalid("VM socket directory identity changed"));
+        }
+        let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        Ok((dir, path))
+    }
+
     fn discard_draft(&self) -> io::Result<()> {
         // The first marker write may have been interrupted before its atomic rename.
         match fs::symlink_metadata(&self.draft) {
@@ -329,7 +338,13 @@ impl Lease {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&self.marker)
         {
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return match fs::symlink_metadata(&self.directory) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                    Ok(_) => Err(invalid("VM directory exists without an ownership record")),
+                };
+            }
             other => other?,
         };
         if !file.metadata()?.is_file() {
@@ -574,13 +589,11 @@ impl Lease {
                 ))
             }
         }
-        if Some(FileIdentity::check(&self.directory)?) != owner.directory {
-            return Err(invalid("VM socket directory identity changed"));
-        }
-        let socket = self.directory.join("vsock.sock");
+        let (_dir, socket_dir) = self.open_socket_directory(owner)?;
+        let socket = socket_dir.join("vsock.sock");
         let mut sockets = [None, None];
         for (index, name) in SOCKETS.iter().enumerate() {
-            let meta = fs::symlink_metadata(self.directory.join(name))?;
+            let meta = fs::symlink_metadata(socket_dir.join(name))?;
             let identity = FileIdentity::from_meta(&meta);
             if !meta.file_type().is_socket()
                 || owner.sockets[index].is_some_and(|saved| saved != identity)
@@ -589,7 +602,7 @@ impl Lease {
             }
             sockets[index] = Some(identity);
         }
-        let peer = UnixStream::connect(self.directory.join("api.sock")).await?;
+        let peer = UnixStream::connect(socket_dir.join("api.sock")).await?;
         if peer.peer_cred()?.pid().filter(|p| *p > 1) != unit.pid || unit.pid.is_none() {
             return Err(invalid(
                 "API endpoint does not belong to the VMM systemd started",
@@ -661,15 +674,12 @@ impl Lease {
     }
 
     async fn cleanup_files(&self, owner: &Owner) -> io::Result<()> {
-        match FileIdentity::check(&self.directory) {
+        match self.open_socket_directory(owner) {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
-            Ok(actual) => {
-                if owner.directory != Some(actual) {
-                    return Err(invalid("refusing to clean replaced VM directory"));
-                }
+            Ok((_dir, socket_dir)) => {
                 for (index, name) in SOCKETS.iter().enumerate() {
-                    let socket = self.directory.join(name);
+                    let socket = socket_dir.join(name);
                     let meta = match fs::symlink_metadata(&socket) {
                         Err(e) if e.kind() == ErrorKind::NotFound => continue,
                         result => result?,
@@ -721,8 +731,12 @@ mod tests {
     const ID: &str = "d07de0d1-b5a4-4082-8c32-b7d400364f96";
 
     async fn fixture() -> (tempfile::TempDir, PodVmStore, Lease, Owner) {
+        fixture_at("store").await
+    }
+
+    async fn fixture_at(name: &str) -> (tempfile::TempDir, PodVmStore, Lease, Owner) {
         let work = tempfile::tempdir().unwrap();
-        let store = PodVmStore::new(work.path().join("store"));
+        let store = PodVmStore::new(work.path().join(name));
         let lease = store
             .lease(ID, true, Duration::ZERO)
             .await
@@ -791,6 +805,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_marker_does_not_authorize_removing_a_resource_directory() {
+        let (_work, store, lease, _) = fixture().await;
+        fs::remove_file(&lease.marker).unwrap();
+        let directory = lease.directory.clone();
+        drop(lease);
+        assert_eq!(
+            store.recover(ID).await.unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            store.remove(ID).await.unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert!(directory.exists());
+    }
+
+    #[tokio::test]
     async fn status_and_start_cannot_commit_an_interrupted_attempt() {
         let (_work, store, lease, owner) = fixture().await;
         assert!(owner.boot.is_none());
@@ -842,6 +873,26 @@ mod tests {
         fs::remove_file(&socket).unwrap();
         fs::rename(original_path, &socket).unwrap();
         drop(original);
+        lease.cleanup_files(&owner).await.unwrap();
+        assert!(!lease.directory.exists() && !lease.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn long_state_directory_supports_socket_connections_and_cleanup() {
+        let (_work, _store, lease, owner) = fixture_at(&"s".repeat(120)).await;
+        assert!(
+            std::os::unix::net::SocketAddr::from_pathname(lease.directory.join("api.sock"))
+                .is_err()
+        );
+        let (_dir, socket_dir) = lease.open_socket_directory(&owner).unwrap();
+        let api = socket_dir.join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&api).unwrap();
+        let peer = UnixStream::connect(&api).await.unwrap();
+        assert_eq!(
+            peer.peer_cred().unwrap().pid(),
+            Some(std::process::id() as i32)
+        );
+        drop(listener);
         lease.cleanup_files(&owner).await.unwrap();
         assert!(!lease.directory.exists() && !lease.marker.exists());
     }
