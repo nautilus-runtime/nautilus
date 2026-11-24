@@ -276,7 +276,10 @@ impl PodVmStore {
             return Ok(None);
         };
         if owner.removing || owner.boot.is_none() {
-            return Ok(None);
+            return Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "VM startup or removal has not been reconciled",
+            ));
         }
         lease.online_with_deadline(&owner).await
     }
@@ -853,7 +856,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_status_readers_share_the_lease_and_exclude_removal() {
-        let (_work, store, writer, _) = fixture().await;
+        let work = tempfile::tempdir().unwrap();
+        let store = PodVmStore::new(work.path().join("store"));
+        let writer = store.lease(ID, Operation::Start).await.unwrap().unwrap();
         drop(writer);
         let reader = store.lease(ID, Operation::Status).await.unwrap().unwrap();
         let (first, second) = tokio::join!(store.status(ID), store.status(ID));
@@ -870,7 +875,9 @@ mod tests {
 
     #[tokio::test]
     async fn status_waits_for_a_briefly_inherited_writer_descriptor() {
-        let (_work, store, writer, _) = fixture().await;
+        let work = tempfile::tempdir().unwrap();
+        let store = PodVmStore::new(work.path().join("store"));
+        let writer = store.lease(ID, Operation::Start).await.unwrap().unwrap();
         let inherited = writer.lock.try_clone().unwrap();
         drop(writer);
         let release = async {
@@ -912,12 +919,26 @@ mod tests {
 
     #[tokio::test]
     async fn status_and_start_cannot_commit_an_interrupted_attempt() {
-        let (_work, store, lease, owner) = fixture().await;
+        let (_work, store, lease, mut owner) = fixture().await;
         assert!(owner.boot.is_none());
         drop(lease);
-        assert_eq!(store.status(ID).await.unwrap(), None);
+        assert_eq!(
+            store.status(ID).await.unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
         let unused = Path::new("/unused");
         assert!(store.start(ID, unused, unused, unused).await.is_err());
+
+        // Recording a removal intent does not prove the service has stopped.
+        let lease = store.lease(ID, Operation::Remove).await.unwrap().unwrap();
+        owner.boot = Some(Uuid::new_v4().to_string());
+        owner.removing = true;
+        lease.save(&owner).unwrap();
+        drop(lease);
+        assert_eq!(
+            store.status(ID).await.unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
     }
 
     #[tokio::test]
