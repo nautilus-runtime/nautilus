@@ -89,6 +89,14 @@ sudo --preserve-env=NAUTILUS_CNI_BIN_DIR,NAUTILUS_VM_VMM,NAUTILUS_VM_KERNEL,NAUT
   unshare -mn --propagation private cargo test --locked --test vm_network_test -- --include-ignored --nocapture
 ```
 
+### 实验性 CRI Pod VM
+
+配置 `[runtime.sandboxes] vm_workloads_enabled = true` 以及 `[runtime.sandboxes.vm]` 的 VMM、kernel、工作负载 initramfs、virtiofsd 四个路径。默认关闭。显式发送 `RunPodSandbox(runtime_handler="vm")` 时，使用 bridge + host-local CNI、Pod 网络/IPC 和每容器私有 PID（`namespace_options.pid=CONTAINER`）。自定义 sysctl、hostPort、节点 namespace 和特定宿主安全配置会在分配资源前被拒绝。Pod 可指定 Linux hostname 和 DNS。
+
+守护进程确认本次启动的身份、完整网络配置和工作负载 agent 的 4083 握手后才发布 READY，并返回该次 attempt 的 Pod IP。运行中 guest 失联会反映在状态及列表；独立的身份探针仍用于旧的开发用 VM。停止时先回收 guest 容器和 VMM，再以已记录的 CNI 配置删除网络。中断的启动或停止可在 daemon 重启时继续清理。
+
+`tests/vm_pod_lifecycle_test.rs` 的 `cri_pod_network_survives_daemon_restart_and_releases_on_stop` 通过真实 CRI socket 验证两台 Pod VM、地址可达、daemon SIGKILL 后 IP 与 boot ID 保持、DEL 失败重试、VMM 意外退出、重复停止与删除。配置 `NAUTILUS_VM_IDENTITY_INITRAMFS` 可额外检查仅具有身份握手的 guest 启动失败后完整回收。通过同一测试的节点使用 Debian Linux 6.12.118、Cloud Hypervisor v54.1，guest 内核为 Ubuntu 5.15.0-191。
+
 ## 节点探针
 
 本地执行 `nautilus vm probe` 会启动一台使用 1 个 vCPU、384 MiB 内存的临时 VM，经 guest 端口 4081 交换 `PING 1` 和 `PONG 1`，然后回收子进程和 socket。它可以在 nautilusd 启动之前运行。测试 guest 仅应答就绪请求，无网络、持久磁盘或执行任意命令的接口。

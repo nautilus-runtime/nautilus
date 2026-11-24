@@ -18,12 +18,13 @@ driver = "libcontainer"                     # libcontainer=进程内(默认);exe
 systemd_cgroup = true                       # 使用 systemd cgroup 管理
 
 [runtime.sandboxes]
+vm_workloads_enabled = false                # 实验性显式 CRI vm 入口
 # 多沙箱路由配置:CRI runtime_handler -> 隔离后端
 # 内置 handler:"runc"(OCI 容器)、"wasi"/"wasm"(进程内 wasmtime)
 default_handler = ""                    # 空 runtime_handler 请求使用的默认后端
 wasm_enabled = true                         # 注册 wasmtime WASM 后端
 
-# 实验性 Pod VM 生命周期测试的镜像。常规 CRI 创建 VM 待容器及网络就绪后开放。
+# 实验性 Pod VM 镜像。显式启用 CRI 工作负载还需配置 virtiofsd 和 CNI。
 # [runtime.sandboxes.vm]
 # vmm = "/opt/cloud-hypervisor/bin/cloud-hypervisor"
 # kernel = "/opt/nautilus/guest/vmlinuz"

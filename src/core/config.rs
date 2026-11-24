@@ -173,6 +173,9 @@ pub struct SandboxesConfig {
     /// Register the in-process wasmtime backend under handlers "wasi"/"wasm".
     #[serde(default = "default_true")]
     pub wasm_enabled: bool,
+    /// Accept explicit VM workload attempts through CRI on this node.
+    #[serde(default)]
+    pub vm_workloads_enabled: bool,
     /// Operator-supplied images for the experimental Pod VM lifecycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmConfig>,
@@ -193,6 +196,7 @@ impl Default for SandboxesConfig {
         Self {
             default_handler: String::new(),
             wasm_enabled: true,
+            vm_workloads_enabled: false,
             vm: None,
         }
     }

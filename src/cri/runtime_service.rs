@@ -8,7 +8,7 @@ use crate::sandbox::SandboxRegistry;
 use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
 use crate::proto::runtime;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -50,6 +50,43 @@ fn sandbox_state(status: &PodStatus) -> PodSandboxState {
 
 fn matches_sandbox_state(filter: Option<&PodSandboxStateValue>, status: &PodStatus) -> bool {
     filter.is_none_or(|value| value.state == sandbox_state(status) as i32)
+}
+
+fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), Status> {
+    use crate::proto::runtime::v1::{NamespaceMode, LinuxSandboxSecurityContext};
+    if host.runtime.sandboxes.vm.as_ref().and_then(|vm| vm.virtiofsd.as_ref()).is_none() {
+        return Err(Status::failed_precondition("VM workloads require a guest and virtiofsd configuration"));
+    }
+    if config.windows.is_some() || !config.port_mappings.is_empty() {
+        return Err(Status::unimplemented("VM supports Linux Pods without host port mappings"));
+    }
+    if config.hostname.len() > 64 || !config.hostname.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        return Err(Status::invalid_argument("invalid guest hostname"));
+    }
+    let linux = config.linux.as_ref().ok_or_else(|| Status::unimplemented("VM requires Linux Pod namespaces"))?;
+    if !linux.sysctls.is_empty() {
+        return Err(Status::unimplemented("VM Pod sysctls are unsupported"));
+    }
+    let mut security = linux.security_context.clone().unwrap_or_default();
+    let ns = security.namespace_options.take().unwrap_or_default();
+    if ns.network != NamespaceMode::Pod as i32 || ns.ipc != NamespaceMode::Pod as i32
+        || ns.pid != NamespaceMode::Container as i32 || !ns.target_id.is_empty() || ns.userns_options.is_some() {
+        return Err(Status::unimplemented("VM requires Pod networking and IPC, private container PID and no user namespace request"));
+    }
+    // The first sandbox process is the guest's root agent. Node profile
+    // references and sandbox credentials cannot be applied to it.
+    // Cloud Hypervisor applies its runtime-default seccomp policy to the
+    // host sandbox process. A localhost profile cannot be resolved in the VM.
+    if security.seccomp.as_ref().is_some_and(|p| p.profile_type == 0 && p.localhost_ref.is_empty()) {
+        security.seccomp = None;
+    }
+    if security.apparmor.as_ref().is_some_and(|p| p.profile_type == 1 && p.localhost_ref.is_empty()) {
+        security.apparmor = None;
+    }
+    if security != LinuxSandboxSecurityContext::default() {
+        return Err(Status::unimplemented("unsupported VM sandbox security context"));
+    }
+    Ok(())
 }
 
 pub struct NautilusRuntimeService {
@@ -352,14 +389,18 @@ impl RuntimeService for NautilusRuntimeService {
             Status::invalid_argument("Pod sandbox config is required")
         })?;
 
+        let managed_vm = req.runtime_handler == "vm" && self._config.runtime.sandboxes.vm_workloads_enabled;
+        if managed_vm {
+            validate_vm_pod(&config, &self._config)?;
+        } else {
+            self.sandbox_registry.resolve(&req.runtime_handler).map_err(Status::from)?;
+        }
         let metadata = config.metadata.ok_or_else(|| {
             Status::invalid_argument("Pod metadata is required")
         })?;
 
         // Multi-sandbox routing: resolve the requested RuntimeClass handler up
         // front and reject unknown ones, per the CRI spec contract.
-        self.sandbox_registry.resolve(&req.runtime_handler)
-            .map_err(Status::from)?;
         let handler = self.sandbox_registry.canonical(&req.runtime_handler);
 
         let vm_resources = if handler == "vm" {
@@ -464,6 +505,35 @@ impl RuntimeService for NautilusRuntimeService {
         if self.pod_manager.get_pod_state(&pod_id).await.map_err(Status::from)?.is_none() {
             return Err(Status::aborted("sandbox removed during setup"));
         }
+        if let Some(resources) = vm_resources {
+            let id = pod_id.clone();
+            let manager = self.pod_manager.clone();
+            let dns = config.dns_config;
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            // A canceled RPC must not abandon an in-flight CNI plugin. Keep
+            // the guard through completion and unwind an unclaimed result.
+            tokio::spawn(async move {
+                let _guard = _guard;
+                let result = manager.create_vm_network_locked(&id, metadata.attempt, dns.as_ref(), &resources).await;
+                if result.is_ok() && !reply.is_closed() {
+                    if reply.send(Ok(())).is_ok() { return; }
+                    if let Err(e) = manager.rollback_vm_locked(&id).await {
+                        tracing::warn!(pod_id=%id, %e, "unclaimed VM retained for cleanup");
+                    }
+                    return;
+                }
+                let cleanup = manager.rollback_vm_locked(&id).await;
+                let error = match (result, cleanup) {
+                    (Err(e), Ok(())) => Status::from(e),
+                    (Err(e), Err(other)) => Status::internal(format!("{e}; sandbox {id} cleanup failed: {other}")),
+                    (Ok(()), Err(e)) => Status::from(e),
+                    (Ok(()), Ok(())) => Status::cancelled("VM request canceled"),
+                };
+                let _ = reply.send(Err(error));
+            });
+            receive.await.map_err(|_| Status::internal("VM setup task stopped"))??;
+            return Ok(Response::new(RunPodSandboxResponse { pod_sandbox_id: pod_id }));
+        }
         let mut ipc_pid = None;
         let mut pause_pid = None;
         let mut network = None;
@@ -530,10 +600,7 @@ impl RuntimeService for NautilusRuntimeService {
                     }
                 }
             }
-            match &vm_resources {
-                Some(resources) => self.pod_manager.start_pod_with_resources_locked(&pod_id, resources).await,
-                None => self.pod_manager.start_pod_locked(&pod_id).await,
-            }.map_err(Status::from)
+            self.pod_manager.start_pod_locked(&pod_id).await.map_err(Status::from)
         }.await;
         if let Err(error) = setup {
             self.release_pod_resources(&pod_id, network.as_ref(), pause_pid, ipc_pid).await.map_err(|cleanup| {
@@ -592,15 +659,17 @@ impl RuntimeService for NautilusRuntimeService {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("pod sandbox {} not found", req.pod_sandbox_id)))?;
 
-        let state = sandbox_state(&pod.status);
+        let mut state = sandbox_state(&pod.status);
         let mut info = HashMap::new();
-        if req.verbose && pod.runtime_handler == "vm" {
-            let details = match self.pod_manager.vm_store().status(&pod.id).await {
+        if pod.runtime_handler == "vm" && (req.verbose || (pod.vm_attempt.is_some() && pod.status == PodStatus::Running)) {
+            let health = self.pod_manager.observe_vm(&pod).await;
+            if !matches!(health, Ok(Some(_))) { state = PodSandboxState::SandboxNotready; }
+            let details = match health {
                 Ok(Some(id)) => serde_json::json!({ "guestReachable": true, "bootId": id }),
                 Ok(None) => serde_json::json!({ "guestReachable": false }),
                 Err(error) => serde_json::json!({ "guestReachable": null, "error": error.to_string() }),
             };
-            info.insert("nautilus.vm".into(), details.to_string());
+            if req.verbose { info.insert("nautilus.vm".into(), details.to_string()); }
         }
 
         Ok(Response::new(PodSandboxStatusResponse {
@@ -610,7 +679,7 @@ impl RuntimeService for NautilusRuntimeService {
                     name: pod.name,
                     uid: pod.uid,
                     namespace: pod.namespace,
-                    attempt: 0,
+                    attempt: pod.vm_attempt.as_ref().map_or(0, |a| a.attempt),
                 }),
                 state: state as i32,
                 created_at: pod.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -620,7 +689,11 @@ impl RuntimeService for NautilusRuntimeService {
                         additional_ips: Vec::new(),
                     }
                 }),
-                linux: None,
+                linux: pod.vm_attempt.as_ref().map(|_| runtime::v1::LinuxPodSandboxStatus {
+                    namespaces: Some(runtime::v1::Namespace { options: Some(runtime::v1::NamespaceOption {
+                        pid: runtime::v1::NamespaceMode::Container as i32, ..Default::default()
+                    }) }),
+                }),
                 labels: pod.labels,
                 annotations: pod.annotations,
                 runtime_handler: pod.runtime_handler,
@@ -639,31 +712,28 @@ impl RuntimeService for NautilusRuntimeService {
         let pods = self.pod_manager.list_pods().await
             .map_err(|e| Status::internal(format!("Failed to list pods: {}", e)))?;
 
-        let items = pods
-            .into_iter()
-            .filter(|p| {
-                req.filter.as_ref().is_none_or(|f| {
-                    (f.id.is_empty() || f.id == p.id)
-                        && matches_sandbox_state(f.state.as_ref(), &p.status)
-                        && (f.label_selector.is_empty()
-                            || f.label_selector.iter().all(|(k, v)| p.labels.get(k) == Some(v)))
-                })
-            })
-            .map(|p| runtime::v1::PodSandbox {
+        let filter = req.filter.as_ref();
+        let candidates = pods.into_iter().filter(|p| filter.is_none_or(|f| {
+            (f.id.is_empty() || f.id == p.id) &&
+                f.label_selector.iter().all(|(k, v)| p.labels.get(k) == Some(v))
+        }));
+        let items = futures::stream::iter(candidates).map(|mut p| async move {
+            if p.vm_attempt.is_some() && p.status == PodStatus::Running &&
+                !matches!(self.pod_manager.observe_vm(&p).await, Ok(Some(_))) {
+                p.status = PodStatus::Unknown;
+            }
+            if !matches_sandbox_state(filter.and_then(|f| f.state.as_ref()), &p.status) {
+                return None;
+            }
+            Some(runtime::v1::PodSandbox {
                 id: p.id,
-                metadata: Some(PodSandboxMetadata {
-                    name: p.name,
-                    uid: p.uid,
-                    namespace: p.namespace,
-                    attempt: 0,
-                }),
+                metadata: Some(PodSandboxMetadata { name: p.name, uid: p.uid, namespace: p.namespace,
+                    attempt: p.vm_attempt.as_ref().map_or(0, |a| a.attempt) }),
                 state: sandbox_state(&p.status) as i32,
                 created_at: p.created_at.timestamp_nanos_opt().unwrap_or(0),
-                labels: p.labels,
-                annotations: p.annotations,
-                runtime_handler: p.runtime_handler,
+                labels: p.labels, annotations: p.annotations, runtime_handler: p.runtime_handler,
             })
-            .collect();
+        }).buffered(8).filter_map(futures::future::ready).collect().await;
 
         Ok(Response::new(ListPodSandboxResponse { items }))
     }

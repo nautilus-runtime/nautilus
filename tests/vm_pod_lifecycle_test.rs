@@ -122,13 +122,22 @@ fn cri_client(root: &Path) -> Client {
 }
 
 async fn start_daemon(root: &Path) -> Result<(Child, Client)> {
+    start_daemon_in(root, true).await
+}
+
+async fn start_daemon_in(root: &Path, new_netns: bool) -> Result<(Child, Client)> {
     let binary = std::env::var_os("NAUTILUS_TEST_DAEMON")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_nautilusd").into());
     // nautilusd initializes a bridge and NAT rules at startup. Isolate them
     // for each daemon. unshare execs nautilusd in place, preserving its PID.
-    let mut daemon = Command::new("unshare")
-        .args(["--net", "--"])
-        .arg(binary)
+    let mut command = if new_netns {
+        let mut command = Command::new("unshare");
+        command.args(["--net", "--"]).arg(binary);
+        command
+    } else {
+        Command::new(binary)
+    };
+    let mut daemon = command
         .arg("--config")
         .arg(root.join("config.toml"))
         .kill_on_drop(true)
@@ -706,4 +715,225 @@ async fn failed_filesystem_or_vmm_start_releases_the_complete_attempt() -> Resul
         ensure!(units.status.success() && units.stdout.is_empty());
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real systemd and KVM; run the test inside a dedicated network namespace"]
+async fn cri_pod_network_survives_daemon_restart_and_releases_on_stop() -> Result<()> {
+    use nautilus::proto::runtime::v1 as rt;
+    ensure!(
+        fs::read_link("/proc/self/ns/net")? != fs::read_link("/proc/1/ns/net")?,
+        "start this test under unshare --net"
+    );
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let root = dir.path();
+    let mut shared = vm_config(root)?;
+    let config = Arc::make_mut(&mut shared);
+    config.runtime.sandboxes.vm_workloads_enabled = true;
+    config.network.cni_bin_dir = root.join("bin");
+    fs::create_dir(&config.network.cni_bin_dir)?;
+    let plugins = asset("NAUTILUS_CNI_BIN_DIR")?;
+    for plugin in ["bridge", "loopback", "host-local"] {
+        std::os::unix::fs::symlink(
+            plugins.join(plugin),
+            config.network.cni_bin_dir.join(plugin),
+        )?;
+    }
+    fs::create_dir(&config.network.cni_config_dir)?;
+    let leases = root.join("leases");
+    let cni = config.network.cni_config_dir.join("test.conflist");
+    fs::write(
+        &cni,
+        serde_json::json!({"cniVersion":"0.4.0","name":"network13","plugins":[
+        {"type":"loopback"},{"type":"bridge","bridge":"ntcri13","isGateway":true,
+        "ipam":{"type":"host-local","subnet":"10.231.43.0/24","dataDir":leases,
+        "routes":[{"dst":"0.0.0.0/0"}]}}]})
+        .to_string(),
+    )?;
+    let config_file = root.join("config.toml");
+    config.to_file(&config_file)?;
+    let request = |name: &str| RunPodSandboxRequest {
+        runtime_handler: "vm".into(),
+        config: Some(PodSandboxConfig {
+            metadata: Some(PodSandboxMetadata {
+                name: name.into(),
+                namespace: "test".into(),
+                uid: Uuid::new_v4().to_string(),
+                attempt: 7,
+            }),
+            hostname: name.into(),
+            linux: Some(rt::LinuxPodSandboxConfig {
+                security_context: Some(rt::LinuxSandboxSecurityContext {
+                    seccomp: Some(rt::SecurityProfile::default()),
+                    namespace_options: Some(rt::NamespaceOption {
+                        pid: rt::NamespaceMode::Container as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    };
+    let mut attempts = Vec::new();
+    let result = async {
+        let (mut daemon, mut cri) = start_daemon_in(root, false).await?;
+        let mut invalid = request("unsupported");
+        invalid
+            .config
+            .as_mut()
+            .unwrap()
+            .port_mappings
+            .push(Default::default());
+        ensure!(
+            cri.run_pod_sandbox(invalid).await.unwrap_err().code() == tonic::Code::Unimplemented
+        );
+        let mut records = vec![];
+        for name in ["first", "second"] {
+            let id = cri
+                .run_pod_sandbox(request(name))
+                .await?
+                .into_inner()
+                .pod_sandbox_id;
+            attempts.push(id.clone());
+            let response = cri
+                .pod_sandbox_status(PodSandboxStatusRequest {
+                    pod_sandbox_id: id.clone(),
+                    verbose: true,
+                })
+                .await?
+                .into_inner();
+            let pod = response.status.context("status missing")?;
+            ensure!(pod.state == PodSandboxState::SandboxReady as i32);
+            ensure!(pod.metadata.unwrap().attempt == 7);
+            ensure!(
+                pod.linux.unwrap().namespaces.unwrap().options.unwrap().pid
+                    == rt::NamespaceMode::Container as i32
+            );
+            let ip = pod.network.unwrap().ip;
+            ensure!(leases.join("network13").join(&ip).is_file());
+            ensure!(Command::new("ping")
+                .args(["-c1", "-W1", &ip])
+                .status()
+                .await?
+                .success());
+            records.push((id, ip, response.info["nautilus.vm"].clone()));
+        }
+        ensure!(records[0].1 != records[1].1);
+        daemon.kill().await?;
+        let (mut daemon, mut cri) = start_daemon_in(root, false).await?;
+        for (id, ip, boot) in &records {
+            let response = cri
+                .pod_sandbox_status(PodSandboxStatusRequest {
+                    pod_sandbox_id: id.clone(),
+                    verbose: true,
+                })
+                .await?
+                .into_inner();
+            let pod = response.status.unwrap();
+            ensure!(
+                pod.state == PodSandboxState::SandboxReady as i32 && pod.network.unwrap().ip == *ip
+            );
+            ensure!(response.info["nautilus.vm"] == *boot);
+        }
+        let bridge = config.network.cni_bin_dir.join("bridge");
+        fs::remove_file(&bridge)?;
+        ensure!(stop_sandbox(&mut cri, &records[0].0).await.is_err());
+        ensure!(leases.join("network13").join(&records[0].1).is_file());
+        std::os::unix::fs::symlink(plugins.join("bridge"), &bridge)?;
+        daemon.kill().await?;
+        let (mut daemon, mut cri) = start_daemon_in(root, false).await?;
+        ensure!(!leases.join("network13").join(&records[0].1).exists());
+        ensure!(Command::new("ping")
+            .args(["-c1", "-W1", &records[1].1])
+            .status()
+            .await?
+            .success());
+        // A crashed VMM must disappear from READY lists before another daemon restart.
+        let peer = &records[1].0;
+        let mut api = UnixStream::connect(root.join("vms").join(peer).join("api.sock")).await?;
+        api.write_all(
+            b"PUT /api/v1/vmm.shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await?;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let reply = cri
+                    .pod_sandbox_status(PodSandboxStatusRequest {
+                        pod_sandbox_id: peer.clone(),
+                        verbose: false,
+                    })
+                    .await?
+                    .into_inner();
+                if reply.status.unwrap().state == PodSandboxState::SandboxNotready as i32 {
+                    break;
+                }
+                sleep(Duration::from_millis(60)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        let listed = cri
+            .list_pod_sandbox(ListPodSandboxRequest {
+                filter: Some(rt::PodSandboxFilter {
+                    id: peer.clone(),
+                    state: Some(rt::PodSandboxStateValue {
+                        state: PodSandboxState::SandboxReady as i32,
+                    }),
+                    ..Default::default()
+                }),
+            })
+            .await?
+            .into_inner();
+        ensure!(listed.items.is_empty());
+        for (id, ip, _) in &records {
+            for _ in 0..2 {
+                stop_sandbox(&mut cri, id).await?;
+                remove_sandbox(&mut cri, id).await?;
+            }
+            ensure!(!leases.join("network13").join(ip).exists());
+            ensure!(!config.network.netns_dir.join(format!("vm-{id}")).exists());
+            ensure!(!root.join("vms").join(id).exists());
+        }
+        eprintln!(
+            "CRI VM Pod IPs {} and {}, preserved across SIGKILL, DEL failure recovered",
+            records[0].1, records[1].1
+        );
+        if let Some(legacy) = std::env::var_os("NAUTILUS_VM_IDENTITY_INITRAMFS") {
+            daemon.kill().await?;
+            config.runtime.sandboxes.vm.as_mut().unwrap().initramfs = legacy.into();
+            config.to_file(&config_file)?;
+            (daemon, cri) = start_daemon_in(root, false).await?;
+            ensure!(
+                cri.run_pod_sandbox(request("legacy")).await.is_err(),
+                "identity-only guest was incorrectly published as READY"
+            );
+            ensure!(cri
+                .list_pod_sandbox(ListPodSandboxRequest::default())
+                .await?
+                .into_inner()
+                .items
+                .is_empty());
+            ensure!(fs::read_dir(root.join("vms"))?
+                .flatten()
+                .all(|e| e.path().extension().is_none()));
+            ensure!(fs::read_dir(&config.network.netns_dir)?.next().is_none());
+            ensure!(fs::read_dir(leases.join("network13"))?.flatten().all(|e| e
+                .file_name()
+                .to_string_lossy()
+                .parse::<std::net::Ipv4Addr>()
+                .is_err()));
+        }
+        daemon.kill().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let store = PodVmStore::new(root.join("vms"));
+    let net = nautilus::network::PodNet::new(shared);
+    for id in &attempts {
+        store.remove(id).await?;
+        net.teardown_vm(id).await?;
+    }
+    result
 }

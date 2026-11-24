@@ -59,6 +59,13 @@ pub struct VmContainer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmPodAttempt {
+    pub attempt: u32,
+    #[serde(default)]
+    pub ready_network: Option<crate::network::vm::VmNetwork>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodState {
     pub id: String,
     pub namespace: String,
@@ -70,7 +77,10 @@ pub struct PodState {
     /// Resolved CRI runtime_handler for this pod's sandboxes.
     #[serde(default)]
     pub runtime_handler: String,
-    /// Published netns bind-mount path (runc pods only).
+    /// Present for fully managed CRI VM attempts, including pending cleanup.
+    #[serde(default)]
+    pub vm_attempt: Option<VmPodAttempt>,
+    /// Published Pod netns bind-mount path.
     #[serde(default)]
     pub network_namespace: Option<String>,
     /// Pod IP assigned by the CNI chain.
