@@ -2001,6 +2001,7 @@ dependencies = [
  "http",
  "hyper-util",
  "libc",
+ "libcgroups",
  "libcontainer",
  "log",
  "nix 0.27.1",
