@@ -37,6 +37,8 @@ sudo apt update && sudo apt upgrade -y
 # 安装基础依赖
 sudo apt install -y \
     build-essential \
+    libelf-dev \
+    zlib1g-dev \
     pkg-config \
     libseccomp-dev \
     libsystemd-dev \

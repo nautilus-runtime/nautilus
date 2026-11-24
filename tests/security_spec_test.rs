@@ -58,6 +58,7 @@ fn runtime_default_installs_embedded_profile() {
         ..Default::default()
     };
     apply_security(&mut spec, Some(&sec), &defaults());
+    assert_eq!(spec["process"]["noNewPrivileges"], json!(true));
     let prof = &spec["linux"]["seccomp"];
     assert_eq!(prof["defaultAction"], "SCMP_ACT_ERRNO");
     // The allowlist must be non-trivial or nothing would run.

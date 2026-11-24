@@ -49,7 +49,7 @@ runc 容器与 WASM 工作负载,生命周期策略用 Wasm 进程内热插拔;m
 |---|---|---|
 | 异步运行时 | tokio 1.x | 全 feature |
 | gRPC | tonic 0.12 + prost 0.13 | UDS 监听 |
-| OCI 容器引擎 | **libcontainer 0.7**(youki 拆出的库) | 进程内调用;`[patch.crates-io]` 指向 Bevisy/youki fork rev `2b4cdda`(= 2867015 + rootfs 递归传播修复);可回退 exec-runc |
+| OCI 容器引擎 | **youki libcontainer 0.8.0** | 默认进程内运行，支持外部 runc 驱动。exec 继承 OCI 安全设置的差异见[依赖说明](../vendor/libcontainer/NAUTILUS.md)。 |
 | WASM | wasmtime 26 + wasmtime-wasi 26 | 沙箱执行 + 策略引擎复用 |
 | 镜像分发 | oci-distribution 0.11(rustls) | 原生拉取,零 docker CLI 依赖 |
 | 流式协议 | spdystream-rs 0.1 | SPDY/3.1 remotecommand v4 + portforward |

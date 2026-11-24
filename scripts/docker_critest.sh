@@ -110,6 +110,8 @@ RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
+    libelf-dev \
+    zlib1g-dev \
     libseccomp-dev \
     libsystemd-dev \
     git \
@@ -124,6 +126,8 @@ RUN apt-get update && apt-get install -y \
     (apt-get clean && apt-get update --fix-missing && apt-get install -y \
     build-essential \
     pkg-config \
+    libelf-dev \
+    zlib1g-dev \
     libseccomp-dev \
     libsystemd-dev \
     git \
@@ -469,7 +473,7 @@ run_local_test() {
         --workdir /workspace \
         debian:12-slim \
         bash -c '
-            apt-get update && apt-get install -y curl build-essential pkg-config libseccomp-dev git jq bc
+            apt-get update && apt-get install -y curl build-essential pkg-config libelf-dev zlib1g-dev libseccomp-dev git jq bc
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source ~/.cargo/env
             

@@ -51,36 +51,9 @@ pub fn apply_security(
     security: Option<&ContainerSecurity>,
     defaults: &crate::core::config::SecurityConfig,
 ) {
-    // Seccomp interplay with libcontainer 0.7: it loads the filter on two
-    // paths chosen by whether `process.noNewPrivileges` is *absent*:
-    //   - absent  -> load BEFORE cap drop (uid0 + full caps) -> works
-    //   - present -> load AFTER cap drop (no CNP_SYS_ADMIN)   -> EPERM
-    // runc handles this differently; here we must OMIT the key whenever a
-    // seccomp filter will be installed, and always for privileged pods.
-    let privileged = security.map_or(false, |s| s.privileged);
-    // Simplistic lookahead: a filter is installed when the request or daemon
-    // default names a seccomp profile other than unconfined/empty.
-    let has_seccomp_request = {
-        let req = security
-            .map(|s| s.seccomp_profile_path.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let effective = if req.is_empty() {
-            defaults.seccomp_profile_path.clone()
-        } else {
-            req
-        };
-        !effective.is_empty() && effective != "unconfined"
-    };
-    if privileged || has_seccomp_request {
-        if let Some(process) = spec.get_mut("process").and_then(|p| p.as_object_mut()) {
-            process.remove("noNewPrivileges");
-        }
-    } else {
+    if let Some(process) = spec.get_mut("process").and_then(|p| p.as_object_mut()) {
         let nnp = security.map_or(defaults.no_new_privileges, |s| s.no_new_privs);
-        if let Some(process) = spec.get_mut("process").and_then(|p| p.as_object_mut()) {
-            process.insert("noNewPrivileges".to_string(), json!(nnp));
-        }
+        process.insert("noNewPrivileges".to_string(), json!(nnp));
     }
     if let Some(root) = spec.get_mut("root").and_then(|r| r.as_object_mut()) {
         let ro_final = security.map_or(defaults.read_only_root_filesystem, |s| s.readonly_rootfs)

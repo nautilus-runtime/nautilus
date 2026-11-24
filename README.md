@@ -21,7 +21,7 @@ Use a Linux machine with systemd and a Rust toolchain with Cargo. The following 
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y git build-essential pkg-config protobuf-compiler libseccomp-dev libsystemd-dev runc iproute2 iptables containernetworking-plugins
+sudo apt-get install -y git build-essential pkg-config protobuf-compiler libelf-dev zlib1g-dev libseccomp-dev libsystemd-dev runc iproute2 iptables containernetworking-plugins
 
 git clone https://github.com/nautilus-runtime/nautilus.git
 cd nautilus

@@ -174,7 +174,7 @@ impl RuncBackend {
             if let Some(fd) = c_in_fd {
                 builder = builder.with_stdin(fd);
             }
-            let mut container = builder
+            let (mut container, _pty) = builder
                 .as_init(bundle.clone())
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: create: {e}")))?;
@@ -197,7 +197,7 @@ impl RuncBackend {
                 });
             }
             // AppArmor is applied by libcontainer's init process from the spec
-            // profile before the workload execve (fork 2867015+); no host-side
+            // profile before the workload execve; no host-side
             // attr write needed here.
             Ok(container.pid().map(|p| p.as_raw() as u32).unwrap_or(0))
             }))
@@ -1122,16 +1122,13 @@ impl RuncBackend {
                     tenant = tenant.with_apparmor(Some(a.clone()));
                 }
             }
-            // Only forward nnp=true: a `false` value makes libcontainer take
-            // the seccomp notify handshake path in pid-namespaced exec and
-            // hang; with None the plain (no-NNP) seccomp application is used.
             if matches!(init_nnp, Some(true)) {
                 tenant = tenant.with_no_new_privs(true);
             }
             if let Some(c) = &cwd_p {
                 tenant = tenant.with_cwd(Some(std::path::PathBuf::from(c)));
             }
-            let pid = tenant
+            let (pid, _pty) = tenant
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer exec {id}: {e}")))?;
 
@@ -1373,16 +1370,13 @@ impl RuncBackend {
                         tenant = tenant.with_apparmor(Some(a.clone()));
                     }
                 }
-                // Only forward nnp=true: `false` takes the seccomp notify
-                // handshake path in pid-namespaced exec and hangs (see
-                // exec_sync_libcontainer).
                 if matches!(init_nnp, Some(true)) {
                     tenant = tenant.with_no_new_privs(true);
                 }
                 if let Some(c) = &cwd_p {
                     tenant = tenant.with_cwd(Some(std::path::PathBuf::from(c)));
                 }
-                let pid = tenant
+                let (pid, _pty) = tenant
                     .build()
                     .map_err(|e| Error::Runtime(format!("libcontainer exec {id}: {e}")))?;
                 Ok(pid.as_raw() as u32)

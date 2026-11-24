@@ -92,15 +92,7 @@ rand = "0.8"
 async-trait = "0.1"
 wasmtime = "26"
 wasmtime-wasi = "26"
-libcontainer = "0.7"
+libcontainer = { version = "=0.8.0", path = "vendor/libcontainer" }
 
 [build-dependencies]
 tonic-build = "0.12.2"
-
-
-[patch.crates-io]
-# NOTE: pins b51cb5c ("clone child probe") and 6a0d9e8 ("SIGCHLD init clone")
-# are REGRESSED — tenant-exec waitpid and the workload reaper both hit ECHILD
-# (children reaped/reparented outside the daemon), failing execSync and ~30
-# dependent critest cases. Last known-good rev is 2867015 (2026-08-27 bisect).
-libcontainer = { git = "https://github.com/Bevisy/youki.git", package = "libcontainer", rev = "2b4cdda" }
