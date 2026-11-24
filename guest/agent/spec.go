@@ -77,7 +77,16 @@ func validArgv(a []string) bool {
 	}
 	return true
 }
-func secureExport(path string, dirOnly bool) error {
+
+type exportKind int
+
+const (
+	bundleDir exportKind = iota
+	configFile
+	boundVolume
+)
+
+func secureExport(path string, kind exportKind) error {
 	actual, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return err
@@ -90,10 +99,23 @@ func secureExport(path string, dirOnly bool) error {
 		return err
 	}
 	typ := st.Mode & unix.S_IFMT
-	if st.Uid != 0 || (typ != unix.S_IFDIR && (dirOnly || typ != unix.S_IFREG || st.Nlink != 1)) {
-		return errors.New("invalid export owner or type")
+	switch kind {
+	case bundleDir:
+		if st.Uid == 0 && typ == unix.S_IFDIR {
+			return nil
+		}
+	case configFile:
+		if st.Uid == 0 && typ == unix.S_IFREG && st.Nlink == 1 {
+			return nil
+		}
+	case boundVolume:
+		// The host pins this entry inside a sealed mount catalog. A CRI
+		// source retains its own UID and hard-link count.
+		if typ == unix.S_IFDIR || typ == unix.S_IFREG {
+			return nil
+		}
 	}
-	return nil
+	return errors.New("invalid export owner or type")
 }
 
 // The host publishes the bundle before create. No workload can mutate its rootfs
@@ -117,11 +139,11 @@ func checkTarget(root, target string) error {
 func prepare(id, private string) (process, error) {
 	var s spec
 	bundle := filepath.Join(share, "containers", id)
-	if err := secureExport(bundle, true); err != nil {
+	if err := secureExport(bundle, bundleDir); err != nil {
 		return s.Process, err
 	}
 	config := filepath.Join(bundle, "config.json")
-	if err := secureExport(config, false); err != nil {
+	if err := secureExport(config, configFile); err != nil {
 		return s.Process, err
 	}
 	f, err := os.Open(config)
@@ -162,7 +184,7 @@ func prepare(id, private string) (process, error) {
 		return s.Process, errors.New("private mount and PID namespaces required")
 	}
 	s.Root.Path = filepath.Join(bundle, "rootfs")
-	if err = secureExport(s.Root.Path, true); err != nil {
+	if err = secureExport(s.Root.Path, bundleDir); err != nil {
 		return s.Process, err
 	}
 	destinations := map[string]bool{}
@@ -188,7 +210,7 @@ func prepare(id, private string) (process, error) {
 		}
 		destinations[m.Destination] = true
 		m.Source = filepath.Join(share, m.Source)
-		if err = secureExport(m.Source, false); err != nil {
+		if err = secureExport(m.Source, boundVolume); err != nil {
 			return s.Process, err
 		}
 		m.Options = append(m.Options, "nosuid", "nodev", "noexec")

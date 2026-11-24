@@ -57,10 +57,8 @@ impl VmBackend {
 
     fn validate(&self, spec: &WorkloadSpec) -> Result<()> {
         let unsupported = |text: &str| Error::Experimental(format!("Pod VM: {text}"));
-        if !spec.volumes.is_empty() || spec.open_stdin {
-            return Err(unsupported(
-                "host volume delivery and interactive stdin are unavailable",
-            ));
+        if spec.open_stdin {
+            return Err(unsupported("interactive stdin is unavailable"));
         }
         if self.config.security.seccomp
             || !self.config.security.seccomp_profile_path.is_empty()
@@ -159,8 +157,24 @@ impl VmBackend {
                 resources["memory"] = json!({"limit":r.memory_limit_in_bytes});
             }
         }
+        let mut mounts = Vec::with_capacity(spec.volumes.len());
+        for volume in &spec.volumes {
+            if !matches!(volume.propagation.as_str(), "" | "rprivate") {
+                return Err(Error::Experimental(
+                    "VM host volumes require private propagation".into(),
+                ));
+            }
+            let source = self
+                .store
+                .bind_volume(&self.pod, &spec.id, &volume.host_path, volume.readonly)
+                .await?;
+            mounts.push(
+                json!({"type":"bind", "source":source, "destination":volume.container_path,
+                "options":["bind", if volume.readonly {"ro"} else {"rw"}]}),
+            );
+        }
         let spec_json = json!({
-            "ociVersion":"1.1.0",
+            "ociVersion":"1.1.0", "mounts":mounts,
             "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
             "process":{"terminal":false,"user":{"uid":uid,"gid":gid,"additionalGids":groups},
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},
