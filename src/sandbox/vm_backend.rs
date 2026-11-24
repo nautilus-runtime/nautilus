@@ -25,6 +25,31 @@ impl VmBackend {
         }
     }
 
+    fn staging_dir(&self, id: &str) -> Result<std::path::PathBuf> {
+        if !uuid::Uuid::parse_str(id).is_ok_and(|u| !u.is_nil() && u.to_string() == id) {
+            return Err(Error::Container("invalid VM container ID".into()));
+        }
+        Ok(self
+            .config
+            .runtime
+            .state_dir
+            .join("vms")
+            .join(format!(".oci-{id}")))
+    }
+
+    pub fn discard_stage(&self, id: &str) -> Result<()> {
+        let path = self.staging_dir(id)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(meta) if meta.is_dir() => {
+                crate::storage::snapshot::check_unmounted(&path.canonicalize()?)?;
+                Ok(std::fs::remove_dir_all(path)?)
+            }
+            Ok(_) => Err(Error::Storage("VM staging directory was replaced".into())),
+        }
+    }
+
     pub async fn call(&self, id: &str, op: Operation<'_>) -> Result<Reply> {
         let channel = self.store.workload_channel(&self.pod).await?;
         Ok(channel.call(id, op).await?)
@@ -82,10 +107,10 @@ impl SandboxBackend for VmBackend {
         self.validate(spec)?;
         // Staging stays outside the guest export and on its filesystem. The owner
         // publishes the complete tree atomically without replacing another bundle.
-        let staged = tempfile::Builder::new()
-            .prefix(".oci-")
-            .tempdir_in(self.config.runtime.state_dir.join("vms"))?;
-        let rootfs = staged.path().join("rootfs");
+        use std::os::unix::fs::DirBuilderExt;
+        let staged = self.staging_dir(&spec.id)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&staged)?;
+        let rootfs = staged.join("rootfs");
         tokio::fs::create_dir(&rootfs).await?;
         let mut image =
             crate::storage::pull::materialize_rootfs(&self.config, &spec.image_ref, &rootfs)
@@ -149,13 +174,9 @@ impl SandboxBackend for VmBackend {
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},
             "linux":{"namespaces":[{"type":"mount"},{"type":"pid"}],"resources":resources}
         });
-        tokio::fs::write(
-            staged.path().join("config.json"),
-            serde_json::to_vec(&spec_json)?,
-        )
-        .await?;
+        tokio::fs::write(staged.join("config.json"), serde_json::to_vec(&spec_json)?).await?;
         self.store
-            .publish_bundle(&self.pod, &spec.id, staged.path())
+            .publish_bundle(&self.pod, &spec.id, &staged)
             .await?;
         self.call(&spec.id, Operation::Create).await?;
         Ok(())
@@ -219,6 +240,7 @@ impl SandboxBackend for VmBackend {
             }
         }
         self.store.remove_bundle(&self.pod, id).await?;
+        self.discard_stage(id)?;
         Ok(())
     }
 }

@@ -1298,6 +1298,7 @@ impl RuntimeService for NautilusRuntimeService {
                 req.container_id, c.status
             )));
         }
+        if c.sandbox_kind == "vm" { return Err(Status::unimplemented("guest streaming exec unavailable")); }
         let url = crate::cri::streaming::exec_url(
             self.container_manager.clone(),
             self._state_manager.clone(),
@@ -1335,6 +1336,7 @@ impl RuntimeService for NautilusRuntimeService {
                 req.container_id, c.status
             )));
         }
+        if c.sandbox_kind == "vm" { return Err(Status::unimplemented("guest attach unavailable")); }
         let url = crate::cri::streaming::attach_url(
             self.container_manager.clone(),
             self._state_manager.clone(),
@@ -1368,6 +1370,7 @@ impl RuntimeService for NautilusRuntimeService {
                 req.pod_sandbox_id, pod.status
             )));
         }
+        if pod.runtime_handler == "vm" { return Err(Status::unimplemented("guest port forwarding unavailable")); }
         let url = crate::cri::streaming::port_forward_url(
             self.container_manager.clone(),
             self._state_manager.clone(),

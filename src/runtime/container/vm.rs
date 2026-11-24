@@ -30,7 +30,12 @@ impl ContainerManager {
     ) -> Result<String> {
         let guard = self.vm_operations.lock(&state.id).await;
         state.status = ContainerStatus::Unknown;
-        self.save_guest(&state).await?;
+        if let Err(e) = self.save_guest(&state).await {
+            self.log_target(&state)
+                .await?
+                .discard_unstarted(&state.vm.as_ref().unwrap().cursor)?;
+            return Err(e);
+        }
         let manager = self.clone();
         // Finish or roll back the intent even when the gRPC caller disconnects.
         let (reply, result) = tokio::sync::oneshot::channel();
@@ -48,13 +53,13 @@ impl ContainerManager {
             .await;
             let cleanup = outcome.is_err() || reply.is_closed();
             if cleanup {
-                if let Err(error) = manager.remove_guest_locked(&state).await {
+                if let Err(error) = manager.rollback_guest(&state).await {
                     tracing::warn!(container_id=%state.id,%error,"guest create retained for cleanup");
                 }
             }
             if let Err(Ok(_)) = reply.send(outcome) {
                 if !cleanup {
-                    let _ = manager.remove_guest_locked(&state).await;
+                    let _ = manager.rollback_guest(&state).await;
                 }
             }
         });
@@ -155,6 +160,34 @@ impl ContainerManager {
         self.sync_guest(&mut state, &backend, exited, changed).await
     }
 
+    async fn rollback_guest(&self, state: &ContainerState) -> Result<()> {
+        let backend = VmBackend::new(self._config.clone(), &state.pod_id);
+        backend.remove(&state.id).await?;
+        let target = self.log_target(state).await?;
+        target.discard_unstarted(&state.vm.as_ref().unwrap().cursor)?;
+        self.forget_guest(&state.id).await
+    }
+
+    /// Called only after the owner's VMM shutdown is confirmed. No host waitpid
+    /// or synthesized guest exit code is available for a lost container.
+    pub(crate) async fn guest_pod_lost(&self, pod: &str) -> Result<()> {
+        for record in self.state_manager.list_containers_in_pod(pod).await? {
+            let _guard = self.vm_operations.lock(&record.id).await;
+            if let Some(mut state) = self.state_manager.get_container_state(&record.id).await? {
+                if let Some(vm) = state.vm.as_mut() {
+                    if state.status != ContainerStatus::Stopped {
+                        state.status = ContainerStatus::Unknown;
+                        state.finish_reason = "ContainerStatusUnknown".into();
+                        state.exit_code = None;
+                    }
+                    vm.logs_complete = true;
+                    self.save_guest(&state).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn remove_guest_locked(&self, state: &ContainerState) -> Result<()> {
         let backend = VmBackend::new(self._config.clone(), &state.pod_id);
         backend.remove(&state.id).await?;
@@ -164,6 +197,9 @@ impl ContainerManager {
     pub(super) async fn remove_guest(&self, id: &str) -> Result<()> {
         let _guard = self.vm_operations.lock(id).await;
         if let Some(mut state) = self.state_manager.get_container_state(id).await? {
+            if state.vm.as_ref().is_some_and(|v| v.preparing) {
+                return self.rollback_guest(&state).await;
+            }
             if state.vm.as_ref().is_some_and(|v| !v.preparing)
                 && !state.vm.as_ref().unwrap().logs_complete
             {
