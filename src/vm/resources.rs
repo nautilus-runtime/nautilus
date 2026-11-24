@@ -174,8 +174,13 @@ impl VmResources {
             } else {
                 overhead.cpu_period as u64
             };
-            let extra =
-                (overhead.cpu_quota.max(0) as u128 * period as u128).div_ceil(aux_period as u128);
+            let scaled = overhead.cpu_quota.max(0) as u128 * period as u128;
+            if !scaled.is_multiple_of(aux_period as u128) {
+                return Err(unsupported(
+                    "Pod CPU overhead is not representable in the workload period",
+                ));
+            }
+            let extra = scaled / aux_period as u128;
             let total = u64::try_from(quota as u128 + extra)
                 .map_err(|_| invalid("Pod CPU quota plus overhead overflows"))?;
             // systemd-run accepts percentages to two decimal places.
@@ -268,6 +273,26 @@ mod tests {
         );
         assert!(parent_slice("/wrong.slice/kubepods-pod.slice").is_err());
         assert_eq!(parent_slice("/").unwrap().as_deref(), Some("-.slice"));
+    }
+
+    #[test]
+    fn rejects_overhead_fractions_below_a_microsecond() {
+        let budget = |period| {
+            Some(LinuxContainerResources {
+                cpu_quota: 1000,
+                cpu_period: period,
+                ..Default::default()
+            })
+        };
+        let config = LinuxPodSandboxConfig {
+            resources: budget(1000),
+            overhead: budget(3000),
+            ..Default::default()
+        };
+        assert_eq!(
+            VmResources::from_cri(Some(&config)).unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
     }
 
     #[test]
