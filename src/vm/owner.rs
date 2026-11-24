@@ -19,6 +19,7 @@ const UNIT_BUDGET: Duration = Duration::from_secs(8);
 const BOOT_BUDGET: Duration = Duration::from_secs(20);
 const MUTATION_LOCK_BUDGET: Duration = Duration::from_secs(45);
 const RECOVERY_BUDGET: Duration = Duration::from_secs(12);
+const STATUS_LOCK_BUDGET: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub struct PodVmStore {
@@ -86,6 +87,20 @@ struct Lease {
     lock: File,
 }
 
+#[derive(Clone, Copy)]
+enum Operation {
+    Start,
+    Status,
+    Recover,
+    Remove,
+}
+
+struct OnlineGuest {
+    boot: String,
+    invocation: String,
+    sockets: [Option<FileIdentity>; 2],
+}
+
 struct Unit {
     invocation: String,
     state: String,
@@ -102,11 +117,13 @@ impl PodVmStore {
         Self { root }
     }
 
-    async fn lease(&self, id: &str, create: bool, wait: Duration) -> io::Result<Option<Lease>> {
+    async fn lease(&self, id: &str, operation: Operation) -> io::Result<Option<Lease>> {
         let uuid = Uuid::parse_str(id).map_err(|_| invalid("invalid VM sandbox UUID"))?;
         if uuid.is_nil() || uuid.to_string() != id {
             return Err(invalid("expected a canonical VM sandbox UUID"));
         }
+        let create = matches!(operation, Operation::Start);
+        let read_only = matches!(operation, Operation::Status);
         if create {
             DirBuilder::new()
                 .recursive(true)
@@ -123,7 +140,7 @@ impl PodVmStore {
         let marker = root.join(format!("{id}.json"));
         let lock = match OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!read_only)
             .create(create)
             .truncate(false)
             .mode(0o600)
@@ -139,11 +156,20 @@ impl PodVmStore {
         // collision only serializes two otherwise independent operations.
         let slot = (uuid.as_u128() as u64 % i64::MAX as u64) as i64;
         let mut range: libc::flock = unsafe { std::mem::zeroed() };
-        range.l_type = libc::F_WRLCK as _;
+        range.l_type = if read_only {
+            libc::F_RDLCK
+        } else {
+            libc::F_WRLCK
+        } as _;
         range.l_whence = libc::SEEK_SET as _;
         range.l_start = slot;
         range.l_len = 1;
-        let deadline = Instant::now() + wait;
+        let deadline = Instant::now()
+            + match operation {
+                Operation::Start | Operation::Remove => MUTATION_LOCK_BUDGET,
+                Operation::Recover => RECOVERY_BUDGET,
+                Operation::Status => STATUS_LOCK_BUDGET,
+            };
         loop {
             if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_OFD_SETLK, &range) } == 0 {
                 break;
@@ -155,13 +181,13 @@ impl PodVmStore {
             if !matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
                 return Err(error);
             }
-            if wait.is_zero() {
-                return Err(io::Error::new(
-                    ErrorKind::WouldBlock,
-                    "VM operation in progress",
-                ));
-            }
             if Instant::now() >= deadline {
+                if read_only {
+                    return Err(io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "VM operation in progress",
+                    ));
+                }
                 return Err(io::Error::new(
                     ErrorKind::TimedOut,
                     format!("timed out locking sandbox {id}"),
@@ -186,21 +212,16 @@ impl PodVmStore {
         initramfs: &Path,
     ) -> io::Result<String> {
         let lease = self
-            .lease(id, true, MUTATION_LOCK_BUDGET)
+            .lease(id, Operation::Start)
             .await?
             .expect("start creates the store");
-        if let Some(mut owner) = lease.load(id)? {
+        if let Some(owner) = lease.load(id)? {
             if owner.removing || owner.boot.is_none() {
                 return Err(io::Error::other("VM attempt requires recovery"));
             }
-            return lease
-                .online_with_deadline(&mut owner)
-                .await?
-                .ok_or_else(|| {
-                    io::Error::other(
-                        "VM attempt has exited or is incomplete; remove before retrying",
-                    )
-                });
+            return lease.online_with_deadline(&owner).await?.ok_or_else(|| {
+                io::Error::other("VM attempt has exited or is incomplete; remove before retrying")
+            });
         }
         let vmm = vmm.canonicalize()?;
         let kernel = kernel.canonicalize()?;
@@ -248,22 +269,22 @@ impl PodVmStore {
     }
 
     pub async fn status(&self, id: &str) -> io::Result<Option<String>> {
-        let Some(lease) = self.lease(id, false, Duration::ZERO).await? else {
+        let Some(lease) = self.lease(id, Operation::Status).await? else {
             return Ok(None);
         };
-        let Some(mut owner) = lease.load(id)? else {
+        let Some(owner) = lease.load(id)? else {
             return Ok(None);
         };
         if owner.removing || owner.boot.is_none() {
             return Ok(None);
         }
-        lease.online_with_deadline(&mut owner).await
+        lease.online_with_deadline(&owner).await
     }
 
     /// Reopen a committed guest or finish the abandoned operation under the same lease.
     pub async fn recover(&self, id: &str) -> io::Result<Option<String>> {
         timeout(RECOVERY_BUDGET, async {
-            let Some(lease) = self.lease(id, false, RECOVERY_BUDGET).await? else {
+            let Some(lease) = self.lease(id, Operation::Recover).await? else {
                 return Ok(None);
             };
             lease.discard_draft()?;
@@ -271,8 +292,11 @@ impl PodVmStore {
                 return Ok(None);
             };
             if !owner.removing && owner.boot.is_some() {
-                if let Some(boot) = lease.online(&mut owner).await? {
-                    return Ok(Some(boot));
+                if let Some(guest) = lease.online(&owner).await? {
+                    if owner.invocation.is_none() || owner.sockets.contains(&None) {
+                        return lease.commit_guest(&mut owner, guest).map(Some);
+                    }
+                    return Ok(Some(guest.boot));
                 }
             }
             lease.remove(&mut owner).await?;
@@ -287,7 +311,7 @@ impl PodVmStore {
     }
 
     async fn remove_if(&self, id: &str, nonce: Option<&str>) -> io::Result<()> {
-        let Some(lease) = self.lease(id, false, MUTATION_LOCK_BUDGET).await? else {
+        let Some(lease) = self.lease(id, Operation::Remove).await? else {
             return Ok(());
         };
         let Some(mut owner) = lease.load(id)? else {
@@ -377,7 +401,7 @@ impl Lease {
         File::open(&self.root)?.sync_all()
     }
 
-    async fn command(&self, mut cmd: Command) -> io::Result<Output> {
+    async fn submit(&self, mut cmd: Command) -> io::Result<Output> {
         let fd = self.lock.as_raw_fd();
         // A canceled client may still be submitting a unit job. Its inherited
         // OFD lock prevents another process racing that submission.
@@ -389,6 +413,10 @@ impl Lease {
                 Ok(())
             });
         }
+        Self::command(cmd).await
+    }
+
+    async fn command(mut cmd: Command) -> io::Result<Output> {
         timeout(UNIT_BUDGET, cmd.kill_on_drop(true).output())
             .await
             .map_err(|_| io::Error::new(ErrorKind::TimedOut, "systemd operation timed out"))?
@@ -414,7 +442,7 @@ impl Lease {
             "LoadState,ActiveState,Transient,Description,WorkingDirectory,InvocationID,MainPID",
             &owner.unit(),
         ]);
-        let output = self.command(cmd).await?;
+        let output = Self::command(cmd).await?;
         self.parse_unit(owner, &output)
     }
 
@@ -531,7 +559,7 @@ impl Lease {
             "rdinit=/init panic=1 nautilus.sandbox_id={} nautilus.nonce={}",
             owner.id, owner.nonce
         ));
-        let output = self.command(cmd).await?;
+        let output = self.submit(cmd).await?;
         if !output.status.success() {
             return Err(Self::command_error("start transient VM service", &output));
         }
@@ -544,7 +572,7 @@ impl Lease {
         timeout(BOOT_BUDGET, async {
             loop {
                 match self.online(owner).await {
-                    Ok(Some(boot)) => return Ok(boot),
+                    Ok(Some(guest)) => return self.commit_guest(owner, guest),
                     Ok(None) => {
                         return Err(io::Error::other("VMM exited before guest became available"))
                     }
@@ -569,13 +597,22 @@ impl Lease {
         .map_err(|_| io::Error::new(ErrorKind::TimedOut, "timed out identifying VM guest"))?
     }
 
-    async fn online_with_deadline(&self, owner: &mut Owner) -> io::Result<Option<String>> {
-        timeout(UNIT_BUDGET, self.online(owner))
-            .await
-            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "VM status timed out"))?
+    fn commit_guest(&self, owner: &mut Owner, guest: OnlineGuest) -> io::Result<String> {
+        owner.boot = Some(guest.boot.clone());
+        owner.invocation = Some(guest.invocation);
+        owner.sockets = guest.sockets;
+        self.save(owner)?;
+        Ok(guest.boot)
     }
 
-    async fn online(&self, owner: &mut Owner) -> io::Result<Option<String>> {
+    async fn online_with_deadline(&self, owner: &Owner) -> io::Result<Option<String>> {
+        let guest = timeout(UNIT_BUDGET, self.online(owner))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "VM status timed out"))??;
+        Ok(guest.map(|guest| guest.boot))
+    }
+
+    async fn online(&self, owner: &Owner) -> io::Result<Option<OnlineGuest>> {
         let Some(unit) = self.unit(owner).await? else {
             return Ok(None);
         };
@@ -623,13 +660,11 @@ impl Lease {
         {
             return Err(invalid("VMM changed during guest identification"));
         }
-        if owner.boot.is_none() || owner.invocation.is_none() {
-            owner.sockets = sockets;
-            owner.boot = Some(boot.clone());
-            owner.invocation = Some(unit.invocation);
-            self.save(owner)?;
-        }
-        Ok(Some(boot))
+        Ok(Some(OnlineGuest {
+            boot,
+            invocation: unit.invocation,
+            sockets,
+        }))
     }
 
     async fn remove(&self, owner: &mut Owner) -> io::Result<()> {
@@ -664,7 +699,7 @@ impl Lease {
                 "stop",
                 &owner.unit(),
             ]);
-            let output = self.command(cmd).await?;
+            let output = self.submit(cmd).await?;
             let remaining = self.unit(owner).await?;
             if remaining.as_ref().is_some_and(|u| u.state != "inactive") {
                 return Err(Self::command_error("VM service stop unconfirmed", &output));
@@ -700,8 +735,17 @@ impl Lease {
                         }
                         Ok(Err(e)) if e.kind() == ErrorKind::NotFound => {}
                         Ok(Err(e)) => return Err(e),
-                        _ => {
-                            return Err(invalid(format!("VM endpoint is still listening: {name}")))
+                        Ok(Ok(_)) => {
+                            return Err(io::Error::new(
+                                ErrorKind::WouldBlock,
+                                format!("VM endpoint is still listening: {name}"),
+                            ))
+                        }
+                        Err(_) => {
+                            return Err(io::Error::new(
+                                ErrorKind::TimedOut,
+                                format!("timed out checking VM endpoint: {name}"),
+                            ))
                         }
                     }
                 }
@@ -737,11 +781,7 @@ mod tests {
     async fn fixture_at(name: &str) -> (tempfile::TempDir, PodVmStore, Lease, Owner) {
         let work = tempfile::tempdir().unwrap();
         let store = PodVmStore::new(work.path().join(name));
-        let lease = store
-            .lease(ID, true, Duration::ZERO)
-            .await
-            .unwrap()
-            .unwrap();
+        let lease = store.lease(ID, Operation::Start).await.unwrap().unwrap();
         DirBuilder::new()
             .mode(0o700)
             .create(&lease.directory)
@@ -760,6 +800,29 @@ mod tests {
         (work, store, lease, owner)
     }
 
+    async fn finish_cleanup(lease: &Lease, owner: &Owner) {
+        // Other parallel tests can fork while this test's listener is open.
+        // Cleanup must wait for the last inherited descriptor to close.
+        timeout(Duration::from_secs(3), async {
+            loop {
+                match lease.cleanup_files(owner).await {
+                    Ok(()) => break,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::WouldBlock | ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(e) => panic!("unexpected cleanup error: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("test endpoint remained live after its listener was dropped");
+    }
+
     #[tokio::test]
     async fn missing_vm_operations_do_not_materialize_store() {
         let work = tempfile::tempdir().unwrap();
@@ -776,7 +839,7 @@ mod tests {
     async fn status_returns_promptly_and_mutations_serialize_with_an_unpublished_start() {
         let work = tempfile::tempdir().unwrap();
         let store = PodVmStore::new(work.path().join("store"));
-        let start = store.lease(ID, true, Duration::ZERO).await.unwrap();
+        let start = store.lease(ID, Operation::Start).await.unwrap();
         assert_eq!(
             store.status(ID).await.unwrap_err().kind(),
             ErrorKind::WouldBlock
@@ -789,14 +852,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_status_readers_share_the_lease_and_exclude_removal() {
+        let (_work, store, writer, _) = fixture().await;
+        drop(writer);
+        let reader = store.lease(ID, Operation::Status).await.unwrap().unwrap();
+        let (first, second) = tokio::join!(store.status(ID), store.status(ID));
+        assert!(first.unwrap().is_none() && second.unwrap().is_none());
+        assert!(timeout(
+            Duration::from_millis(75),
+            store.lease(ID, Operation::Remove)
+        )
+        .await
+        .is_err());
+        drop(reader);
+        assert!(store.lease(ID, Operation::Remove).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn status_waits_for_a_briefly_inherited_writer_descriptor() {
+        let (_work, store, writer, _) = fixture().await;
+        let inherited = writer.lock.try_clone().unwrap();
+        drop(writer);
+        let release = async {
+            sleep(Duration::from_millis(50)).await;
+            drop(inherited);
+        };
+        let ((), status) = tokio::join!(release, store.status(ID));
+        assert!(status.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn recovery_discards_a_partial_first_marker() {
         let work = tempfile::tempdir().unwrap();
         let store = PodVmStore::new(work.path().join("store"));
-        let lease = store
-            .lease(ID, true, Duration::ZERO)
-            .await
-            .unwrap()
-            .unwrap();
+        let lease = store.lease(ID, Operation::Start).await.unwrap().unwrap();
         let path = lease.draft.clone();
         fs::write(&path, b"{").unwrap();
         drop(lease);
@@ -873,7 +962,7 @@ mod tests {
         fs::remove_file(&socket).unwrap();
         fs::rename(original_path, &socket).unwrap();
         drop(original);
-        lease.cleanup_files(&owner).await.unwrap();
+        finish_cleanup(&lease, &owner).await;
         assert!(!lease.directory.exists() && !lease.marker.exists());
     }
 
@@ -893,7 +982,7 @@ mod tests {
             Some(std::process::id() as i32)
         );
         drop(listener);
-        lease.cleanup_files(&owner).await.unwrap();
+        finish_cleanup(&lease, &owner).await;
         assert!(!lease.directory.exists() && !lease.marker.exists());
     }
 }
