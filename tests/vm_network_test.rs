@@ -163,6 +163,67 @@ async fn real_guests_resolve_and_reach_one_another_and_release_only_their_alloca
         searches: vec!["svc.test".into()],
         options: vec!["ndots:1".into()],
     };
+    let replaced = Uuid::new_v4().to_string();
+    let handle = net.reserve_vm(&replaced).unwrap();
+    nix::mount::umount(handle.netns_path.as_str()).unwrap();
+    let backup = dir.path().join("original-placeholder");
+    fs::rename(&handle.netns_path, &backup).unwrap();
+    fs::write(&handle.netns_path, "foreign").unwrap();
+    assert!(net.teardown_vm(&replaced).await.is_err());
+    assert_eq!(fs::read_to_string(&handle.netns_path).unwrap(), "foreign");
+    fs::remove_file(&handle.netns_path).unwrap();
+    symlink("/missing-vm-test-path", &handle.netns_path).unwrap();
+    assert!(net.teardown_vm(&replaced).await.is_err());
+    assert!(fs::symlink_metadata(&handle.netns_path)
+        .unwrap()
+        .is_symlink());
+    fs::remove_file(&handle.netns_path).unwrap();
+    fs::rename(&backup, &handle.netns_path).unwrap();
+    net.teardown_vm(&replaced).await.unwrap();
+
+    // A CNI ADD inherited the operation lock before its caller was canceled.
+    // DEL must wait until the plugin has finished allocating.
+    let delayed = Uuid::new_v4().to_string();
+    let mut delayed_info = net.reserve_vm(&delayed).unwrap();
+    let bridge = config.network.cni_bin_dir.join("bridge");
+    fs::rename(&bridge, bridge.with_file_name("real-bridge")).unwrap();
+    fs::write(
+        &bridge,
+        r#"#!/bin/sh
+if [ "$CNI_COMMAND" = ADD ]; then
+    touch "$CNI_PATH/adding"
+    while [ ! -e "$CNI_PATH/release" ]; do sleep 0.02; done
+fi
+exec "$CNI_PATH/real-bridge"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&bridge, fs::Permissions::from_mode(0o755)).unwrap();
+    let other = PodNet::new(Arc::new(config.clone()));
+    let delayed_id = delayed.clone();
+    let add =
+        tokio::spawn(async move { other.attach_vm(&delayed_id, &mut delayed_info, None).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !config.network.cni_bin_dir.join("adding").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    add.abort();
+    assert!(add.await.unwrap_err().is_cancelled());
+    let other = PodNet::new(Arc::new(config.clone()));
+    let del = tokio::spawn(async move { other.teardown_vm(&delayed).await });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        !del.is_finished(),
+        "DEL ran before the outstanding ADD finished"
+    );
+    fs::write(config.network.cni_bin_dir.join("release"), "").unwrap();
+    del.await.unwrap().unwrap();
+    fs::remove_file(&bridge).unwrap();
+    fs::rename(bridge.with_file_name("real-bridge"), &bridge).unwrap();
+    assert!(!leases.join("network13").join("10.231.13.2").exists());
     let (first, first_nic) = allocate(&net, &a, Some(&dns)).await;
     let (second, second_nic) = allocate(&net, &b, None).await;
     assert_ne!(first.ip, second.ip);

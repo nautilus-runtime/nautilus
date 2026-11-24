@@ -11,7 +11,8 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use tempfile::NamedTempFile;
@@ -64,6 +65,8 @@ struct Reservation {
     chain: Chain,
     netns: PathBuf,
     namespace_id: (u64, u64),
+    #[serde(default)]
+    placeholder_id: Option<(u64, u64)>,
     adding: bool,
     result: Option<Value>,
 }
@@ -92,18 +95,83 @@ fn read(path: &Path) -> Result<Reservation> {
         .map_err(|e| invalid(format!("read VM CNI reservation: {e}")))
 }
 
-fn identity(path: &Path) -> Result<Option<(u64, u64)>> {
-    if !path.try_exists()? {
-        return Ok(None);
+impl Reservation {
+    // None is an absent name. A symlink or a foreign replacement must retain
+    // the journal even if it resolves to the original namespace inode.
+    fn mounted(&self) -> Result<Option<bool>> {
+        let meta = match fs::symlink_metadata(&self.netns) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let id = (meta.dev(), meta.ino());
+        if !meta.file_type().is_symlink() {
+            if id == self.namespace_id {
+                return Ok(Some(true));
+            }
+            if Some(id) == self.placeholder_id {
+                return Ok(Some(false));
+            }
+        }
+        Err(invalid(
+            "VM namespace or its placeholder has changed identity",
+        ))
     }
-    let stat = nix::sys::statfs::statfs(path).map_err(|e| invalid(e.to_string()))?;
-    // Between creating the placeholder and bind-mounting or after a partial
-    // teardown this is an ordinary file, never valid for nsenter or CNI.
-    if stat.filesystem_type().0 != libc::NSFS_MAGIC {
-        return Ok(None);
+}
+
+// The durable operations file is never unlinked. Linux OFD locks follow this
+// open file description through dup/fork/exec and release on the last close.
+fn try_operation_lock(record: &Path, id: &str) -> std::io::Result<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(record.with_file_name(".operations"))?;
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = (uuid::Uuid::parse_str(id)
+        .expect("validated sandbox id")
+        .as_u128() as u64
+        % i64::MAX as u64) as i64;
+    lock.l_len = 1;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock) } == -1 {
+        return Err(std::io::Error::last_os_error());
     }
-    let meta = fs::metadata(path)?;
-    Ok(Some((meta.dev(), meta.ino())))
+    Ok(file)
+}
+
+async fn operation_lock(record: &Path, id: &str) -> Result<File> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match try_operation_lock(record, id) {
+            Ok(file) => return Ok(file),
+            Err(e)
+                if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EACCES))
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await
+            }
+            Err(e) => return Err(invalid(format!("acquire VM network operation lease: {e}"))),
+        }
+    }
+}
+
+pub(super) fn keep_operation_lease(cmd: &mut tokio::process::Command, lease: &File) {
+    let fd = lease.as_raw_fd();
+    unsafe {
+        cmd.pre_exec(move || {
+            // Change only the child's descriptor flags. Other concurrent
+            // spawns in the daemon must keep their descriptors close-on-exec.
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 fn checked(action: &str, output: Output) -> Result<Vec<u8>> {
@@ -117,8 +185,10 @@ fn checked(action: &str, output: Output) -> Result<Vec<u8>> {
     }
 }
 
-async fn in_namespace(ns: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let out = tokio::process::Command::new("nsenter")
+async fn in_namespace(lease: &File, ns: &str, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = tokio::process::Command::new("nsenter");
+    keep_operation_lease(&mut cmd, lease);
+    let out = cmd
         .arg(format!("--net={ns}"))
         .arg("--")
         .args(args)
@@ -185,6 +255,7 @@ impl PodNet {
             }
         }
         fs::create_dir_all(path.parent().unwrap())?;
+        let _lease = try_operation_lock(&path, id)?;
         fs::create_dir_all(&self.config.network.netns_dir)?;
         let netns = self
             .config
@@ -192,9 +263,21 @@ impl PodNet {
             .netns_dir
             .canonicalize()?
             .join(format!("vm-{id}"));
-        if netns.try_exists()? {
-            return Err(invalid("VM namespace path is already occupied"));
+        match fs::symlink_metadata(&netns) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+            Ok(_) => return Err(invalid("VM namespace path is already occupied")),
         }
+        let directory = netns.parent().unwrap();
+        // An unnamed file has no crash window between creation and journaling
+        // its inode. linkat publishes it only when the final path is unused.
+        let placeholder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_TMPFILE)
+            .mode(0o600)
+            .open(directory)?;
+        let placeholder_meta = placeholder.metadata()?;
         // A short-lived OS thread creates an anonymous namespace. Its FD pins
         // the namespace while we journal its inode *before* publishing it.
         let handle = std::thread::spawn(|| -> std::io::Result<File> {
@@ -209,11 +292,25 @@ impl PodNet {
             chain,
             netns,
             namespace_id: (meta.dev(), meta.ino()),
+            placeholder_id: Some((placeholder_meta.dev(), placeholder_meta.ino())),
             adding: false,
             result: None,
         };
         saved(&path, &reservation, true)?;
-        File::create_new(&reservation.netns)?;
+        let name = std::ffi::CString::new(reservation.netns.as_os_str().as_bytes())
+            .map_err(|_| invalid("invalid VM network path"))?;
+        if unsafe {
+            libc::linkat(
+                placeholder.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
         mount(
             Some(Path::new(&format!("/proc/self/fd/{}", handle.as_raw_fd()))),
             &reservation.netns,
@@ -236,10 +333,11 @@ impl PodNet {
         dns: Option<&DnsConfig>,
     ) -> Result<VmNetwork> {
         let path = self.vm_record(id)?;
+        let lease = operation_lock(&path, id).await?;
         let mut record = read(&path)?;
         if record.adding
             || record.netns != Path::new(&info.netns_path)
-            || identity(&record.netns)? != Some(record.namespace_id)
+            || record.mounted()? != Some(true)
         {
             return Err(invalid(
                 "VM CNI reservation is incomplete, already used, or has changed identity",
@@ -248,8 +346,16 @@ impl PodNet {
         record.adding = true;
         saved(&path, &record, false)?;
         let ns = &info.netns_path;
-        let result =
-            Self::run_chain(&record.bin_dir, record.chain.clone(), "ADD", id, ns, None).await?;
+        let result = Self::run_chain(
+            &record.bin_dir,
+            record.chain.clone(),
+            "ADD",
+            id,
+            ns,
+            None,
+            Some(&lease),
+        )
+        .await?;
         record.result = Some(result.clone());
         saved(&path, &record, false)?;
         let ips = result["ips"]
@@ -269,7 +375,12 @@ impl PodNet {
             .as_str()
             .ok_or_else(|| invalid("missing CNI address"))?;
         let (ip, _) = ipv4_cidr(addr)?;
-        let link = in_namespace(ns, &["ip", "-d", "-j", "link", "show", "dev", "eth0"]).await?;
+        let link = in_namespace(
+            &lease,
+            ns,
+            &["ip", "-d", "-j", "link", "show", "dev", "eth0"],
+        )
+        .await?;
         let link: Vec<Value> = serde_json::from_slice(&link)?;
         let link = link.first().ok_or_else(|| invalid("missing eth0"))?;
         if link["linkinfo"]["info_kind"] != "veth" {
@@ -290,7 +401,12 @@ impl PodNet {
             .as_u64()
             .filter(|m| (68..=65535).contains(m))
             .ok_or_else(|| invalid("invalid CNI MTU"))?;
-        let routes = in_namespace(ns, &["ip", "-j", "-4", "route", "show", "dev", "eth0"]).await?;
+        let routes = in_namespace(
+            &lease,
+            ns,
+            &["ip", "-j", "-4", "route", "show", "dev", "eth0"],
+        )
+        .await?;
         let routes: Vec<Value> = serde_json::from_slice(&routes)?;
         let routes = guest_routes(&routes, addr)?;
         let resolv_conf = self.vm_resolver(dns, &result["dns"])?;
@@ -306,8 +422,14 @@ impl PodNet {
             ));
         }
 
-        in_namespace(ns, &["ip", "tuntap", "add", "nttap0", "mode", "tap"]).await?;
         in_namespace(
+            &lease,
+            ns,
+            &["ip", "tuntap", "add", "nttap0", "mode", "tap"],
+        )
+        .await?;
+        in_namespace(
+            &lease,
             ns,
             &["ip", "link", "set", "nttap0", "mtu", &mtu.to_string(), "up"],
         )
@@ -315,8 +437,9 @@ impl PodNet {
         // CNI's namespace retains the endpoint name and MAC until DEL. Move
         // all ingress to the peer; only the guest should own the IPv4 address.
         for (from, to) in [("nttap0", "eth0"), ("eth0", "nttap0")] {
-            in_namespace(ns, &["tc", "qdisc", "add", "dev", from, "clsact"]).await?;
+            in_namespace(&lease, ns, &["tc", "qdisc", "add", "dev", from, "clsact"]).await?;
             in_namespace(
+                &lease,
                 ns,
                 &[
                     "tc", "filter", "add", "dev", from, "ingress", "protocol", "all", "matchall",
@@ -325,7 +448,12 @@ impl PodNet {
             )
             .await?;
         }
-        in_namespace(ns, &["ip", "-4", "addr", "del", addr, "dev", "eth0"]).await?;
+        in_namespace(
+            &lease,
+            ns,
+            &["ip", "-4", "addr", "del", addr, "dev", "eth0"],
+        )
+        .await?;
         info.ip = ip.to_string();
         Ok(VmNetwork {
             netns_path: ns.clone(),
@@ -342,13 +470,14 @@ impl PodNet {
         if !path.try_exists()? {
             return Ok(());
         }
-        let mut record = read(&path)?;
-        let current = identity(&record.netns)?;
-        if current.is_some() && current != Some(record.namespace_id) {
-            return Err(invalid("VM network namespace identity has changed"));
+        let lease = operation_lock(&path, id).await?;
+        if !path.try_exists()? {
+            return Ok(());
         }
+        let mut record = read(&path)?;
+        let mounted = record.mounted()? == Some(true);
         if record.adding {
-            let ns = if current.is_some() {
+            let ns = if mounted {
                 record
                     .netns
                     .to_str()
@@ -363,17 +492,20 @@ impl PodNet {
                 id,
                 ns,
                 record.result.clone(),
+                Some(&lease),
             )
             .await?;
             record.adding = false;
             saved(&path, &record, false)?;
         }
-        if current.is_some() {
+        if mounted {
             umount2(&record.netns, MntFlags::MNT_DETACH)
                 .map_err(|e| invalid(format!("unmount VM namespace: {e}")))?;
         }
-        if record.netns.try_exists()? {
-            fs::remove_file(&record.netns)?;
+        match record.mounted()? {
+            Some(false) => fs::remove_file(&record.netns)?,
+            Some(true) => return Err(invalid("VM namespace remains mounted")),
+            None => {}
         }
         fs::remove_file(&path)?;
         File::open(path.parent().unwrap())?.sync_all()?;

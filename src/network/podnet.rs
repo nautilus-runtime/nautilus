@@ -122,7 +122,7 @@ impl PodNet {
     ) -> Result<serde_json::Value> {
         let chain = self.load_chain(false)?;
         let prev = prev_ip.map(|ip| serde_json::json!({ "ips": [ { "address": ip } ] }));
-        Self::run_chain(&self.config.network.cni_bin_dir, chain, command, pod_id, netns_path, prev).await
+        Self::run_chain(&self.config.network.cni_bin_dir, chain, command, pod_id, netns_path, prev, None).await
     }
 
     pub(super) async fn run_chain(
@@ -132,6 +132,7 @@ impl PodNet {
         pod_id: &str,
         netns_path: &str,
         mut prev: Option<serde_json::Value>,
+        lease: Option<&std::fs::File>,
     ) -> Result<serde_json::Value> {
         let mut attempted = Vec::new();
         let mut delete_error = None;
@@ -166,7 +167,7 @@ impl PodNet {
                 netns_path,
                 ifname,
                 &bin_dir.to_string_lossy(),
-                &conf,
+                &conf, lease,
             ).await;
             if command == "DEL" {
                 if let Err(error) = result {
@@ -186,7 +187,7 @@ impl PodNet {
                     for (plugin, interface, config) in attempted.into_iter().rev() {
                         if let Err(cleanup) = invoke_plugin(
                             &bin_dir.join(&plugin), &plugin, "DEL", pod_id, netns_path,
-                            interface, &bin_dir.to_string_lossy(), &config,
+                            interface, &bin_dir.to_string_lossy(), &config, lease,
                         ).await {
                             tracing::warn!(%pod_id, %plugin, %cleanup, "CNI rollback failed");
                         }
@@ -577,6 +578,7 @@ async fn invoke_plugin(
     ifname: &str,
     cni_path: &str,
     conf: &serde_json::Value,
+    lease: Option<&std::fs::File>,
 ) -> Result<serde_json::Value> {
     use tokio::io::AsyncWriteExt;
 
@@ -590,6 +592,9 @@ async fn invoke_plugin(
         .map_err(|e| Error::Network(format!("serialize plugin config: {e}")))?;
 
     let mut cmd = tokio::process::Command::new(bin);
+    if let Some(lease) = lease {
+        super::vm::keep_operation_lease(&mut cmd, lease);
+    }
     cmd.env("CNI_COMMAND", command)
         .env("CNI_CONTAINERID", pod_id)
         .env("CNI_NETNS", netns_path)
