@@ -4,6 +4,23 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 Pod VM 的 CRI 用量统计
+
+在两个隔离节点用提交 `0b1e188` 的同一 daemon 二进制运行未过滤的 critest，检验默认 OCI 后端。每轮的 runtime 和 image endpoint 均指向该节点专用的 Unix socket。两轮退出码均为 0，清理后各自的 CRI Pod 和容器数均为零。
+
+| critest 版本 | 通过 | 失败 | 跳过 | 耗时 |
+|---|---:|---:|---:|---:|
+| v1.31.1 | 96 | 0 | 17 | 237.372 秒 |
+| v1.37.0 | 105 | 0 | 37 | 321.110 秒 |
+
+提交 `0b1e188` 在独立的 Debian 13 嵌套 KVM 节点通过双 Pod 验收，耗时 13.50 秒。节点使用 Linux 6.12.118、Cloud Hypervisor v55.0 和 virtiofsd 1.13.2，guest 使用 Linux 5.15.0-191。通过 CRI 在同一 Pod 的一个容器内写入 16 MiB tmpfs，再由 exec 子进程对该文件执行 12 次 SHA-256。该容器的累计 CPU 为 677,363,000 ns，内存为 19,103,744 字节。同 Pod 空闲容器分别为 24,089,000 ns 和 2,019,328 字节。
+
+四个 CRI 用量接口均经过真实 daemon 验证。Pod 统计包含两个容器和 Pod 父 cgroup 的用量。列表按 ID、Pod 和标签过滤，另一台空 Pod 可独立取样。切断首个 Pod 的 guest 连接后，该容器的单项查询报错，另一台 Pod 仍能返回用量。[CRI 验收用例](../tests/vm_cri_workloads_test.rs)
+
+独立节点的 kubelet v1.37.2 在 `/configz` 报告 `PodAndContainerStatsFromCRI=true`。通过 Kubernetes API 的 Node 代理读取 `/stats/summary`，其中 alpha Pod、web 和 console 容器的工作集分别为 17,350,656、17,125,376 和 217,088 字节。beta Pod 和 client 容器分别为 290,816 和 286,720 字节。重启 daemon 后两个 Pod 保持原有身份。强制终止 beta 的 VMM 后，alpha 仍能处理请求。删除 Pod 后，VMM、virtiofsd、网络命名空间和 IPAM 租约均已回收，CRI Pod 列表为空。[kubelet 验收用例](../tests/kubelet_vm_acceptance.py)
+
+Linux 完整 Rust 测试为 104 通过、0 失败、8 项默认忽略。与主线 `12e7d5c` 对照，全库 `cargo fmt --check` 仍报告相同的 31 个文件，`cargo clippy --locked -- -D warnings` 仍报告相同的 29 项诊断。
+
 ## 2026-11-24 真实 kubelet 和 RuntimeClass
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点验证提交 `58e5ea5`。API server、scheduler、controller-manager、kubelet 与 kubectl 均为 Kubernetes v1.37.2，节点为 Linux 6.12.118、systemd 257.13、Cloud Hypervisor v55.0 和 virtiofsd 1.13.2，guest 为 Linux 5.15.0-191。测试通过 Kubernetes API 提交两个 VM Pod，在三个 Ready 容器上核对日志、镜像 ID、同 Pod 共享和跨 Pod 独立的 boot ID、跨 Pod HTTP、原 init 的交互式 attach、端口转发和 `kubectl exec` 传回的退出码 35。[复验脚本](../tests/kubelet_vm_acceptance.py) [RuntimeClass 和节点配置](VM_RUNTIMECLASS.md)
