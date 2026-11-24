@@ -23,8 +23,8 @@
 //! so the connection setup below replicates it with `parse_upgrade_request` +
 //! `send_upgrade_response_with_protocol` + `Connection::serve`, keeping the
 //! parsed path to resolve the session. The session is captured per connection
-//! in the stream handler closure; the request stream (stream 1) carries no
-//! `streamType` and is only acked.
+//! in the stream handler closure. client-go can open the error channel on
+//! stream 1. An untyped upgrade stream only needs an acknowledgment.
 
 use crate::core::state::StateManager;
 use crate::runtime::container::ContainerManager;
@@ -45,11 +45,8 @@ use tokio::sync::{mpsc, oneshot, watch, OnceCell};
 #[derive(Clone, Debug)]
 pub enum SessionKind {
     Exec,
-    /// CRI attach attaches to the container's primary process; the workload
-    /// stdio here is file-based (no pipes survive a detached start), so a
-    /// session serves a fresh `/bin/sh` in the container namespaces instead.
-    /// Semantically an approximation, streaming-plumbing-wise identical to
-    /// exec.
+    /// VM sessions use the existing init console. The native backend keeps
+    /// its historical attach shell for file-backed workload stdio.
     Attach,
     PortForward,
 }
@@ -387,7 +384,7 @@ fn success_status() -> Bytes {
 
 fn exit_code_status(code: i32) -> Bytes {
     Bytes::from(format!(
-        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","message":"command terminated with exit code {code}","reason":"NonZeroExitCodeError","details":{{"causes":[{{"reason":"ExitCode","message":"{code}"}}]}},"code":500}}"#
+        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","message":"command terminated with exit code {code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{code}"}}]}},"code":500}}"#
     ))
 }
 
@@ -752,7 +749,7 @@ pub async fn exec_url(
     Ok(url_for(port, "exec", &token))
 }
 
-/// Register an attach session (served as a fresh /bin/sh; see SessionKind).
+/// Register an attach session for the target container.
 pub async fn attach_url(
     exec: Arc<ContainerManager>,
     state: Arc<StateManager>,
@@ -799,4 +796,19 @@ pub async fn port_forward_url(
     };
     let token = register(session);
     Ok(url_for(port, "portforward", &token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remotecommand_v4_reports_a_typed_process_exit() {
+        let status: serde_json::Value = serde_json::from_slice(&exit_code_status(35)).unwrap();
+        assert_eq!(status["reason"], "NonZeroExitCode");
+        assert_eq!(
+            status["details"]["causes"][0],
+            serde_json::json!({"reason": "ExitCode", "message": "35"})
+        );
+    }
 }

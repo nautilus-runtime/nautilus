@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/kubernetes/cri-api/v0.37.2/pkg/apis
 
 `PodSandboxConfig.log_directory` 与容器相对 `log_path` 定位 kubelet 读取的宿主日志文件。VM 内 stdout、stderr 要以 CRI 日志格式写回，`ReopenContainerLog` 后继续写入轮转后的文件。`ExecSync` 返回两路输出及退出码，timeout 单位是秒，0 表示不设命令超时，按上游约定限制超大输出。`Exec`、`Attach`、`PortForward` 的 gRPC 响应分别给出流式服务 URL。Exec 定位指定 guest 容器，Attach 连接运行中主进程的原有 stdio，TTY 合流并处理窗口大小，PortForward 定位 sandbox 内端口，包括只监听 guest loopback 的服务。[日志与交互 RPC](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto#L97-L115) · [请求和返回值](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto#L1614-L1702)
 
-现有 Nautilus SPDY 服务为 Attach 新启 shell，并将 PortForward 连接到 Pod IP，在无地址时回退到宿主 loopback。VM 路径需要独立验证真正的主进程连接和 guest 侧转发，尤其要覆盖宿主与 guest 同时监听同一端口的情况。每个容器的 CPU/内存统计应从 guest cgroup 采集，Pod 统计明确时间戳、聚合口径及开销来源。当前实现读取宿主 `/proc/<pid>`，把同一 VMM 的 CPU 或 RSS 填给每个容器会造成重复计数。[流式实现](../src/cri/streaming.rs#L45) · [端口连接](../src/cri/streaming.rs#L477) · [现有统计](../src/cri/runtime_service.rs#L147) · [上游统计类型](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto#L1973-L2064)
+原有宿主 OCI 后端为 Attach 新启 shell，并将 PortForward 连接到 Pod IP，在无地址时使用宿主 loopback。VM 的 Attach 接入 guest 原 init 的 stdio，PortForward 在指定 guest 内拨号。每个容器的 CPU/内存统计应从 guest cgroup 采集，Pod 统计明确时间戳、聚合口径及开销来源。当前实现读取宿主 `/proc/<pid>`，把同一 VMM 的 CPU 或 RSS 填给每个容器会造成重复计数。[流式实现](../src/cri/streaming.rs#L45) · [端口连接](../src/cri/streaming.rs#L477) · [现有统计](../src/cri/runtime_service.rs#L147) · [上游统计类型](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto#L1973-L2064)
 
 ## 高级 RPC 和验证边界
 
