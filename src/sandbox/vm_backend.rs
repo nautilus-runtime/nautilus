@@ -57,9 +57,6 @@ impl VmBackend {
 
     fn validate(&self, spec: &WorkloadSpec) -> Result<()> {
         let unsupported = |text: &str| Error::Experimental(format!("Pod VM: {text}"));
-        if !spec.volumes.is_empty() {
-            return Err(unsupported("host volume delivery is unavailable"));
-        }
         if self.config.security.seccomp
             || !self.config.security.seccomp_profile_path.is_empty()
             || self.config.security.enable_apparmor
@@ -157,8 +154,24 @@ impl VmBackend {
                 resources["memory"] = json!({"limit":r.memory_limit_in_bytes});
             }
         }
+        let mut mounts = Vec::with_capacity(spec.volumes.len());
+        for volume in &spec.volumes {
+            if !matches!(volume.propagation.as_str(), "" | "rprivate") {
+                return Err(Error::Experimental(
+                    "VM host volumes require private propagation".into(),
+                ));
+            }
+            let source = self
+                .store
+                .bind_volume(&self.pod, &spec.id, &volume.host_path, volume.readonly)
+                .await?;
+            mounts.push(
+                json!({"type":"bind", "source":source, "destination":volume.container_path,
+                "options":["bind", if volume.readonly {"ro"} else {"rw"}]}),
+            );
+        }
         let spec_json = json!({
-            "ociVersion":"1.1.0",
+            "ociVersion":"1.1.0", "mounts":mounts,
             "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
             "annotations":{"io.nautilus.stdin":spec.open_stdin.to_string(),"io.nautilus.stdinOnce":spec.stdin_once.to_string()},
             "process":{"terminal":spec.tty,"user":{"uid":uid,"gid":gid,"additionalGids":groups},

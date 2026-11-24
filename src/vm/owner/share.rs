@@ -27,7 +27,7 @@ fn endpoint(path: &Path, socket: bool, expected: Option<FileIdentity>) -> io::Re
     Ok(identity)
 }
 
-fn pin_directory(path: &Path, expected: Option<FileIdentity>) -> io::Result<File> {
+pub(super) fn pin_directory(path: &Path, expected: Option<FileIdentity>) -> io::Result<File> {
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -38,7 +38,7 @@ fn pin_directory(path: &Path, expected: Option<FileIdentity>) -> io::Result<File
     Ok(dir)
 }
 
-fn pinned(dir: &File) -> PathBuf {
+pub(super) fn pinned(dir: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
 }
 
@@ -53,7 +53,13 @@ impl Lease {
         let containers = export.join("containers");
         DirBuilder::new().mode(0o700).create(&export)?;
         DirBuilder::new().mode(0o700).create(&containers)?;
+        let stage = self.directory.join(volume::STAGE);
+        DirBuilder::new().mode(0o700).create(&stage)?;
+        let volumes = export.join("volumes");
+        DirBuilder::new().mode(0o700).create(&volumes)?;
         let share = owner.share.as_mut().expect("share requested");
+        share.volumes = Some(FileIdentity::check(&volumes)?);
+        share.volume_stage = Some(FileIdentity::check(&stage)?);
         share.export = Some(FileIdentity::check(&export)?);
         share.containers = Some(FileIdentity::check(&containers)?);
         File::open(&export)?.sync_all()?;
@@ -82,6 +88,17 @@ impl Lease {
                 let share = owner.share.as_mut().expect("share requested");
                 match self.check_share_endpoints(share) {
                     Ok((socket, pid_file)) => {
+                        let Some(pid) = unit.pid else {
+                            sleep(Duration::from_millis(40)).await;
+                            continue;
+                        };
+                        // The socket can exist before virtiofsd pivots into its export.
+                        let Some(worker) = volume::Worker::open(pid, share)? else {
+                            sleep(Duration::from_millis(40)).await;
+                            continue;
+                        };
+                        share.volume_catalog_mount =
+                            Some(worker.seal_catalog(&pin_directory(&volumes, share.volumes)?)?);
                         share.invocation = Some(unit.invocation);
                         share.socket = Some(socket);
                         share.pid_file = Some(pid_file);
@@ -118,10 +135,17 @@ impl Lease {
         }
         let export = dir.join(EXPORT);
         let retired = dir.join(".retired-podfs");
+        if share.volume_stage.is_some() || share.export.is_none() {
+            volume::cleanup_stage(dir, share.volume_stage)?;
+        }
+
         match fs::symlink_metadata(&export) {
             Ok(meta) if meta.is_dir() && Some(FileIdentity::from_meta(&meta)) == share.export => {
                 let pinned_export = pin_directory(&export, share.export)?;
                 pin_directory(&pinned(&pinned_export).join("containers"), share.containers)?;
+                if share.volumes.is_some() {
+                    pin_directory(&pinned(&pinned_export).join("volumes"), share.volumes)?;
+                }
                 no_host_mounts(&export)?;
                 // Mark successful ownership verification before recursive deletion.
                 // If deletion is interrupted it may already have removed containers/.
@@ -139,6 +163,10 @@ impl Lease {
             // No service could have started then. Only remove empty staging directories.
             Ok(meta) if meta.is_dir() && share.export.is_none() => {
                 match fs::remove_dir(export.join("containers")) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    result => result?,
+                }
+                match fs::remove_dir(export.join("volumes")) {
                     Err(e) if e.kind() == ErrorKind::NotFound => {}
                     result => result?,
                 }
@@ -208,9 +236,10 @@ impl PodVmStore {
         let Some(lease) = self.lease(id, Operation::Remove).await? else {
             return Ok(());
         };
-        let Some(owner) = lease.load(id)? else {
+        let Some(mut owner) = lease.load(id)? else {
             return Ok(());
         };
+        lease.remove_volumes(&mut owner, container).await?;
         let bundles = lease.bundles(&owner)?;
         // Check the whole pinned directory, so an entry replaced by the guest
         // cannot redirect deletion into a different pre-existing mount in this export.

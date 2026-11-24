@@ -321,6 +321,61 @@ async fn exec(cli: &mut Runtime, id: &str, program: &str) -> Result<Vec<u8>> {
     Ok(r.stdout)
 }
 
+// Simulate daemon death directly after its placeholder receipt became durable
+// but before renameat2. A public file of exactly the expected type and size is
+// still someone else's. Cleanup must release only the private staged inode.
+fn interrupted_volume(root: &Path, pod: &str, container: &str) -> Result<(PathBuf, PathBuf, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let store = root.join("state/vms");
+    let slot = Uuid::new_v4().to_string();
+    let stage = store.join(pod).join(".volume-stage").join(&slot);
+    let public = store.join(pod).join("podfs/volumes").join(&slot);
+    use std::os::unix::fs::OpenOptionsExt;
+    let create_empty = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    create_empty(&stage)?.sync_all()?;
+    let foreign = create_empty(&public)?;
+    let metadata = fs::metadata(&stage)?;
+    let identity = json!({"device":metadata.dev(), "inode":metadata.ino()});
+    let record = store.join(format!("{pod}.json"));
+    let mut owner: serde_json::Value = serde_json::from_slice(&fs::read(&record)?)?;
+    owner["share"]["bindings"]
+        .as_array_mut()
+        .context("volume receipts")?
+        .push(json!({
+            "id":slot, "container":container, "mount":0, "source":identity, "placeholder":identity
+        }));
+    fs::write(record, serde_json::to_vec(&owner)?)?;
+    Ok((stage, public, foreign.metadata()?.ino()))
+}
+
+// These host mounts are confined to the disposable fixture. Drop them before
+// TempDir cleanup, including on failure.
+struct FixtureMount(PathBuf);
+impl FixtureMount {
+    fn new(source: &Path, target: &Path) -> Result<Self> {
+        nix::mount::mount(
+            Some(source),
+            target,
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
+        Ok(Self(target.into()))
+    }
+}
+impl Drop for FixtureMount {
+    fn drop(&mut self) {
+        nix::mount::umount2(&self.0, nix::mount::MntFlags::MNT_DETACH)
+            .expect("unmount temporary fixture");
+    }
+}
+
 async fn scenario(
     root: &Path,
     image: &str,
@@ -363,15 +418,56 @@ async fn scenario(
         create(cli, &id, &pod, unsupported).await.is_err(),
         "accepted privileged request"
     );
-    let mut mount = first_work.clone();
-    mount.mounts.push(Mount {
-        host_path: "/".into(),
-        container_path: "/host".into(),
-        ..Default::default()
-    });
+    // All host paths in this test belong to a disposable fixture outside state/storage.
+    let sources = tempfile::tempdir()?;
+    let hosts = sources.path().join("kubelet-hosts");
+    fs::write(&hosts, "127.0.0.1 fixture")?;
+    std::os::unix::fs::chown(&hosts, Some(65534), Some(65534))?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hosts, fs::Permissions::from_mode(0o666))?;
+    fs::hard_link(&hosts, sources.path().join("hosts-reference"))?;
+    let data = sources.path().join("data");
+    fs::create_dir(&data)?;
+    let nested = sources.path().join("nested-source");
+    fs::create_dir(&nested)?;
+    fs::write(nested.join("view"), b"nested")?;
+    fs::create_dir(data.join("nested"))?;
+    fs::write(data.join("nested/view"), b"covered")?;
+    fs::create_dir(data.join("later"))?;
+    let _existing_mount = FixtureMount::new(&nested, &data.join("nested"))?;
+    let projection = sources.path().join("projected");
+    for (version, value) in [("..one", "old"), ("..two", "new")] {
+        fs::create_dir_all(projection.join(version))?;
+        fs::write(projection.join(version).join("key"), value)?;
+    }
+    std::os::unix::fs::symlink("..one", projection.join("..data"))?;
+    std::os::unix::fs::symlink("..data/key", projection.join("key"))?;
+    let link = sources.path().join("selector");
+    std::os::unix::fs::symlink(&data, &link)?;
+    for (source, dest, readonly) in [
+        (&hosts, "/etc/hosts", true),
+        (&link, "/data", false),
+        (&projection, "/projected", true),
+    ] {
+        first_work.mounts.push(Mount {
+            host_path: source.to_string_lossy().into_owned(),
+            container_path: dest.into(),
+            readonly,
+            ..Default::default()
+        });
+    }
+    let mut incomplete = first_work.clone();
+    incomplete.metadata.as_mut().unwrap().name = "partial-source".into();
+    incomplete.mounts[1].host_path = sources
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    ensure!(create(cli, &id, &pod, incomplete).await.is_err());
+    let export = root.join("state/vms").join(&id).join("podfs/volumes");
     ensure!(
-        create(cli, &id, &pod, mount).await.is_err(),
-        "accepted unrestricted host mount"
+        export.read_dir()?.count() == 0,
+        "partially attached mounts survived failed create"
     );
     // Fail after the host has accepted the config and begun preparing a guest
     // bundle. Kubelet retries this same log_path when the immutable image arrives.
@@ -382,21 +478,29 @@ async fn scenario(
         create(cli, &id, &pod, missing).await.is_err(),
         "accepted missing image"
     );
+    let mut unsupported = first_work.clone();
+    unsupported.mounts[0].recursive_read_only = true;
+    ensure!(create(cli, &id, &pod, unsupported).await.is_err());
+    let mut unsupported = first_work.clone();
+    unsupported.mounts[0].propagation = MountPropagation::PropagationHostToContainer.into();
+    ensure!(create(cli, &id, &pod, unsupported).await.is_err());
     let a = create(cli, &id, &pod, first_work)
         .await
         .context("create first")?;
-    let b = create(
-        cli,
-        &id,
-        &pod,
-        workload(
-            "second",
-            image,
-            "echo second-out; exec /bin/busybox sleep 300",
-        ),
-    )
-    .await
-    .context("create second")?;
+    let mut second = workload(
+        "second",
+        image,
+        "echo second-out; exec /bin/busybox sleep 300",
+    );
+    second.mounts.push(Mount {
+        host_path: hosts.to_string_lossy().into_owned(),
+        container_path: "/shared-hosts".into(),
+        readonly: false,
+        ..Default::default()
+    });
+    let b = create(cli, &id, &pod, second)
+        .await
+        .context("create second")?;
     let initial = state(cli, &a).await?;
     ensure!(initial.image_id == image_id && initial.metadata.as_ref().unwrap().attempt == 2);
     for c in [&a, &b] {
@@ -452,6 +556,93 @@ async fn scenario(
         })
         .await?;
     }
+    ensure!(exec(cli, &a, "/bin/busybox cat /etc/hosts").await? == b"127.0.0.1 fixture");
+    ensure!(exec(cli, &a, "/bin/busybox cat /projected/key").await? == b"old");
+    exec(
+        cli,
+        &a,
+        "! (echo change > /etc/hosts) && ! (echo change > /projected/key)",
+    )
+    .await?;
+    // The same inode can be requested read-only and read-write concurrently.
+    exec(cli, &b, "echo writable > /shared-hosts").await?;
+    ensure!(fs::read(&hosts)? == b"writable\n");
+    exec(cli, &a, "! (echo change > /etc/hosts)").await?;
+    fs::remove_file(&link)?;
+    std::os::unix::fs::symlink(&projection, &link)?;
+    ensure!(exec(cli, &a, "/bin/busybox cat /data/nested/view").await? == b"nested");
+    let _later_mount = FixtureMount::new(&nested, &data.join("later"))?;
+    exec(cli, &a, "test ! -e /data/later/view").await?;
+    exec(cli, &a, "echo from-guest > /data/token").await?;
+    ensure!(fs::read(data.join("token"))? == b"from-guest\n" && !projection.join("token").exists());
+    fs::write(data.join("host-token"), b"host")?;
+    fs::write(&hosts, b"updated hosts")?;
+    std::os::unix::fs::symlink("..two", projection.join("..next"))?;
+    fs::rename(projection.join("..next"), projection.join("..data"))?;
+    timeout(Duration::from_secs(6), async {
+        loop {
+            if exec(
+                cli,
+                &a,
+                "/bin/busybox cat /etc/hosts /projected/key /data/host-token",
+            )
+            .await?
+                == b"updated hostsnewhost"
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("guest did not observe updated host files and AtomicWriter symlink swap")??;
+    exec(cli, &b, "test ! -e /data/token && test ! -e /projected/key").await?;
+    ensure!(export.read_dir()?.count() == 4);
+    let mut readonly_files = 0;
+    let mut writable_files = 0;
+    let fsd = |pod: &str| -> Result<(String, PathBuf)> {
+        let text = std::process::Command::new("systemctl")
+            .args([
+                "show",
+                "--value",
+                "-p",
+                "MainPID",
+                &format!("nautilus-virtiofs-{pod}-*.service"),
+            ])
+            .output()?;
+        let pid = String::from_utf8(text.stdout)?.trim().parse::<u32>()?;
+        ensure!(pid > 1);
+        Ok((
+            format!("nautilus-virtiofs-{pod}-*.service"),
+            PathBuf::from(format!("/proc/{pid}/root/volumes")),
+        ))
+    };
+    let (_, mounted) = fsd(&id)?;
+    let (_, sibling) = fsd(&other)?;
+    for slot in export.read_dir()? {
+        let slot = slot?;
+        let mount = mounted.join(slot.file_name());
+        ensure!(!sibling.join(slot.file_name()).exists());
+        if slot.file_type()?.is_file() {
+            ensure!(fs::metadata(slot.path())?.len() == 0 && fs::read(&mount)? == b"updated hosts");
+            match fs::OpenOptions::new().write(true).open(mount) {
+                Err(e) if e.raw_os_error() == Some(libc::EROFS) => readonly_files += 1,
+                Ok(_) => writable_files += 1,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            ensure!(slot.path().read_dir()?.count() == 0);
+        }
+    }
+    ensure!(
+        root.join("state/vms")
+            .join(&other)
+            .join("podfs/volumes")
+            .read_dir()?
+            .count()
+            == 0
+    );
+    ensure!((readonly_files, writable_files) == (1, 1));
     for n in 1..=10 {
         let out = exec(cli, &a, "echo x >> count; /bin/busybox wc -l < count").await?;
         ensure!(std::str::from_utf8(&out)?.trim() == n.to_string());
@@ -525,10 +716,14 @@ async fn scenario(
     exec(cli, &b, "test ! -e count").await?;
 
     daemon_process.kill().await?;
+    let (staging, foreign, foreign_ino) = interrupted_volume(root, &id, &a)?;
     let (new_daemon, new_client) = daemon(root).await?;
     *daemon_process = new_daemon;
     *cli = new_client;
     ensure!(boot_id(cli, &id).await? == boot_a && boot_id(cli, &other).await? == boot_b);
+    ensure!(
+        exec(cli, &a, "/bin/busybox cat /projected/key /data/token").await? == b"newfrom-guest\n"
+    );
     let after = exec(cli, &a, "/bin/busybox wc -l < count").await?;
     ensure!(
         std::str::from_utf8(&after)?.trim() == "10",
@@ -579,6 +774,30 @@ async fn scenario(
             })
             .await?;
         }
+        if c == &a {
+            let config: serde_json::Value = serde_json::from_slice(&fs::read(
+                root.join("state/vms")
+                    .join(&id)
+                    .join("podfs/containers")
+                    .join(&a)
+                    .join("config.json"),
+            )?)?;
+            let selector = config["mounts"][0]["source"]
+                .as_str()
+                .context("volume selector")?;
+            let slot = export.join(selector.strip_prefix("volumes/").context("volume prefix")?);
+            let saved = sources.path().join("old-placeholder");
+            fs::rename(&slot, &saved)?;
+            fs::write(&slot, b"foreign file")?;
+            let result = cli
+                .remove_container(RemoveContainerRequest {
+                    container_id: c.clone(),
+                })
+                .await;
+            ensure!(result.is_err() && fs::read(&slot)? == b"foreign file");
+            fs::remove_file(&slot)?;
+            fs::rename(saved, &slot)?;
+        }
         for _ in 0..2 {
             cli.remove_container(RemoveContainerRequest {
                 container_id: c.clone(),
@@ -586,6 +805,11 @@ async fn scenario(
             .await?;
         }
         if c == &a {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(!staging.exists() && fs::metadata(&foreign)?.ino() == foreign_ino);
+            fs::remove_file(&foreign)?;
+            ensure!(export.read_dir()?.count() == 1 && fs::read(&hosts)? == b"updated hosts");
+            ensure!(exec(cli, &b, "/bin/busybox cat /shared-hosts").await? == b"updated hosts");
             exec(cli, &b, "test ! -e count").await?;
         }
     }
@@ -609,6 +833,49 @@ async fn scenario(
         container_id: never_started,
     })
     .await?;
+    // A live binding exists only in its virtiofsd namespace; SIGKILL releases it
+    // even while nautilusd is offline. Restart and retry the normal CRI teardown.
+    let doomed_config = pod_config(root, "doomed");
+    let doomed = boot(cli, &doomed_config).await?;
+    let doomed_export = root.join("state/vms").join(&doomed).join("podfs/volumes");
+    let (unit, dying_mounts) = fsd(&doomed)?;
+    let mut victim = workload("lost-share", image, "exec /bin/busybox sleep 300");
+    victim.mounts.push(Mount {
+        host_path: hosts.to_string_lossy().into_owned(),
+        container_path: "/etc/hosts".into(),
+        readonly: true,
+        ..Default::default()
+    });
+    let lost = create(cli, &doomed, &doomed_config, victim).await?;
+    cli.start_container(StartContainerRequest { container_id: lost })
+        .await?;
+    daemon_process.kill().await?;
+    ensure!(Command::new("systemctl")
+        .args(["kill", "--signal=KILL", &unit])
+        .status()
+        .await?
+        .success());
+    timeout(Duration::from_secs(5), async {
+        while dying_mounts.exists() {
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .context("virtiofsd namespace survived service exit")?;
+    let (restarted, client) = daemon(root).await?;
+    *daemon_process = restarted;
+    *cli = client;
+    for _ in 0..2 {
+        cli.stop_pod_sandbox(StopPodSandboxRequest {
+            pod_sandbox_id: doomed.clone(),
+        })
+        .await?;
+        cli.remove_pod_sandbox(RemovePodSandboxRequest {
+            pod_sandbox_id: doomed.clone(),
+        })
+        .await?;
+    }
+    ensure!(!doomed_export.exists() && fs::read(&hosts)? == b"updated hosts");
     ensure!(boot_id(cli, &other).await? == boot_b);
     Ok(())
 }

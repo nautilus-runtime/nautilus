@@ -54,9 +54,13 @@ cargo test --locked --test vm_pod_lifecycle_test two_pods_survive_owner_restart 
 
 宿主在同一文件系统的私有目录准备目录型 OCI bundle，包括 `config.json` 和 `rootfs/`。调用 `PodVmStore::publish_bundle` 后，guest 可以在挂载点下的 `containers/<container-uuid>/` 访问它。宿主固定目录文件描述符、核对目录身份并以不可覆盖的原子重命名发布；`remove_bundle` 可以重复调用。数据目录归 Pod 所有，宿主创建后不解析 guest 可写目录内的链接来寻址宿主资源。
 
-当前实现导出宿主准备的容器 bundle。[宿主卷交付 #21](https://github.com/nautilus-runtime/nautilus/issues/21) 接受受信任 CRI 调用方指定的任意宿主文件或目录。源路径由节点解析，guest 只收到当前 Pod 的不透明卷 ID。实现需验证只读约束、跨宿主和 guest 的实时更新以及清理后的源数据完整性。在卷交付验收前，VM handler 对 CRI 挂载请求返回错误。
+受信任的节点 CRI 客户端通过每次 `CreateContainer.mounts` 指定宿主上的普通文件或目录。节点按 CRI 约定解析源符号链接，用文件描述符固定该次请求的 inode，并为每个容器挂载分配独立 UUID。路径被重命名或替换后，已有卷仍绑定原对象。guest 只收到 `volumes/<uuid>`。容器可按指定的只读或读写权限访问卷。宿主上的文件内容变化、目录内新增文件和 kubelet AtomicWriter 的 `..data` 切换可在 guest 中重新打开路径后观察。应用若依赖本机 inotify 事件，当前实现不保证跨 VM 通知。Kata 对需要通知的 Kubernetes 卷使用专门的 watchable bind。[上游 CRI Mount](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto#L335-L382) · [Kata 卷监视](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/container.go#L519-L548)
 
-这个选择参考了两个稳定版本。Kata 4.4.0 的 Cloud Hypervisor 路径逐项 bind mount 到 sandbox 共享目录，只读卷先在私有挂载点设为只读，再交给 virtiofsd。Kata 对识别出的 ConfigMap 和 Secret 使用 `watchable-bind` 支持 guest 内的文件变更通知。Firecracker v1.18.0 的 drives 接口提供镜像文件或块设备，以整块盘为单位控制只读属性。Nautilus 的验收会分别检查普通文件内容更新、目录内文件替换以及投射卷通知。[Kata 文件共享](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/fs_share_linux.go#L428-L469) · [Kata 投射卷](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/container.go#L519-L548) · [Firecracker 块设备](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/block.md)
+节点保留 virtiofsd 默认的挂载命名空间和 `pivot_root` 沙箱。启动 VMM 前，节点将该服务中的 `volumes/` 目录设为只读。随后通过 `open_tree` 固定请求时已存在的挂载树，在未发布的树上设置 `private`、`nosuid,nodev,noexec` 和读写属性，再用 `move_mount` 一次性接入该服务。节点本身的导出目录只包含空占位。每个卷的 Pod、容器、挂载 ID 和文件身份写入受保护的 owner 记录。删除容器会核对并卸载其卷；服务退出后内核释放整个私有挂载树。宿主源文件和目录由 CRI 调用方管理。旧版运行中的 Pod 可继续原有工作负载，重新创建 Pod 后即可申请宿主卷。[virtiofsd 沙箱](https://gitlab.com/virtio-fs/virtiofsd/-/blob/v1.13.2/src/sandbox.rs) · [Kata 在发布前设置只读](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/fs_share_linux.go#L428-L468) · [Firecracker 的挂载命名空间与 jail](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/jailer.md)
+
+请求宿主到容器或双向传播、CRI 递归只读、UID/GID 映射、SELinux 重标记、镜像卷或其他未实现的挂载选项会得到明确错误。节点需要 Linux 的 `mount_setattr`（5.12 起）以及加入该服务挂载命名空间的权限。
+
+Firecracker v1.18.0 的 drives 接口对整个镜像文件或块设备设置只读属性。Nautilus 的 CRI 卷需要按单个文件和目录请求交付，使用 virtio-fs 保留这一级边界。[Firecracker 块设备](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/block.md)
 
 恢复和状态查询核对两个服务的 InvocationID、端点和导出目录身份。Stop/Remove 先停止 VMM，再停止 virtiofsd 并回收数据。身份校验失败时保留记录供重试。系统级 systemd 和 KVM 节点可用以下命令运行双 guest 验证：
 
