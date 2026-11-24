@@ -25,17 +25,18 @@ type logState struct {
 }
 
 type container struct {
-	logState logState
-	mu       sync.Mutex
-	execs    sync.WaitGroup
-	waitErr  error
-	id, dir  string
-	s        status
-	p        process
-	pidfd    int
-	done     chan struct{}
-	exited   status // published by closing done
-	log      *os.File
+	runtimeAttempted bool
+	logState         logState
+	mu               sync.Mutex
+	execs            sync.WaitGroup
+	waitErr          error
+	id, dir          string
+	s                status
+	p                process
+	pidfd            int
+	done             chan struct{}
+	exited           status // published by closing done
+	log              *os.File
 }
 
 func (c *container) current() status {
@@ -132,15 +133,11 @@ func (c *container) create() error {
 	defer cancel()
 	cmd := runc(ctx, "--log", runtimeLog, "create", "--no-pivot", "--bundle", c.dir, "--pid-file", pidfile, c.id)
 	cmd.Stdout, cmd.Stderr = outW, errW
+	c.runtimeAttempted = true
 	if err = cmd.Run(); err != nil {
 		b, _ := os.ReadFile(runtimeLog)
 		return fmt.Errorf("runc create: %w: %.2048s", err, b)
 	}
-	defer func() {
-		if !complete {
-			command("delete", "--force", c.id)
-		}
-	}()
 	raw, err := os.ReadFile(pidfile)
 	if err != nil {
 		return err
@@ -180,6 +177,41 @@ func (c *container) create() error {
 	complete = true
 	return nil
 }
+
+// runc create may have created the init before returning an error or timing
+// out. Keep ownership until both runtime and private directory are removed.
+func (c *container) rollbackCreate() error {
+	if c.runtimeAttempted {
+		// Pin this attempt's child before deleting it. A late create failure can
+		// leave an adopted init which has no normal exit watcher yet.
+		fd := -1
+		if raw, err := os.ReadFile(filepath.Join(c.dir, "pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 1 {
+				if p, err := unix.PidfdOpen(pid, 0); err == nil {
+					group, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+					if strings.TrimSpace(string(group)) == "0::/nautilus/"+c.id {
+						fd = p
+					} else {
+						unix.Close(p)
+					}
+				}
+			}
+		}
+		if fd >= 0 {
+			defer unix.Close(fd)
+		}
+		if err := command("delete", "--force", c.id); err != nil {
+			return err
+		}
+		c.runtimeAttempted = false
+		if fd >= 0 {
+			var info unix.Siginfo
+			unix.Waitid(unix.P_PIDFD, fd, &info, unix.WEXITED, nil)
+		}
+	}
+	return os.RemoveAll(c.dir)
+}
+
 func (c *container) stop(grace time.Duration) error {
 	if c.current().State == "exited" {
 		return nil
@@ -250,9 +282,23 @@ func (s *server) dispatch(ctx context.Context, q request) response {
 		}
 		s.mu.Unlock()
 	}
+	if c.s.State == "cleanup" {
+		if !useStop && q.Op != "remove" {
+			return fail("runtime", "cleanup of failed container create is pending; retry remove")
+		}
+		if err := c.rollbackCreate(); err != nil {
+			return fail("runtime", err)
+		}
+		c.s.State = "removed"
+		forget()
+		return success(status{})
+	}
 	if q.Op == "create" && c.s.State == "" {
 		if err := c.create(); err != nil {
-			os.RemoveAll(c.dir)
+			c.s.State = "cleanup"
+			if cleanup := c.rollbackCreate(); cleanup != nil {
+				return fail("runtime", fmt.Errorf("%w; rollback: %v", err, cleanup))
+			}
 			c.s.State = "removed"
 			forget()
 			if errors.Is(err, invalidBundle) {

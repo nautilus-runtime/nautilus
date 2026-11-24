@@ -14,6 +14,14 @@ cleanup() {
     rm -rf -- "$work"
 }
 trap cleanup EXIT
+if [[ ${INJECT_CREATE_FAILURE:-0} == 1 ]]; then
+    mkdir "$work/image"
+    (cd "$work/image" && gzip -dc "$INITRAMFS" | cpio --quiet -id)
+    mv "$work/image/bin/runc" "$work/image/bin/runc-real"
+    "${CC:-cc}" -static -Wall -Wextra -Werror -o "$work/image/bin/runc" "$here/fault-runc.c"
+    (cd "$work/image" && find . -print0 | cpio --quiet --null -o -H newc | gzip -n) >"$work/fault.gz"
+    INITRAMFS="$work/fault.gz"
+fi
 mkdir "$work/share"
 "$VIRTIOFSD" --socket-path "$work/fs.sock" --shared-dir "$work/share" --xattr >"$work/fs.log" 2>&1 &
 fs_pid=$!

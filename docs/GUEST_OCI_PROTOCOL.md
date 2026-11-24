@@ -23,6 +23,8 @@
 
 成功应答具有 `{"version":1,"requestId":"…","ok":true,...}`。失败时 `ok=false`，`code` 取 `invalid`（协议、参数或 bundle）、`identity`、`not_found`、`conflict`（不符合当前生命周期）、`timeout`、`limit` 或 `runtime`，`message` 用于诊断。客户端首先检查 `ok`。格式损坏的请求可能没有可回显的 requestId。传输失败时 create/start/stop/remove 可对同一容器重新调用；exec 可能已经产生工作负载副作用，宿主须将断连报告给调用方。agent 以每次调用的 cgroup 回收 exec，覆盖超时、断连及脱离原进程组的后代。其他容器和目标容器的 init 继续运行。最多 32 个连接并发，其中最多 24 个执行 exec。
 
+创建期间 runc 或其清理命令失败时，guest 返回错误。仍有待回收对象的 ID 将保留在 guest 的启动记录中，宿主须重试 remove 或 stop，待成功后再重新创建。
+
 ## OCI 交付
 
 宿主在独占 podfs 的 `containers/<containerId>/` 原子发布完整的 `config.json` 和 `rootfs/`，待 guest remove 成功才回收。agent 将导出挂在 `/run/nautilus/share`，从固定位置读取，随后把审核后的 spec 写入仅 guest 可见的 bundle，调用静态 runc。宿主必须保证各容器使用独立可写 rootfs，授权卷和 bundle 在其使用期内不可替换。工作负载只能访问自己的 rootfs 和显式挂载的卷。
@@ -45,4 +47,4 @@ sudo env VMM=/path/to/cloud-hypervisor VIRTIOFSD=/path/to/virtiofsd \
     BUSYBOX=/path/to/static-busybox ./guest/tests/boot.sh
 ```
 
-2026-11-24 在 Linux x86_64 5.15.0-191-generic、Cloud Hypervisor v54.1、virtiofsd 1.13.2、runc 1.5.3 上运行该用例。协议实测涵盖同一 boot ID、两个容器的独立 PID 与可写根、Pod IPC、十次 exec 的工作区、日志分流与偏移、授权只读卷、退出码与纳秒时间、参数和 bundle 拒绝、输出上限、超时与断连后的后代清理、重复 stop/remove。宿主 CRI 及 kubelet 由其自身入口另行验收。
+2026-11-24 在 Linux x86_64 5.15.0-191-generic、Cloud Hypervisor v54.1、virtiofsd 1.13.2、runc 1.5.3 上运行该用例。协议实测涵盖同一 boot ID、两个容器的独立 PID 与可写根、Pod IPC、十次 exec 的工作区、日志分流与偏移、授权只读卷、退出码与纳秒时间、参数和 bundle 拒绝、输出上限、超时与断连后的后代清理、重复 stop/remove。在上面的测试命令中设置 `INJECT_CREATE_FAILURE=1` 会构建额外的故障测试镜像，模拟 runc create 已产生 init 后报错、首次清理失败，并验证再次 remove 和同一 ID 的后续创建。宿主 CRI 及 kubelet 由其自身入口另行验收。

@@ -4,6 +4,7 @@
 import argparse
 import base64
 import json
+import os
 import shutil
 import socket
 import struct
@@ -126,6 +127,18 @@ if __name__ == "__main__":
         return d
 
     d = bundle(first, "echo firstout; echo firsterr >&2; exec sleep 120")
+    if os.environ.get("INJECT_CREATE_FAILURE") == "1":
+        broken_id = "00ca1100-1000-4000-8000-000000000001"
+        bundle(broken_id, "exit 0")
+        failure = call("create", broken_id)
+        assert failure["code"] == "runtime", failure
+        assert call("status", broken_id)["code"] == "runtime"
+        ok("remove", broken_id)
+        assert call("status", broken_id)["code"] == "not_found"
+        # runc delete succeeded on retry: this exact ID can be reused.
+        ok("create", broken_id)
+        ok("remove", broken_id)
+        print("Partial runc create and failed cleanup recovered on retry", flush=True)
     invalid = uid()
     broken = bundle(invalid, "exit 0")
     specfile = broken / "config.json"
