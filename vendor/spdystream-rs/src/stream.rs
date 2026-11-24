@@ -19,6 +19,7 @@ pub struct Stream {
     pub(crate) local_fin_sent: AtomicBool,
     pub(crate) replied: AtomicBool,
     pub(crate) reply_notify: Notify,
+    remote_reset_tx: watch::Sender<bool>,
     remote_closed_tx: watch::Sender<bool>,
     pub(crate) remote_closed_rx: watch::Receiver<bool>,
     /// Partial-frame remainder buffer for AsyncRead.
@@ -44,6 +45,7 @@ impl Stream {
             local_fin_sent: AtomicBool::new(false),
             replied: AtomicBool::new(false),
             reply_notify: Notify::new(),
+            remote_reset_tx: watch::channel(false).0,
             remote_closed_tx,
             remote_closed_rx,
             unread: Mutex::new(None),
@@ -58,6 +60,18 @@ impl Stream {
     /// Mark remote side as closed (FIN received).
     pub(crate) fn close_remote(&self) {
         let _ = self.remote_closed_tx.send(true);
+    }
+
+    /// Wake the stream handler even if a prior FIN already closed the input half.
+    pub(crate) fn reset_remote(&self) {
+        self.remote_reset_tx.send_replace(true);
+        self.close_remote();
+    }
+
+    /// Wait for an explicit reset. A FIN still permits downstream writes.
+    pub async fn wait_remote_reset(&self) {
+        let mut reset = self.remote_reset_tx.subscribe();
+        let _ = reset.wait_for(|value| *value).await;
     }
 
     /// Send RST_STREAM.

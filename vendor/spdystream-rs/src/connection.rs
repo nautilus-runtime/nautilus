@@ -211,7 +211,7 @@ impl Connection {
                             }
                         }
                         Frame::RstStream(_) => {
-                            msg.stream.close_remote();
+                            msg.stream.reset_remote();
                             let mut guard = streams.lock().await;
                             guard.remove(&msg.stream.stream_id);
                         }

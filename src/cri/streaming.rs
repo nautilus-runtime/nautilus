@@ -606,20 +606,26 @@ async fn handle_pf_stream(
                 stdout: true,
                 ..Default::default()
             };
-            let stream = exec
-                .guest_stream(
-                    &pod.id,
-                    &pod.id,
-                    Operation::PortForward {
-                        stream: PortOptions { port },
-                    },
-                    options,
-                    ctx.closed.subscribe(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            let _lifetime = stream.lifetime;
-            relay_guest_port(s.clone(), stream.io).await
+            let forward = async {
+                let stream = exec
+                    .guest_stream(
+                        &pod.id,
+                        &pod.id,
+                        Operation::PortForward {
+                            stream: PortOptions { port },
+                        },
+                        options,
+                        ctx.closed.subscribe(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _lifetime = stream.lifetime;
+                relay_guest_port(s.clone(), stream.io).await
+            };
+            tokio::select! {
+                result = forward => result,
+                _ = s.wait_remote_reset() => Ok(()),
+            }
         } else {
             let ip = if pod.network_ip.is_empty() {
                 "127.0.0.1"

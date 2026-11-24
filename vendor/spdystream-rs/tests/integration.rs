@@ -576,3 +576,49 @@ async fn test_upgrade_wrong_protocol() {
         Err(_) => {} // connection reset — also acceptable
     }
 }
+
+
+#[tokio::test]
+async fn reset_after_half_close_only_cancels_one_stream() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (done, mut completed) = tokio::sync::mpsc::channel(2);
+        let server = ServerConfig::new(move |s| {
+            let done = done.clone();
+            Box::pin(async move {
+                s.send_reply(http::HeaderMap::new(), false).await.unwrap();
+                tokio::select! {
+                    _ = s.wait_remote_reset() => {
+                        done.send(s.stream_id).await.unwrap();
+                    }
+                    _ = async {
+                        while let Some(bytes) = s.read_data().await.unwrap() {
+                            if !bytes.is_empty() {
+                                s.write_data(bytes, false).await.unwrap();
+                            }
+                        }
+                        s.write_data(Bytes::from_static(b"half-closed"), false).await.unwrap();
+                        std::future::pending::<()>().await;
+                    } => unreachable!(),
+                }
+            })
+        });
+        let (mut enc, mut dec) = connect_client(start_server(server).await).await;
+        assert!(matches!(dec.read_frame().await.unwrap(), Frame::Settings(_)));
+        for id in [1, 3] {
+            enc.write_frame(&syn_stream_frame(id)).await.unwrap();
+            assert!(matches!(dec.read_frame().await.unwrap(), Frame::SynReply(r) if r.stream_id == id));
+        }
+        enc.write_frame(&Frame::Data(DataFrame {
+            stream_id: 1, flags: DATA_FLAG_FIN, data: Bytes::new(),
+        })).await.unwrap();
+        assert!(matches!(dec.read_frame().await.unwrap(), Frame::Data(d) if d.stream_id == 1 && d.data == "half-closed"));
+        enc.write_frame(&Frame::RstStream(RstStreamFrame {
+            stream_id: 1, status: RstStatus::Cancel,
+        })).await.unwrap();
+        assert_eq!(completed.recv().await, Some(1));
+        enc.write_frame(&Frame::Data(DataFrame {
+            stream_id: 3, flags: 0, data: Bytes::from_static(b"still connected"),
+        })).await.unwrap();
+        assert!(matches!(dec.read_frame().await.unwrap(), Frame::Data(d) if d.stream_id == 3 && d.data == "still connected"));
+    }).await.expect("timed out waiting for reset or sibling stream");
+}
