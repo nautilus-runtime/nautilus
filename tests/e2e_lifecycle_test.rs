@@ -449,19 +449,14 @@ async fn setup_test_environment() -> TestEnvironment {
         container_manager.clone(),
     ));
     
-    let image_manager = Arc::new(ImageManager::new(config.clone()));
     let network_manager = Arc::new(NetworkManager::new(config.clone()));
-    
-    let runtime_service = Arc::new(NautilusRuntimeService::new(
-        config.clone(),
-        state_manager.clone(),
+    let image_service = Arc::new(NautilusImageService::new(config.clone(), state_manager.clone()));
+    image_service.initialize().await.unwrap();
+    let image_manager = image_service.image_manager();
+    let runtime_service = Arc::new(NautilusRuntimeService::with_images(
+        config.clone(), state_manager.clone(), image_manager.clone(),
     ));
-    
-    let image_service = Arc::new(NautilusImageService::new(
-        config.clone(),
-        state_manager.clone(),
-    ));
-    
+
     TestEnvironment {
         temp_dir,
         _config: config,

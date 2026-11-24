@@ -112,6 +112,9 @@ def main():
                               automountServiceAccountToken=False))
 
     def snapshot():
+        image = json.loads(run([*cri, "inspecti", args.image]))["status"]
+        expected = {image["id"], *image["repoDigests"]}
+        listed = {c["id"]: c.get("imageId") for c in json.loads(run([*cri, "ps", "-o", "json"]))["containers"]}
         facts = []
         for name, container in [("alpha", "web"), ("beta", "client")]:
             pod_data = json.loads(kube("get", "pod", name, "-o", "json"))
@@ -119,6 +122,11 @@ def main():
             status = pod_data["status"]
             ids = [c["containerID"] for c in status["containerStatuses"] if c["ready"]]
             assert len(ids) == (2 if name == "alpha" else 1)
+            for c in status["containerStatuses"]:
+                assert c["imageID"] in expected, c["imageID"]
+                cri_id = c["containerID"].split("://", 1)[1]
+                observed = json.loads(run([*cri, "inspect", cri_id]))["status"]
+                assert listed[cri_id] == observed["imageId"] == image["id"]
             boot = exec_in(name, container, "cat", "/proc/sys/kernel/random/boot_id")
             uuid.UUID(boot)
             facts.append((status["podIP"], ids, boot))
