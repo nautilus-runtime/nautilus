@@ -145,6 +145,7 @@ def main():
     wait(advertised)
     kube("create", "namespace", namespace)
     records = []
+    vm_units = {}
     try:
         node = json.loads(kube("get", "node", args.node, "-o", "json"))
         hostname = node["metadata"]["labels"]["kubernetes.io/hostname"]
@@ -180,6 +181,7 @@ def main():
                              f"nautilus-vm-{pod_id}-*.service"]).split()
                 assert units, f"VMM unit for {pod_id} is missing"
                 unit = units[0]
+                vm_units[name] = unit
                 group = run(["systemctl", "show", unit, "-p", "ControlGroup", "--value"])
                 cgroup = Path("/sys/fs/cgroup", group.lstrip("/"))
                 assert int((cgroup / "memory.max").read_text()) == 512 << 20
@@ -204,6 +206,20 @@ def main():
             assert snapshot() == before
             exercise(before, "updated")
             print("Guest IPs, container IDs and boots after daemon SIGKILL:", before)
+            # Kill the exact VM service for beta. Kubelet can remove or replace
+            # this attempt before the next CRI query observes its NOTREADY state.
+            unit = vm_units["beta"]
+            assert unit.startswith("nautilus-vm-" + records[1] + "-")
+            vm_pid = int(run(["systemctl", "show", unit, "-p", "MainPID", "--value"]))
+            assert vm_pid > 1 and Path(f"/proc/{vm_pid}/exe").samefile(cfg["runtime"]["sandboxes"]["vm"]["vmm"])
+            run(["systemctl", "kill", "--kill-whom=main", "--signal=SIGKILL", unit])
+            def beta_lost():
+                listing = json.loads(run([*cri, "pods", "--id", records[1], "-o", "json"])).get("items", [])
+                return not listing or listing[0]["state"] == "SANDBOX_NOTREADY"
+            wait(beta_lost)
+            assert exec_in("alpha", "web", "cat", "/proc/sys/kernel/random/boot_id") == before[0][2]
+            forwarded_http(k)
+            print("Alpha retained its guest and served HTTP after beta's VMM exited")
             kube("delete", "pod", "alpha", "beta", "--grace-period=1", "--wait=false")
             state = Path(cfg["runtime"]["state_dir"])
             def cleaned():
