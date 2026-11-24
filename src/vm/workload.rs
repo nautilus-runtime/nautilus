@@ -45,6 +45,8 @@ pub(crate) enum Operation<'a> {
     Create,
     Start,
     Status,
+    Stats,
+    PodStats,
     Exec {
         argv: &'a [String],
         #[serde(rename = "timeoutMs")]
@@ -67,9 +69,24 @@ struct Request<'a> {
     #[serde(flatten)]
     target: &'a Identity,
     request_id: String,
+    #[serde(skip_serializing_if = "str::is_empty")]
     container_id: &'a str,
     #[serde(flatten)]
     operation: Operation<'a>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Sample {
+    pub timestamp: i64,
+    pub cpu_usage_nanos: u64,
+    pub usage_nano_cores: Option<u64>,
+    pub memory_usage_bytes: u64,
+    pub working_set_bytes: u64,
+    pub available_bytes: Option<u64>,
+    pub rss_bytes: u64,
+    pub page_faults: u64,
+    pub major_page_faults: u64,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +109,9 @@ pub(crate) struct Reply {
     #[serde(default)]
     stderr: String,
     pub next_offset: Option<i64>,
+    pub stats: Option<Sample>,
+    #[serde(default)]
+    pub containers: std::collections::HashMap<String, Sample>,
 }
 
 impl Reply {
@@ -157,7 +177,9 @@ impl Channel {
     }
 
     async fn exchange(&mut self, id: &str, operation: Operation<'_>) -> io::Result<Reply> {
-        if !super::guest::canonical_uuid(id) {
+        if !(super::guest::canonical_uuid(id)
+            || (matches!(operation, Operation::PodStats) && id.is_empty()))
+        {
             return Err(invalid("invalid container ID"));
         }
         let wait = match &operation {

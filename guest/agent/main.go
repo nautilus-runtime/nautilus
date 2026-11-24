@@ -62,9 +62,11 @@ type response struct {
 	Code    string `json:"code,omitempty"`
 	Message string `json:"message,omitempty"`
 	status
-	Stdout     []byte `json:"stdout,omitempty"`
-	Stderr     []byte `json:"stderr,omitempty"`
-	NextOffset *int64 `json:"nextOffset,omitempty"`
+	Stdout     []byte            `json:"stdout,omitempty"`
+	Stderr     []byte            `json:"stderr,omitempty"`
+	NextOffset *int64            `json:"nextOffset,omitempty"`
+	Stats      *sample           `json:"stats,omitempty"`
+	Containers map[string]sample `json:"containers,omitempty"`
 }
 
 func fail(code string, err any) response { return response{Code: code, Message: fmt.Sprint(err)} }
@@ -75,6 +77,8 @@ type server struct {
 	mu         sync.Mutex
 	containers map[string]*container
 	execSlots  chan struct{}
+	statsMu    sync.Mutex
+	cpu        cpuHistory
 }
 
 func strictJSON(input []byte, v any) error {
@@ -124,7 +128,7 @@ func (s *server) serve(f *os.File) {
 	var res response
 	if err := strictJSON(b, &req); err != nil {
 		res = fail("invalid", err)
-	} else if req.Version != 1 || !validID(req.ID) || !validID(req.Container) {
+	} else if req.Version != 1 || !validID(req.ID) || (req.Op == "podStats" && req.Container != "") || (req.Op != "podStats" && !validID(req.Container)) {
 		res = fail("invalid", "invalid version or ID")
 	} else if req.identity != s.identity {
 		res = fail("identity", "guest launch identity mismatch")
@@ -178,6 +182,10 @@ func run() error {
 		if err := mount(fs.typ, fs.source, fs.path, fs.flags); err != nil && !errors.Is(err, unix.EBUSY) {
 			return fmt.Errorf("mount %s: %w", fs.path, err)
 		}
+	}
+	// Keep the workload parent observable even before the first container.
+	if err := initWorkloadAccounting(); err != nil {
+		log.Printf("guest cgroup accounting unavailable: %v", err)
 	}
 	// Pods using guest loopback only also support port forwarding.
 	fdNet, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)

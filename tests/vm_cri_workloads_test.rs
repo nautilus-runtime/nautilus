@@ -199,6 +199,7 @@ fn pod_config(root: &Path, name: &str) -> PodSandboxConfig {
             namespace: "vm-test".into(),
             ..Default::default()
         }),
+        labels: [("test-pod".into(), name.into())].into(),
         log_directory: root.join(name).to_string_lossy().into_owned(),
         linux: Some(LinuxPodSandboxConfig {
             security_context: Some(LinuxSandboxSecurityContext {
@@ -257,6 +258,7 @@ fn workload(name: &str, image: &str, program: &str) -> ContainerConfig {
             "-c".into(),
             program.into(),
         ],
+        labels: [("test-container".into(), name.into())].into(),
         log_path: format!("{name}.log"),
         linux: Some(LinuxContainerConfig {
             security_context: Some(LinuxContainerSecurityContext {
@@ -374,6 +376,180 @@ impl Drop for FixtureMount {
         nix::mount::umount2(&self.0, nix::mount::MntFlags::MNT_DETACH)
             .expect("unmount temporary fixture");
     }
+}
+
+async fn container_usage(cli: &mut Runtime, id: &str) -> Result<ContainerStats> {
+    Ok(cli
+        .container_stats(ContainerStatsRequest {
+            container_id: id.into(),
+        })
+        .await?
+        .into_inner()
+        .stats
+        .context("missing container stats")?)
+}
+
+async fn guest_stats(
+    cli: &mut Runtime,
+    pod: &str,
+    other: &str,
+    busy: &str,
+    idle: &str,
+) -> Result<()> {
+    let counters = |s: &ContainerStats| -> Result<(u64, u64)> {
+        let cpu = s.cpu.as_ref().context("missing CPU")?;
+        let mem = s.memory.as_ref().context("missing memory")?;
+        ensure!(cpu.timestamp > 0 && cpu.timestamp == mem.timestamp);
+        let usage = mem
+            .usage_bytes
+            .as_ref()
+            .context("missing memory.current")?
+            .value;
+        ensure!(
+            mem.working_set_bytes
+                .as_ref()
+                .context("missing working set")?
+                .value
+                <= usage
+        );
+        Ok((
+            cpu.usage_core_nano_seconds
+                .as_ref()
+                .context("missing CPU nanoseconds")?
+                .value,
+            usage,
+        ))
+    };
+    let before_busy = counters(&container_usage(cli, busy).await?)?.0;
+    let before_idle = counters(&container_usage(cli, idle).await?)?.0;
+    // The busy container charges persistent tmpfs pages and consumes CPU in exec descendants.
+    exec(cli, busy, "/bin/busybox dd if=/dev/zero of=/dev/shm/stats-load bs=1048576 count=16 2>/dev/null || exit 1; i=0; while [ $i -lt 12 ]; do /bin/busybox sha256sum /dev/shm/stats-load >/dev/null || exit 1; i=$((i+1)); done").await?;
+    sleep(Duration::from_secs(1)).await;
+    let busy_sample = container_usage(cli, busy).await?;
+    let (busy_cpu, busy_mem) = counters(&busy_sample)?;
+    let (idle_cpu, idle_mem) = counters(&container_usage(cli, idle).await?)?;
+    ensure!(
+        busy_cpu - before_busy > (idle_cpu - before_idle) + 1_000_000,
+        "busy/idle CPU: {busy_cpu}/{idle_cpu}"
+    );
+    ensure!(
+        busy_mem > idle_mem + (8 << 20),
+        "busy/idle memory: {busy_mem}/{idle_mem}"
+    );
+    ensure!(
+        busy_sample
+            .cpu
+            .unwrap()
+            .usage_nano_cores
+            .context("missing second-sample CPU rate")?
+            .value
+            > 0
+    );
+    let stats = cli
+        .pod_sandbox_stats(PodSandboxStatsRequest {
+            pod_sandbox_id: pod.into(),
+        })
+        .await?
+        .into_inner()
+        .stats
+        .context("missing Pod stats")?;
+    let name = stats
+        .attributes
+        .as_ref()
+        .context("missing Pod attributes")?
+        .metadata
+        .as_ref()
+        .unwrap()
+        .name
+        .clone();
+    let linux = stats.linux.context("missing Linux Pod stats")?;
+    ensure!(linux.cpu.unwrap().usage_core_nano_seconds.unwrap().value >= busy_cpu + idle_cpu);
+    ensure!(linux.memory.unwrap().usage_bytes.unwrap().value >= busy_mem);
+    let mut children: Vec<_> = linux
+        .containers
+        .iter()
+        .map(|c| c.attributes.as_ref().unwrap().id.as_str())
+        .collect();
+    children.sort_unstable();
+    let mut expected = [busy, idle];
+    expected.sort_unstable();
+    ensure!(children == expected);
+    let all = cli
+        .list_container_stats(ListContainerStatsRequest::default())
+        .await?
+        .into_inner()
+        .stats;
+    for id in [busy, idle] {
+        ensure!(all
+            .iter()
+            .any(|s| s.attributes.as_ref().is_some_and(|a| a.id == id)));
+    }
+    let all_pods = cli
+        .list_pod_sandbox_stats(ListPodSandboxStatsRequest::default())
+        .await?
+        .into_inner()
+        .stats;
+    ensure!(all_pods
+        .iter()
+        .any(|s| s.attributes.as_ref().is_some_and(|a| a.id == pod)));
+    let empty = all_pods
+        .iter()
+        .find(|s| s.attributes.as_ref().is_some_and(|a| a.id == other))
+        .context("missing empty VM Pod stats")?
+        .linux
+        .as_ref()
+        .context("missing Linux stats")?;
+    ensure!(empty.containers.is_empty() && empty.cpu.is_some() && empty.memory.is_some());
+    let filter = ContainerStatsFilter {
+        pod_sandbox_id: pod.into(),
+        id: busy.into(),
+        label_selector: [("test-container".into(), "first".into())].into(),
+    };
+    let matching = cli
+        .list_container_stats(ListContainerStatsRequest {
+            filter: Some(filter.clone()),
+        })
+        .await?
+        .into_inner()
+        .stats;
+    ensure!(matching.len() == 1 && matching[0].attributes.as_ref().unwrap().id == busy);
+    let mismatch = ContainerStatsFilter {
+        pod_sandbox_id: other.into(),
+        ..filter
+    };
+    ensure!(cli
+        .list_container_stats(ListContainerStatsRequest {
+            filter: Some(mismatch)
+        })
+        .await?
+        .into_inner()
+        .stats
+        .is_empty());
+    let filter = PodSandboxStatsFilter {
+        id: pod.into(),
+        label_selector: [("test-pod".into(), name)].into(),
+    };
+    let matching = cli
+        .list_pod_sandbox_stats(ListPodSandboxStatsRequest {
+            filter: Some(filter.clone()),
+        })
+        .await?
+        .into_inner()
+        .stats;
+    ensure!(matching.len() == 1 && matching[0].attributes.as_ref().unwrap().id == pod);
+    ensure!(cli
+        .list_pod_sandbox_stats(ListPodSandboxStatsRequest {
+            filter: Some(PodSandboxStatsFilter {
+                id: other.into(),
+                ..filter
+            })
+        })
+        .await?
+        .into_inner()
+        .stats
+        .is_empty());
+    eprintln!("guest counters: busy CPU {busy_cpu}ns memory {busy_mem}B; idle CPU {idle_cpu}ns memory {idle_mem}B");
+    Ok(())
 }
 
 async fn scenario(
@@ -515,6 +691,7 @@ async fn scenario(
                 == format!("{boot_a}\n").as_bytes()
         );
     }
+    guest_stats(cli, &id, &other, &a, &b).await?;
     ensure!(
         exec(cli, &a, "/bin/busybox readlink /proc/self/ns/pid").await?
             != exec(cli, &b, "/bin/busybox readlink /proc/self/ns/pid").await?
@@ -700,11 +877,18 @@ async fn scenario(
     let detached = socket.with_file_name("detached-vsock.sock");
     fs::rename(&socket, &detached)?;
     let disconnected = exec(cli, &a, "echo unexpected").await;
+    let unavailable = container_usage(cli, &a).await;
+    let foreign_stats = cli
+        .pod_sandbox_stats(PodSandboxStatsRequest {
+            pod_sandbox_id: other.clone(),
+        })
+        .await;
     let observed = state(cli, &a).await;
     let listing = cli.list_containers(ListContainersRequest::default()).await;
     let other_boot = boot_id(cli, &other).await;
     fs::rename(&detached, &socket)?;
     ensure!(disconnected.is_err(), "exec accepted a disconnected guest");
+    ensure!(unavailable.is_err() && foreign_stats?.into_inner().stats.is_some());
     ensure!(other_boot? == boot_b);
     ensure!(observed?.state() == ContainerState::ContainerUnknown);
     ensure!(listing?

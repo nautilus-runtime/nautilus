@@ -84,10 +84,12 @@ sudo --preserve-env=KUBECONFIG python3 tests/kubelet_vm_acceptance.py \
   --ipam-dir /var/lib/cni/networks/nautilus
 ```
 
+要验证 kubelet 的实际采样源，在该测试节点的 KubeletConfiguration 中设置 `featureGates.PodAndContainerStatsFromCRI: true`，并在上面的命令追加 `--kubelet-stats`。脚本经 API server 访问 `/api/v1/nodes/<node>/proxy/stats/summary`，核对两个 VM Pod 和三个容器的 CPU、工作集，并比较分别加载和休眠的容器内存。执行者需有读取节点 proxy 的权限。[Kubernetes 节点指标来源](https://kubernetes.io/docs/reference/instrumentation/node-metrics/)
+
 ## 已验证的行为与范围
 
 真实 kubelet 验收使用 Kubernetes v1.37.2 和 Cloud Hypervisor v55.0。两个 VM Pod 中共有三个容器，验证了跨 Pod HTTP、真实退出码、连接原 init 的 attach、guest 回环端口转发、CRI 日志，以及 daemon 重启后 boot ID、Pod IP 和容器身份保持。WASI 和默认 OCI 后端另行回归。[CRI 回归结果](CRITEST_RESULTS.md)
 
 - 受信任的节点 CRI 调用方可以指定任意宿主普通文件或目录。每个 Pod 单独导出被请求的挂载，支持只读或读写。Kubernetes 的准入策略决定哪些 Pod 可以使用 hostPath。ConfigMap 通过 AtomicWriter 切换后，在 guest 中重新打开文件可读到新值。应用若依赖 inotify，需要单独验证通知语义。[卷交付](VM_RUNTIME.md)
-- 首版支持私有 PID namespace、Pod 网络和 IPC，以及创建时的 Linux CPU / 内存约束。资源热更新和 guest CPU / 内存用量统计目前未开放。节点上的 VMM cgroup 可用来核实整台 VM 的资源约束。[资源契约](CRI_VM_CONTRACT.md)
+- 首版支持私有 PID namespace、Pod 网络和 IPC，以及创建时的 Linux CPU / 内存约束。使用带统计支持的工作负载 initramfs 时，`crictl stats` 和 `crictl statsp` 返回 guest 内容器与 Pod 工作负载的 CPU 和内存用量。资源热更新尚未开放。节点上的 VMM cgroup 可用来核实整台 VM 的资源约束。[资源契约](CRI_VM_CONTRACT.md)
 - pro6000 上的验收覆盖 CPU 工作负载。GPU 直通、快照和迁移分别需要额外的 VMM 设备与生命周期支持。

@@ -1,3 +1,5 @@
+mod stats;
+
 use crate::cri::version;
 use crate::core::{Config, StateManager};
 use crate::runtime::{ContainerManager, PodManager};
@@ -299,7 +301,9 @@ impl NautilusRuntimeService {
             .ok_or_else(|| Status::not_found(format!("container {} not found", container_id)))?;
 
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        if c.sandbox_kind == "vm" { return Err(Status::unimplemented("guest container metrics unavailable")); }
+        if c.sandbox_kind == "vm" {
+            return self.guest_container_stats(&c).await;
+        }
         let (cpu_ns, mem_bytes) = match c.pid {
             Some(pid) if pid > 0 => {
                 let stat = tokio::fs::read_to_string(format!("/proc/{}/stat", pid))
@@ -327,15 +331,7 @@ impl NautilusRuntimeService {
         };
 
         Ok(rt::ContainerStats {
-            attributes: Some(rt::ContainerAttributes {
-                id: c.id.clone(),
-                metadata: Some(rt::ContainerMetadata {
-                    name: c.name.clone(),
-                    attempt: c.attempt,
-                }),
-                labels: c.labels.clone(),
-                annotations: c.annotations.clone(),
-            }),
+            attributes: Some(stats::container_attributes(&c)),
             cpu: Some(rt::CpuUsage {
                 timestamp: now,
                 usage_core_nano_seconds: Some(rt::UInt64Value { value: cpu_ns }),
@@ -373,7 +369,7 @@ impl NautilusRuntimeService {
             .ok_or_else(|| Status::not_found(format!("pod {} not found", pod_id)))?;
 
         if pod.runtime_handler == "vm" {
-            return Err(Status::unimplemented("guest Pod metrics unavailable"));
+            return self.guest_pod_stats(&pod).await;
         }
 
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -397,17 +393,7 @@ impl NautilusRuntimeService {
         }
 
         Ok(rt::PodSandboxStats {
-            attributes: Some(rt::PodSandboxAttributes {
-                id: pod.id.clone(),
-                metadata: Some(rt::PodSandboxMetadata {
-                    name: pod.name.clone(),
-                    uid: pod.uid.clone(),
-                    namespace: pod.namespace.clone(),
-                    attempt: pod.attempt,
-                }),
-                labels: pod.labels,
-                annotations: pod.annotations,
-            }),
+            attributes: Some(stats::pod_attributes(&pod)),
             linux: Some(rt::LinuxPodSandboxStats {
                 cpu: Some(rt::CpuUsage {
                     timestamp: now,
@@ -1538,26 +1524,16 @@ impl RuntimeService for NautilusRuntimeService {
             .await
             .map_err(Status::from)?;
 
-        let mut stats = Vec::new();
-        for c in containers {
-            if !filter.id.is_empty() && c.id != filter.id {
-                continue;
-            }
-            if !filter.pod_sandbox_id.is_empty() && c.pod_id != filter.pod_sandbox_id {
-                continue;
-            }
-            if !filter.label_selector.is_empty()
-                && !filter.label_selector.iter().all(|(k, v)| c.labels.get(k) == Some(v))
-            {
-                continue;
-            }
-            // Skip containers whose process already exited; stats are
-            // point-in-time samples of live workloads.
-            if let Ok(s) = self.stats_response(&c.id).await {
-                stats.push(s);
-            }
-        }
-
+        let matches = containers.into_iter().filter(|c| {
+            (filter.id.is_empty() || filter.id == c.id)
+                && (filter.pod_sandbox_id.is_empty() || filter.pod_sandbox_id == c.pod_id)
+                && filter.label_selector.iter().all(|(k, v)| c.labels.get(k) == Some(v))
+        });
+        let stats = futures::stream::iter(matches)
+            .map(|c| async move { self.stats_response(&c.id).await.ok() })
+            .buffered(8)
+            .filter_map(std::future::ready)
+            .collect().await;
         Ok(Response::new(ListContainerStatsResponse { stats }))
     }
 
@@ -1628,15 +1604,19 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn list_pod_sandbox_stats(
         &self,
-        _request: Request<ListPodSandboxStatsRequest>,
+        request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
+        let filter = request.into_inner().filter.unwrap_or_default();
         let pods = self.pod_manager.list_pods().await.map_err(Status::from)?;
-        let mut stats = Vec::new();
-        for p in pods {
-            if let Ok(s) = self.pod_stats_response(&p.id).await {
-                stats.push(s);
-            }
-        }
+        let matches = pods.into_iter().filter(|p| {
+            (filter.id.is_empty() || filter.id == p.id)
+                && filter.label_selector.iter().all(|(k, v)| p.labels.get(k) == Some(v))
+        });
+        let stats = futures::stream::iter(matches)
+            .map(|p| async move { self.pod_stats_response(&p.id).await.ok() })
+            .buffered(8)
+            .filter_map(std::future::ready)
+            .collect().await;
         Ok(Response::new(ListPodSandboxStatsResponse { stats }))
     }
 

@@ -34,6 +34,7 @@ type container struct {
 	waitErr          error
 	id, dir          string
 	s                status
+	cpu              cpuHistory
 	p                process
 	pidfd            int
 	done             chan struct{}
@@ -240,7 +241,7 @@ func (c *container) stop(grace time.Duration) error {
 func (s *server) dispatch(ctx context.Context, q request) response {
 	useExec, useStop, readLog := q.Op == "exec", q.Op == "stop", q.Op == "readLog"
 	switch q.Op {
-	case "create", "start", "status", "exec", "stop", "remove", "readLog":
+	case "create", "start", "status", "exec", "stop", "remove", "readLog", "stats", "podStats":
 	default:
 		return fail("invalid", "unknown operation")
 	}
@@ -248,6 +249,9 @@ func (s *server) dispatch(ctx context.Context, q request) response {
 		(q.Timeout != nil && ((!useExec && !useStop) || *q.Timeout < 0 || *q.Timeout > 300000)) ||
 		(readLog && (q.Offset == nil || *q.Offset < 0 || q.Limit == nil || *q.Limit < 1 || *q.Limit > maxOutput)) || (!readLog && (q.Offset != nil || q.Limit != nil)) {
 		return fail("invalid", "invalid operation arguments")
+	}
+	if q.Op == "podStats" {
+		return s.podStats()
 	}
 	s.mu.Lock()
 	c := s.containers[q.Container]
@@ -307,6 +311,15 @@ func (s *server) dispatch(ctx context.Context, q request) response {
 		return fail("runtime", c.waitErr)
 	}
 	switch q.Op {
+	case "stats":
+		if current.State != "running" {
+			return fail("conflict", "container is not running")
+		}
+		data, err := c.sample()
+		if err != nil {
+			return fail("unavailable", err)
+		}
+		return response{OK: true, Stats: &data}
 	case "start":
 		if current.Started != 0 {
 			break
