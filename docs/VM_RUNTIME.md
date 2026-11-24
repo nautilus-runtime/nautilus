@@ -71,9 +71,9 @@ cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
 
 ### Pod 的初始资源
 
-`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。资源热更新返回 CRI `Unimplemented`。
+`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。目前接受 systemd slice 名或对应层级路径，cgroupfs 布局的父路径会在分配前返回错误。kubelet 的 cgroup 驱动发现与节点配置在 #16 验收。资源热更新返回 CRI `Unimplemented`。
 
-可使用 `tests/vm_resources_test.rs` 的真实 KVM 用例检查 VMM 配置及所在 cgroup。Linux 5.15.0-191、systemd 249、Cloud Hypervisor v54.1 上，1.5 CPU、448 MiB 内存加 0.1 CPU、64 MiB 开销，实测得到 2 个 vCPU、448 MiB guest RAM、`cpu.max=160000 100000` 和 `memory.max=536870912`。
+使用 `bash guest/pack-initramfs.sh tests/fixtures/vm_resources_init.c /tmp/resources.cpio.gz` 构建资源测试 guest。将 `NAUTILUS_VM_RESOURCE_TEST_INITRAMFS` 指向该镜像后执行 `cargo test --locked --test vm_resources_test -- --ignored`，同时设置 VMM 和内核路径。guest 会核对在线 CPU 和可用物理内存，宿主测试会检查 VMM 配置及所在 cgroup。Linux 5.15.0-191、systemd 249、Cloud Hypervisor v54.1 上，1.5 CPU、448 MiB 内存加 0.1 CPU、64 MiB 开销，实测得到 2 个 vCPU、448 MiB guest RAM、`cpu.max=160000 100000` 和 `memory.max=536870912`。
 
 ## 节点探针
 

@@ -17,7 +17,7 @@ async fn pod_limits_reach_vmm_and_kernel() -> Result<()> {
         virtiofsd: None,
         vmm: std::env::var("NAUTILUS_VM_VMM")?.into(),
         kernel: std::env::var("NAUTILUS_VM_KERNEL")?.into(),
-        initramfs: std::env::var("NAUTILUS_VM_INITRAMFS")?.into(),
+        initramfs: std::env::var("NAUTILUS_VM_RESOURCE_TEST_INITRAMFS")?.into(),
     };
     let linux = LinuxPodSandboxConfig {
         cgroup_parent: "/system.slice".into(),
@@ -55,7 +55,7 @@ async fn pod_limits_reach_vmm_and_kernel() -> Result<()> {
         ensure!(group.starts_with("system.slice/"));
         let group = Path::new("/sys/fs/cgroup").join(group);
         for (name, expected) in [
-            ("cpu.weight", "39"),
+            ("cpu.weight", "100"),
             ("cpu.max", "160000 100000"),
             ("memory.max", "536870912"),
         ] {

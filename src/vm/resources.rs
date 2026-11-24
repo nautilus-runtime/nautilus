@@ -144,7 +144,19 @@ impl VmResources {
         }
         if work.cpu_shares > 0 || overhead.cpu_shares > 0 {
             let shares = (work.cpu_shares + overhead.cpu_shares).clamp(2, 262_144) as u64;
-            plan.weight = Some(1 + (shares - 2) * 9999 / 262142);
+            // Same conversion as Kubernetes v1.37.2's vendored
+            // opencontainers/cgroups ConvertCPUSharesToCgroupV2Value.
+            plan.weight = Some(match shares {
+                2 => 1,
+                1024 => 100,
+                262_144 => 10_000,
+                _ => {
+                    let log = (shares as f64).log2();
+                    10_f64
+                        .powf((log * log + 125.0 * log) / 612.0 - 7.0 / 34.0)
+                        .ceil() as u64
+                }
+            });
         }
         if work.cpu_quota > 0 {
             let period = if work.cpu_period == 0 {
@@ -232,7 +244,7 @@ mod tests {
         assert_eq!(
             plan.systemd_properties(),
             [
-                "CPUWeight=39",
+                "CPUWeight=100",
                 "CPUQuota=135.00%",
                 "CPUQuotaPeriodSec=100000us",
                 "MemoryMax=603979776"
