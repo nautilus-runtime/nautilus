@@ -50,7 +50,14 @@ type cpu struct {
 type memory struct {
 	Limit *int64 `json:"limit,omitempty"`
 }
+type hugepage struct {
+	PageSize string `json:"pageSize"`
+	Limit    uint64 `json:"limit"`
+}
 type resources struct {
+	Unified   map[string]string `json:"unified,omitempty"`
+	Hugepages []hugepage        `json:"hugepageLimits,omitempty"`
+
 	CPU    *cpu    `json:"cpu,omitempty"`
 	Memory *memory `json:"memory,omitempty"`
 }
@@ -260,6 +267,18 @@ func prepare(id, private string) (process, error) {
 		"readonlyPaths": append([]string{"/proc/sys", "/proc/bus", "/proc/fs", "/proc/irq", "/proc/asound"}, s.Linux.ReadonlyPaths...)}
 	r := map[string]any{"devices": []map[string]any{{"allow": false, "access": "rwm"}}}
 	if s.Linux.Resources != nil {
+		for key, val := range s.Linux.Resources.Unified {
+			if !(key == "memory.oom.group" && val == "1" || key == "memory.swap.max" && val == "0") {
+				return s.Process, errors.New("unsupported unified cgroup control")
+			}
+		}
+		r["unified"] = s.Linux.Resources.Unified
+		for _, p := range s.Linux.Resources.Hugepages {
+			if (p.PageSize != "2MB" && p.PageSize != "1GB") || p.Limit != 0 {
+				return s.Process, errors.New("unsupported guest hugepage limit")
+			}
+		}
+		r["hugepageLimits"] = s.Linux.Resources.Hugepages
 		if c := s.Linux.Resources.CPU; c != nil {
 			if (c.Shares != nil && (*c.Shares < 2 || *c.Shares > 262144)) || (c.Period != nil && (*c.Period < 1000 || *c.Period > 1000000)) || (c.Quota != nil && *c.Quota != -1 && *c.Quota < 1000) {
 				return s.Process, errors.New("invalid cpu resources")

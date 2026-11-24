@@ -51,6 +51,10 @@ pub struct ResourceLimits {
     pub memory_limit_in_bytes: i64,
     #[serde(default)]
     pub oom_score_adj: i32,
+    #[serde(default)]
+    pub guest_unified: HashMap<String, String>,
+    #[serde(default)]
+    pub guest_no_hugepages: Vec<String>,
 }
 
 /// Per-container security knobs from CRI LinuxContainerSecurityContext.
