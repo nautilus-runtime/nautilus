@@ -4,6 +4,14 @@
 - 测试工具为 kubernetes-sigs/cri-tools 的 `critest v1.31.1`。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-24 Pod VM 生命周期
+
+PR #10 的生产代码提交为 `af327ce`。用 Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主验证，再用 v55.0 在同机的 Linux 6.12.118、systemd 257 嵌套 KVM 节点复验。每轮启动两个实验性 Pod VM，再通过真实 daemon 的 CRI socket 验证 guest boot ID、强制终止并重启 daemon、并发及重复 Stop/Remove、意外退出后的清理。[实验范围与运行命令](VM_RUNTIME.md#首版使用系统级-systemd-托管-vmm)
+
+在同一嵌套节点上将 runtime 和 image endpoint 都指向隔离 daemon 的 Unix socket，运行未过滤的 critest v1.31.1。首轮冷缓存为 **95 通过、1 失败、17 跳过**，失败发生在 port-forward 用例从 GCR 拉取 nginx 镜像层时，尚未创建容器。恢复测试代理、预置 31 个按 SHA-256 核验的官方压缩层后，用全新的状态目录重跑整套，结果为 **96 通过、0 失败、17 跳过**，耗时 239.851 秒，退出码 0。17 项跳过包括 user namespace 6 项、递归只读挂载 4 项、SupplementalGroupsPolicy 2 项及默认关闭的 benchmark 5 项。该套件检验默认运行时，VM 行为另由上述双 Pod 验收覆盖。
+
+在独立 Linux 网络命名空间以单测试线程执行 `cargo test --locked --offline`，84 项通过，3 项默认忽略。真实 VM 测试另行执行通过。额外执行两项默认忽略的 OverlayFS 测试，其中重新挂载视图的测试在本次提交和基线 `32d26c0` 上均读回了底层文件内容。两版的全库格式检查均涉及相同的 31 个文件，Clippy 均报告相同的 29 条诊断。
+
 ## 2026-11-24 拉取阶段解包
 
 版本 `4666bb5` 通过 28 项库测试，包括解包失败后的重试、拉取日志恢复、快照复用、退役和延迟卸载。critest v1.31.1 运行镜像管理与 RemoveImage 幂等性相关的 9 项用例，9 项通过，其余 104 项未选中。独立 CRI 检查还验证了拉取超时后的四路重试和关闭 OverlayFS 后的完整生命周期。见[启动性能和测试边界](PERFORMANCE.md)。

@@ -46,6 +46,8 @@ NAUTILUS_VM_INITRAMFS=/opt/nautilus/guest/agent.cpio.gz \
 cargo test --locked --test vm_pod_lifecycle_test -- --include-ignored --nocapture
 ```
 
+在 Linux 5.15.0-191 + Cloud Hypervisor v54.1 和 Linux 6.12.118 + v55.0 两种宿主上，已用提交 `af327ce` 跑通上述生命周期测试。通过 PodManager 创建两台 VM，再从真实 `nautilusd` 的 CRI socket 核对两个 boot ID。强制终止和重启 daemon 后，两个 ID 均保持一致。并发停止、删除第一个 Pod 后，第二台 VM 仍可访问；独立关闭第二个 VMM 后，CRI 观察到退出，重复删除回收了私有目录和端点。运行时与镜像服务的回归结果见 [CRI 验证记录](CRITEST_RESULTS.md)。
+
 ## 节点探针
 
 本地执行 `nautilus vm probe` 会启动一台使用 1 个 vCPU、384 MiB 内存的临时 VM，经 guest 端口 4081 交换 `PING 1` 和 `PONG 1`，然后回收子进程和 socket。它可以在 nautilusd 启动之前运行。测试 guest 仅应答就绪请求，无网络、持久磁盘或执行任意命令的接口。
