@@ -3,6 +3,8 @@
 #[cfg(target_os = "linux")]
 pub mod owner;
 
+pub mod resources;
+
 pub mod guest;
 
 use std::io::{self, ErrorKind};

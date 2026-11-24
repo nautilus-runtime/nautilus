@@ -114,6 +114,14 @@ impl PodManager {
 
     /// The CRI caller keeps the same guard across network allocation and publication.
     pub(crate) async fn start_pod_locked(&self, pod_id: &str) -> Result<()> {
+        self.start_pod_with_resources_locked(pod_id, &crate::vm::resources::VmResources::default()).await
+    }
+
+    pub(crate) async fn start_pod_with_resources_locked(
+        &self,
+        pod_id: &str,
+        resources: &crate::vm::resources::VmResources,
+    ) -> Result<()> {
         let mut pod_state = self.get_pod_state(pod_id).await?
             .ok_or_else(|| Error::Pod(format!("Pod {} not found", pod_id)))?;
 
@@ -128,7 +136,7 @@ impl PodManager {
             let store = self.vm_store();
             let start = match &self.config.runtime.sandboxes.vm {
                 Some(images) => store
-                    .start_configured(pod_id, images)
+                    .start_with_resources(pod_id, images, resources)
                     .await
                     .map_err(Error::from),
                 None => Err(Error::Config("Pod VM images are not configured".into())),

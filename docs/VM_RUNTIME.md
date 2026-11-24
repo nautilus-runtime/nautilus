@@ -69,6 +69,12 @@ cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
 
 2026-11-24 在 x86_64 Linux 5.15.0-191、Cloud Hypervisor v54.1、virtiofsd 1.13.2 上运行了该测试。两个 guest 同时使用 `podfs`，各自读到本 Pod 的随机标记并回写自己的 boot ID，另一个 Pod 的目录返回 ENOENT。通过 CRI 验证了 nautilusd 被 SIGKILL 后的接管、单个 virtiofsd 意外退出、另一个 VMM 退出和重复 Stop/Remove。缺失 virtiofsd、virtiofsd 启动即退出、VMM 启动即退出均完成回滚。另起未配置 virtiofsd 的两个 Pod 也完成了原身份测试。
 
+### Pod 的初始资源
+
+`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。资源热更新返回 CRI `Unimplemented`。
+
+可使用 `tests/vm_resources_test.rs` 的真实 KVM 用例检查 VMM 配置及所在 cgroup。Linux 5.15.0-191、systemd 249、Cloud Hypervisor v54.1 上，1.5 CPU、448 MiB 内存加 0.1 CPU、64 MiB 开销，实测得到 2 个 vCPU、448 MiB guest RAM、`cpu.max=160000 100000` 和 `memory.max=536870912`。
+
 ## 节点探针
 
 本地执行 `nautilus vm probe` 会启动一台使用 1 个 vCPU、384 MiB 内存的临时 VM，经 guest 端口 4081 交换 `PING 1` 和 `PONG 1`，然后回收子进程和 socket。它可以在 nautilusd 启动之前运行。测试 guest 仅应答就绪请求，无网络、持久磁盘或执行任意命令的接口。
@@ -95,5 +101,18 @@ nautilus vm probe --vmm /opt/cloud-hypervisor/bin/cloud-hypervisor \
 | [#4 guest 内 OCI 容器](https://github.com/nautilus-runtime/nautilus/issues/4) | #3 | 同一 VM 两个 OCI 容器分别创建、启动、执行与停止；十次调用保持工作区并正确返回退出码和日志。 |
 | [#5 Pod 网络与资源](https://github.com/nautilus-runtime/nautilus/issues/5) | #3 | CNI、TAP、Pod IP、DNS 及资源约束可观察；网络失败、资源申请失败和删除重试释放全部资源。 |
 | [#6 对 kubelet 开放 vm](https://github.com/nautilus-runtime/nautilus/issues/6) | #4、#5 | 启用后通过 CRI 发现 handler；真实 kubelet 验证 RuntimeClass、容器与流式操作、重启恢复和资源清理；复测原有 handler。 |
+
+### 可并行开发的子任务
+
+| 子任务 | 输入依赖 | 验收入口 |
+| --- | --- | --- |
+| [#11 每个 Pod 独立 virtiofsd](https://github.com/nautilus-runtime/nautilus/issues/11) | #3 | 两台 VM 的导出目录隔离，启动失败和 daemon 重启后可回收。 |
+| [#12 guest OCI 管理](https://github.com/nautilus-runtime/nautilus/issues/12) | guest 身份协议 | 真实 guest 内管理两个容器，验证十次 exec、日志和退出状态。 |
+| [#13 CNI、TAP 和 guest 网络](https://github.com/nautilus-runtime/nautilus/issues/13) | #3 | 从 guest 验证对端、DNS、Pod IP 和失败回收。 |
+| [#14 Pod CPU 和内存](https://github.com/nautilus-runtime/nautilus/issues/14) | #3 | 对照 VMM 启动配置和宿主内核的 cgroup 限制。 |
+| [#15 CRI 容器生命周期](https://github.com/nautilus-runtime/nautilus/issues/15) | #11、#12 | 经真实 daemon socket 运行 OCI 镜像，验证状态、工作区、日志和恢复。 |
+| [#16 RuntimeClass 与 kubelet](https://github.com/nautilus-runtime/nautilus/issues/16) | #13、#14、#15 | 经真实 kubelet 验证调度、流式操作与清理，运行完整 critest。 |
+
+首版使用每个 Pod 专属的 virtiofsd 导出容器 bundle。宿主复用 Nautilus 拉取的 OCI 镜像，为每个容器准备独立 rootfs。对 CRI 卷只开放已能兑现权限、读写和传播语义的类型。Kata 4.4.0 的 Cloud Hypervisor 配置也默认使用 virtio-fs，并为块设备 snapshotter 提供单独的接入路径。[Kata Go runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/Makefile#L266-L267) · [Kata Rust runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime-rs/Makefile#L240) · [Kata 存储设计](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture/storage.md)
 
 首版范围为 Linux CPU 工作负载。GPU 直通、跨主机迁移和 VM 快照需要独立的资源与一致性设计。Firecracker 和 Dragonball 保留为后续 VMM 候选。工作负载兼容性由 CRI 验收结果决定，节点探针与性能测量单独记录。
