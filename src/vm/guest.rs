@@ -67,6 +67,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_guest_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vm.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut input = String::new();
+            stream.read_line(&mut input).await.unwrap();
+            stream.get_mut().write_all(b"OK 10000\n").await.unwrap();
+            input.clear();
+            stream.read_line(&mut input).await.unwrap();
+            assert_eq!(input, "IDENTIFY 1\n");
+            input.clear();
+            assert_eq!(stream.read_line(&mut input).await.unwrap(), 0);
+        };
+        let check = async { tokio::join!(peer, identify(&path, POD, NONCE)).1 };
+        let err = tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("the caller must bound an unanswered query")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
     async fn verifies_guest_startup_identity_before_returning_boot_id() {
         let reply = format!("IDENTITY 1 {POD} {NONCE} {BOOT}\n");
         assert_eq!(peer(&reply).await.unwrap(), BOOT);
