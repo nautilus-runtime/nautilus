@@ -1,5 +1,6 @@
 /* Linux PID 1 for a Nautilus Pod VM. */
 #include <stdbool.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -115,6 +116,25 @@ int main(void)
     if (!make_identity(response, sizeof(response))) {
         fputs("invalid guest boot identity\n", stderr);
         return EXIT_FAILURE;
+    }
+    /* The identity-only image can boot without a filesystem export. */
+    if (access("/bin/nautilus-agent", X_OK) == 0) {
+        char sandbox[37], nonce[37], boot[37];
+        if (sscanf(response, "IDENTITY 1 %36s %36s %36s", sandbox, nonce, boot) != 3)
+            return EXIT_FAILURE;
+        /* Reap orphaned workload descendants after the agent has exited. */
+        signal(SIGCHLD, SIG_IGN);
+        pid_t child = fork();
+        if (child == 0) {
+            signal(SIGCHLD, SIG_DFL);
+            execl("/bin/nautilus-agent", "nautilus-agent", sandbox, nonce, boot, (char *)NULL);
+            perror("exec nautilus-agent");
+            _exit(1);
+        }
+        if (child < 0) {
+            perror("fork nautilus-agent");
+            return EXIT_FAILURE;
+        }
     }
     int server = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_vm addr = {

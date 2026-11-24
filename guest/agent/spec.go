@@ -1,0 +1,239 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"golang.org/x/sys/unix"
+)
+
+type user struct {
+	UID    uint32   `json:"uid"`
+	GID    uint32   `json:"gid"`
+	Groups []uint32 `json:"additionalGids,omitempty"`
+}
+type process struct {
+	Terminal bool                `json:"terminal"`
+	User     *user               `json:"user"`
+	Args     []string            `json:"args"`
+	Env      []string            `json:"env"`
+	Cwd      string              `json:"cwd"`
+	Caps     map[string][]string `json:"capabilities"`
+	NNP      bool                `json:"noNewPrivileges"`
+}
+type root struct {
+	Path     string `json:"path"`
+	Readonly bool   `json:"readonly"`
+}
+type mountSpec struct {
+	Type        string   `json:"type"`
+	Source      string   `json:"source"`
+	Destination string   `json:"destination"`
+	Options     []string `json:"options"`
+}
+type namespace struct {
+	Type string `json:"type"`
+}
+type cpu struct {
+	Shares *uint64 `json:"shares,omitempty"`
+	Quota  *int64  `json:"quota,omitempty"`
+	Period *uint64 `json:"period,omitempty"`
+}
+type memory struct {
+	Limit *int64 `json:"limit,omitempty"`
+}
+type resources struct {
+	CPU    *cpu    `json:"cpu,omitempty"`
+	Memory *memory `json:"memory,omitempty"`
+}
+type linuxSpec struct {
+	Namespaces []namespace `json:"namespaces"`
+	Resources  *resources  `json:"resources,omitempty"`
+}
+type spec struct {
+	Version string      `json:"ociVersion"`
+	Root    root        `json:"root"`
+	Process process     `json:"process"`
+	Linux   linuxSpec   `json:"linux"`
+	Mounts  []mountSpec `json:"mounts,omitempty"`
+}
+
+func absolute(s string) bool {
+	return filepath.IsAbs(s) && filepath.Clean(s) == s && !strings.ContainsRune(s, 0)
+}
+func validArgv(a []string) bool {
+	if len(a) == 0 || len(a) > 256 || a[0] == "" {
+		return false
+	}
+	for _, v := range a {
+		if strings.ContainsRune(v, 0) {
+			return false
+		}
+	}
+	return true
+}
+func secureExport(path string, dirOnly bool) error {
+	actual, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	if actual != path {
+		return errors.New("symlink in export selector")
+	}
+	var st unix.Stat_t
+	if err = unix.Lstat(path, &st); err != nil {
+		return err
+	}
+	typ := st.Mode & unix.S_IFMT
+	if st.Uid != 0 || (typ != unix.S_IFDIR && (dirOnly || typ != unix.S_IFREG || st.Nlink != 1)) {
+		return errors.New("invalid export owner or type")
+	}
+	return nil
+}
+
+// The host publishes the bundle before create. No workload can mutate its rootfs
+// yet. Reject symlinks along mount targets so aliases cannot shadow reserved mounts.
+func checkTarget(root, target string) error {
+	for current := filepath.Join(root, target); current != root; current = filepath.Dir(current) {
+		st, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink in mount target %s", target)
+		}
+	}
+	return nil
+}
+
+func prepare(id, private string) (process, error) {
+	var s spec
+	bundle := filepath.Join(share, "containers", id)
+	if err := secureExport(bundle, true); err != nil {
+		return s.Process, err
+	}
+	config := filepath.Join(bundle, "config.json")
+	if err := secureExport(config, false); err != nil {
+		return s.Process, err
+	}
+	f, err := os.Open(config)
+	if err != nil {
+		return s.Process, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, (256<<10)+1))
+	if err != nil || len(b) > 256<<10 {
+		return s.Process, errors.New("invalid config size")
+	}
+	if err = strictJSON(b, &s); err != nil {
+		return s.Process, err
+	}
+	if (s.Version != "1.0.2" && s.Version != "1.1.0" && s.Version != "1.2.0") || s.Root.Path != "rootfs" || !validArgv(s.Process.Args) || s.Process.User == nil || s.Process.Terminal || !s.Process.NNP || !absolute(s.Process.Cwd) {
+		return s.Process, errors.New("unsupported OCI process, root, or version")
+	}
+	for _, v := range s.Process.Env {
+		name, _, ok := strings.Cut(v, "=")
+		if !ok || name == "" || strings.ContainsRune(v, 0) {
+			return s.Process, errors.New("invalid process env")
+		}
+	}
+	for k, v := range s.Process.Caps {
+		if len(v) > 0 || (k != "bounding" && k != "effective" && k != "inheritable" && k != "permitted" && k != "ambient") {
+			return s.Process, errors.New("only empty capabilities supported")
+		}
+	}
+	s.Process.Caps = map[string][]string{"bounding": {}, "effective": {}, "inheritable": {}, "permitted": {}, "ambient": {}}
+	ns := map[string]bool{}
+	for _, n := range s.Linux.Namespaces {
+		if ns[n.Type] || (n.Type != "mount" && n.Type != "pid" && n.Type != "ipc" && n.Type != "uts") {
+			return s.Process, errors.New("unsupported namespace")
+		}
+		ns[n.Type] = true
+	}
+	if !ns["mount"] || !ns["pid"] {
+		return s.Process, errors.New("private mount and PID namespaces required")
+	}
+	s.Root.Path = filepath.Join(bundle, "rootfs")
+	if err = secureExport(s.Root.Path, true); err != nil {
+		return s.Process, err
+	}
+	destinations := map[string]bool{}
+	mounts := []mountSpec{
+		{"proc", "proc", "/proc", []string{"nosuid", "nodev", "noexec"}},
+		{"tmpfs", "tmpfs", "/dev", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{"mqueue", "mqueue", "/dev/mqueue", []string{"nosuid", "nodev", "noexec"}},
+	}
+	if ns["ipc"] {
+		mounts = append(mounts, mountSpec{"tmpfs", "shm", "/dev/shm", []string{"nosuid", "nodev", "noexec", "mode=1777", "size=65536k"}})
+	} else {
+		mounts = append(mounts, mountSpec{"bind", "/run/nautilus/shm", "/dev/shm", []string{"bind", "nosuid", "nodev", "noexec"}})
+	}
+	for _, m := range s.Mounts {
+		sub, ok := strings.CutPrefix(m.Source, "volumes/")
+		if !ok || !validID(sub) || m.Type != "bind" || !absolute(m.Destination) || m.Destination == "/" || destinations[m.Destination] || len(m.Options) != 2 || m.Options[0] != "bind" || (m.Options[1] != "ro" && m.Options[1] != "rw") {
+			return s.Process, errors.New("invalid volume mount")
+		}
+		for _, reserved := range []string{"/proc", "/sys", "/dev"} {
+			if m.Destination == reserved || strings.HasPrefix(m.Destination, reserved+"/") {
+				return s.Process, errors.New("reserved mount target")
+			}
+		}
+		destinations[m.Destination] = true
+		m.Source = filepath.Join(share, m.Source)
+		if err = secureExport(m.Source, false); err != nil {
+			return s.Process, err
+		}
+		m.Options = append(m.Options, "nosuid", "nodev", "noexec")
+		mounts = append(mounts, m)
+	}
+	if !destinations["/etc/resolv.conf"] {
+		if _, err := os.Stat("/etc/resolv.conf"); err == nil {
+			mounts = append(mounts, mountSpec{"bind", "/etc/resolv.conf", "/etc/resolv.conf", []string{"bind", "ro", "nodev", "noexec", "nosuid"}})
+		}
+	}
+	for _, m := range mounts {
+		if err := checkTarget(s.Root.Path, m.Destination); err != nil {
+			return s.Process, err
+		}
+	}
+	s.Mounts = mounts
+	// Runtime-owned fields never come from the exported OCI input.
+	linux := map[string]any{"namespaces": s.Linux.Namespaces, "cgroupsPath": "/nautilus/" + id,
+		"maskedPaths":   []string{"/proc/cmdline", "/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/sysrq-trigger"},
+		"readonlyPaths": []string{"/proc/sys", "/proc/bus", "/proc/fs", "/proc/irq", "/proc/asound"}}
+	r := map[string]any{"devices": []map[string]any{{"allow": false, "access": "rwm"}}}
+	if s.Linux.Resources != nil {
+		if c := s.Linux.Resources.CPU; c != nil {
+			if (c.Shares != nil && (*c.Shares < 2 || *c.Shares > 262144)) || (c.Period != nil && (*c.Period < 1000 || *c.Period > 1000000)) || (c.Quota != nil && *c.Quota != -1 && *c.Quota < 1000) {
+				return s.Process, errors.New("invalid cpu resources")
+			}
+			r["cpu"] = c
+		}
+		if m := s.Linux.Resources.Memory; m != nil {
+			if m.Limit != nil && *m.Limit != -1 && *m.Limit <= 0 {
+				return s.Process, errors.New("invalid memory limit")
+			}
+			r["memory"] = m
+		}
+	}
+	linux["resources"] = r
+	data, err := json.Marshal(map[string]any{"ociVersion": s.Version, "root": s.Root, "process": s.Process, "mounts": s.Mounts, "linux": linux})
+	if err != nil {
+		return s.Process, err
+	}
+	if err = os.Mkdir(private, 0700); err != nil {
+		return s.Process, err
+	}
+	if err = os.WriteFile(filepath.Join(private, "config.json"), data, 0600); err != nil {
+		return s.Process, fmt.Errorf("write private OCI bundle: %w", err)
+	}
+	return s.Process, nil
+}
