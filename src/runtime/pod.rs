@@ -6,12 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+mod vm;
+
 pub struct PodManager {
     config: Arc<Config>,
     state_manager: Arc<StateManager>,
     container_manager: Arc<ContainerManager>,
     pods: Arc<RwLock<HashMap<String, PodState>>>,
-    operations: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    operations: crate::runtime::OperationLocks,
 }
 
 impl PodManager {
@@ -31,17 +33,7 @@ impl PodManager {
 
     /// Serialize resource and membership changes for this sandbox across RPCs.
     pub async fn operation_guard(&self, pod_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut operations = self.operations.lock().unwrap();
-            operations.retain(|_, lock| lock.strong_count() > 0);
-            let slot = operations.entry(pod_id.to_owned()).or_default();
-            slot.upgrade().unwrap_or_else(|| {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                *slot = Arc::downgrade(&lock);
-                lock
-            })
-        };
-        lock.lock_owned().await
+        self.operations.lock(pod_id).await
     }
 
     /// Create a new pod
@@ -67,6 +59,7 @@ impl PodManager {
         let pod_id = StateManager::generate_pod_id();
 
         let pod_state = PodState {
+            vm_attempt: None,
             id: pod_id.clone(),
             namespace: namespace.to_string(),
             name: name.to_string(),
@@ -133,6 +126,9 @@ impl PodManager {
         }
 
         if pod_state.runtime_handler == "vm" {
+            if pod_state.vm_attempt.is_some() {
+                return Err(Error::Pod("managed VM must start through its CRI network reservation".into()));
+            }
             let store = self.vm_store();
             let start = match &self.config.runtime.sandboxes.vm {
                 Some(images) => store
@@ -179,6 +175,11 @@ impl PodManager {
         let mut pod_state = self.get_pod_state(pod_id).await?
             .ok_or_else(|| Error::Pod(format!("Pod {} not found", pod_id)))?;
 
+        if pod_state.vm_attempt.is_some() {
+            // Journal Stop before touching the VMM. A restart must continue
+            // this Stop even if the guest had remained reachable on disk.
+            self.mark_vm_stopping(&mut pod_state).await?;
+        }
         if pod_state.status != PodStatus::Running && pod_state.runtime_handler != "vm" {
             return Err(Error::Pod(format!(
                 "Pod {} is not running, current status: {:?}",
@@ -186,13 +187,37 @@ impl PodManager {
             )));
         }
 
+        let mut guest_lost = false;
         for container in self.container_manager.list_containers_in_pod(pod_id).await? {
-            if container.status == crate::core::state::ContainerStatus::Running {
-                self.container_manager.stop_container(&container.id, grace_period).await?;
+            // Guest Start or exit can precede the host status commit. Give the
+            // live guest a chance to reap every init and drain its final log.
+            let result = match &container.vm {
+                Some(vm) if vm.preparing => self.container_manager.remove_container(&container.id).await,
+                Some(vm) if !vm.logs_complete => self.container_manager.stop_container(&container.id, grace_period).await,
+                None if container.status == crate::core::state::ContainerStatus::Running =>
+                    self.container_manager.stop_container(&container.id, grace_period).await,
+                _ => continue,
+            };
+            if let Err(e) = result {
+                if pod_state.vm_attempt.is_none() || self.vm_store().workload_channel(pod_id).await.is_ok() {
+                    return Err(e);
+                }
+                // The guest agent is unreachable. The owned systemd unit
+                // remains the authoritative way to stop all its workloads.
+                guest_lost = true;
+                break;
             }
         }
         if pod_state.runtime_handler == "vm" {
             self.vm_store().remove(pod_id).await?;
+            if guest_lost {
+                self.container_manager.guest_pod_lost(pod_id).await?;
+            }
+            if pod_state.vm_attempt.is_some() {
+                crate::network::PodNet::new(self.config.clone()).teardown_vm(pod_id).await?;
+                pod_state.network_namespace = None;
+                pod_state.network_ip.clear();
+            }
         }
         pod_state.status = PodStatus::Succeeded;
 
@@ -228,6 +253,9 @@ impl PodManager {
         }
         if pod_state.runtime_handler == "vm" {
             self.vm_store().remove(pod_id).await?;
+            if pod_state.vm_attempt.is_some() {
+                crate::network::PodNet::new(self.config.clone()).teardown_vm(pod_id).await?;
+            }
         }
 
         // Remove from state manager
@@ -334,6 +362,9 @@ impl PodManager {
         store: &crate::vm::owner::PodVmStore,
         pod: &PodState,
     ) -> Result<()> {
+        if let Some(attempt) = &pod.vm_attempt {
+            return self.recover_managed_vm(store, pod, attempt).await;
+        }
         let status = match store.recover(&pod.id).await {
             Ok(Some(_)) => PodStatus::Pending,
             Ok(None) => PodStatus::Failed,

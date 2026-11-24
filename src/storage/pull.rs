@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Workload defaults extracted from the image config (typed).
 pub struct ImageWorkload {
+    pub image_id: String,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub env: Vec<String>,
@@ -256,6 +257,7 @@ impl CachedImage {
     fn workload(&self) -> ImageWorkload {
         let cfg = self.config.config.as_ref();
         ImageWorkload {
+            image_id: self.manifest.config.digest.clone(),
             entrypoint: cfg
                 .and_then(|c| c.entrypoint.clone())
                 .unwrap_or_default(),

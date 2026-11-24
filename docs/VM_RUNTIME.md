@@ -1,6 +1,6 @@
 # Pod 级虚机运行时
 
-设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。当前实现提供节点探针、自研 guest agent 的启动身份校验，以及实验性的 Pod VM 生命周期管理。面向 kubelet 的 handler 在完成容器、网络与恢复验收后启用。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
+设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。kubelet 的 RuntimeClass 发现、实时宿主卷和流式接口跟踪于 #16。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
 
 ## 所有权与协议
 
@@ -54,7 +54,9 @@ cargo test --locked --test vm_pod_lifecycle_test two_pods_survive_owner_restart 
 
 宿主在同一文件系统的私有目录准备目录型 OCI bundle，包括 `config.json` 和 `rootfs/`。调用 `PodVmStore::publish_bundle` 后，guest 可以在挂载点下的 `containers/<container-uuid>/` 访问它。宿主固定目录文件描述符、核对目录身份并以不可覆盖的原子重命名发布；`remove_bundle` 可以重复调用。数据目录归 Pod 所有，宿主创建后不解析 guest 可写目录内的链接来寻址宿主资源。
 
-目前导出支持宿主准备的普通目录。CRI 宿主卷需单独实现授权、只读属性和挂载回收，并在 virtiofsd 的挂载命名空间验证可见性；在此之前，VM 工作负载必须拒绝这些挂载请求。
+当前实现导出宿主准备的容器 bundle。[宿主卷交付 #21](https://github.com/nautilus-runtime/nautilus/issues/21) 接受受信任 CRI 调用方指定的任意宿主文件或目录。源路径由节点解析，guest 只收到当前 Pod 的不透明卷 ID。实现需验证只读约束、跨宿主和 guest 的实时更新以及清理后的源数据完整性。在卷交付验收前，VM handler 对 CRI 挂载请求返回错误。
+
+这个选择参考了两个稳定版本。Kata 4.4.0 的 Cloud Hypervisor 路径逐项 bind mount 到 sandbox 共享目录，只读卷先在私有挂载点设为只读，再交给 virtiofsd。Kata 对识别出的 ConfigMap 和 Secret 使用 `watchable-bind` 支持 guest 内的文件变更通知。Firecracker v1.18.0 的 drives 接口提供镜像文件或块设备，以整块盘为单位控制只读属性。Nautilus 的验收会分别检查普通文件内容更新、目录内文件替换以及投射卷通知。[Kata 文件共享](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/fs_share_linux.go#L428-L469) · [Kata 投射卷](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/container.go#L519-L548) · [Firecracker 块设备](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/block.md)
 
 恢复和状态查询核对两个服务的 InvocationID、端点和导出目录身份。Stop/Remove 先停止 VMM，再停止 virtiofsd 并回收数据。身份校验失败时保留记录供重试。系统级 systemd 和 KVM 节点可用以下命令运行双 guest 验证：
 
@@ -88,6 +90,18 @@ cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
 sudo --preserve-env=NAUTILUS_CNI_BIN_DIR,NAUTILUS_VM_VMM,NAUTILUS_VM_KERNEL,NAUTILUS_VM_INITRAMFS \
   unshare -mn --propagation private cargo test --locked --test vm_network_test -- --include-ignored --nocapture
 ```
+
+### 实验性 CRI Pod VM
+
+配置 `[runtime.sandboxes] vm_workloads_enabled = true` 以及 `[runtime.sandboxes.vm]` 的 VMM、kernel、工作负载 initramfs、virtiofsd 四个路径。默认关闭。显式发送 `RunPodSandbox(runtime_handler="vm")` 时，使用 bridge + host-local CNI、Pod 网络/IPC 和每容器私有 PID（`namespace_options.pid=CONTAINER`）。自定义 sysctl、hostPort、节点 namespace 和特定宿主安全配置会在分配资源前被拒绝。Pod 可指定 Linux hostname 和 DNS。
+
+守护进程确认本次启动的身份、完整网络配置和工作负载 agent 的 4083 握手后才发布 READY，并返回该次 attempt 的 Pod IP。运行中 guest 失联会反映在状态及列表；独立的身份探针仍用于旧的开发用 VM。停止时先回收 guest 容器和 VMM，再以已记录的 CNI 配置删除网络。中断的启动或停止可在 daemon 重启时继续清理。
+
+`tests/vm_pod_lifecycle_test.rs` 的 `cri_pod_network_survives_daemon_restart_and_releases_on_stop` 通过真实 CRI socket 验证两台 Pod VM、地址可达、daemon SIGKILL 后 IP 与 boot ID 保持、DEL 失败重试、VMM 意外退出、重复停止与删除。配置 `NAUTILUS_VM_IDENTITY_INITRAMFS` 可额外检查仅具有身份握手的 guest 启动失败后完整回收。通过同一测试的节点使用 Debian Linux 6.12.118，Cloud Hypervisor v54.1 和 v55.0 分别运行通过，guest 内核为 Ubuntu 5.15.0-191。
+
+用 `guest/build-workload-initramfs.sh` 构建工作负载镜像。每个容器独立持有 OCI rootfs、PID namespace 和 guest runc 实例，通过认证的 vsock 连接进行生命周期和 ExecSync 操作。宿主按 guest 提供的日志偏移写入 kubelet 日志。日志文件系统需支持 `O_TMPFILE` 和用户扩展属性，宿主先持久化匿名 inode 的身份，再发布 kubelet 使用的文件名。[guest 协议](GUEST_OCI_PROTOCOL.md)
+
+`tests/vm_cri_workloads_test.rs` 在独立网络命名空间启动真实 daemon，使用带摘要的本地 OCI 镜像测试两个 Pod、同 Pod 的两个容器、十次连续 exec、日志、超时、断连、daemon 重启和重复删除。运行时设置 `NAUTILUS_VM_VMM`、`NAUTILUS_VM_KERNEL`、`NAUTILUS_VM_INITRAMFS`、`NAUTILUS_VM_VIRTIOFSD`、`NAUTILUS_CNI_BIN_DIR` 和指向静态 BusyBox 的 `NAUTILUS_TEST_BUSYBOX`，再执行 `cargo test --locked --test vm_cri_workloads_test -- --ignored --nocapture`。
 
 ## 节点探针
 
@@ -126,6 +140,8 @@ nautilus vm probe --vmm /opt/cloud-hypervisor/bin/cloud-hypervisor \
 | [#14 Pod CPU 和内存](https://github.com/nautilus-runtime/nautilus/issues/14) | #3 | 对照 VMM 启动配置和宿主内核的 cgroup 限制。 |
 | [#15 CRI 容器生命周期](https://github.com/nautilus-runtime/nautilus/issues/15) | #11、#12 | 经真实 daemon socket 运行 OCI 镜像，验证状态、工作区、日志和恢复。 |
 | [#16 RuntimeClass 与 kubelet](https://github.com/nautilus-runtime/nautilus/issues/16) | #13、#14、#15 | 经真实 kubelet 验证调度、流式操作与清理，运行完整 critest。 |
+
+#16 分为 [#21 宿主卷实时交付](https://github.com/nautilus-runtime/nautilus/issues/21)、[#23 Exec / Attach / PortForward](https://github.com/nautilus-runtime/nautilus/issues/23) 和 [#22 真实 kubelet 及 RuntimeClass 验收](https://github.com/nautilus-runtime/nautilus/issues/22)。前两项可独立开发，最后一项在真实集群核对两条路径。
 
 首版使用每个 Pod 专属的 virtiofsd 导出容器 bundle。宿主复用 Nautilus 拉取的 OCI 镜像，为每个容器准备独立 rootfs。对 CRI 卷只开放已能兑现权限、读写和传播语义的类型。Kata 4.4.0 的 Cloud Hypervisor 配置也默认使用 virtio-fs，并为块设备 snapshotter 提供单独的接入路径。[Kata Go runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/Makefile#L266-L267) · [Kata Rust runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime-rs/Makefile#L240) · [Kata 存储设计](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture/storage.md)
 

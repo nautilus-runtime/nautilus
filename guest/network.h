@@ -53,6 +53,12 @@ static bool configure_pod_network(void)
     char *cursor = cmdline, *word, *config = NULL;
     const char key[] = "nautilus.net=";
     while ((word = strsep(&cursor, " \t"))) {
+        const char hostkey[] = "nautilus.hostname=";
+        if (!strncmp(word, hostkey, sizeof(hostkey) - 1)) {
+            const char *name = word + sizeof(hostkey) - 1;
+            if (sethostname(name, strlen(name)) < 0)
+                return false;
+        }
         if (!strncmp(word, key, sizeof(key) - 1)) {
             if (config)
                 return false;

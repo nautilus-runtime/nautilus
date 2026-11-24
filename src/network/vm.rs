@@ -23,6 +23,8 @@ pub struct VmNetwork {
     pub mac: String,
     pub cmdline: String,
     pub resolv_conf: String,
+    #[serde(default)]
+    pub(crate) hostname: String,
 }
 
 impl VmNetwork {
@@ -460,6 +462,7 @@ impl PodNet {
             mac: mac.to_owned(),
             cmdline,
             resolv_conf,
+            hostname: String::new(),
         })
     }
 

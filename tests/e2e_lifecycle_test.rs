@@ -265,6 +265,7 @@ async fn test_e2e_state_persistence() {
         let state_manager = StateManager::new(db_path.clone()).unwrap();
         
         let pod_state = nautilus::core::PodState {
+            vm_attempt: None,
             id: pod_id.clone(),
             name: "persistent-test-pod".to_string(),
             namespace: "default".to_string(),
@@ -295,6 +296,7 @@ async fn test_e2e_state_persistence() {
             id: container_id.clone(),
             name: "persistent-test-container".to_string(),
             pod_id: pod_id.clone(),
+            attempt: 0,
             image: "alpine:latest".to_string(),
             env: HashMap::new(),
             status: nautilus::core::ContainerStatus::Running,
@@ -312,6 +314,7 @@ async fn test_e2e_state_persistence() {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             open_stdin: false,
+            vm: None,
         };
         
         state_manager.save_pod_state(&pod_state).await.unwrap();

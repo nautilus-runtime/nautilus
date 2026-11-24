@@ -33,6 +33,7 @@ spdystream-rs = "0.1"
 # tonic/spdystream-rs already resolve to.
 http = "1"
 bytes = "1"
+base64 = "0.22"
 
 # Logging and tracing
 log = "0.4.22"

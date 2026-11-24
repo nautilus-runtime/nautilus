@@ -11,6 +11,8 @@ use uuid::Uuid;
 pub struct ContainerState {
     pub id: String,
     pub pod_id: String,
+    #[serde(default)]
+    pub attempt: u32,
     pub name: String,
     pub image: String,
     pub status: ContainerStatus,
@@ -45,6 +47,26 @@ pub struct ContainerState {
     /// before a client attaches.
     #[serde(default)]
     pub open_stdin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<VmContainer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmContainer {
+    #[serde(default)]
+    pub image_id: String,
+    pub preparing: bool,
+    #[serde(default)]
+    pub logs_complete: bool,
+    pub relative_log: String,
+    pub cursor: crate::runtime::vm_log::Cursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmPodAttempt {
+    pub attempt: u32,
+    #[serde(default)]
+    pub ready_network: Option<crate::network::vm::VmNetwork>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +81,10 @@ pub struct PodState {
     /// Resolved CRI runtime_handler for this pod's sandboxes.
     #[serde(default)]
     pub runtime_handler: String,
-    /// Published netns bind-mount path (runc pods only).
+    /// Present for fully managed CRI VM attempts, including pending cleanup.
+    #[serde(default)]
+    pub vm_attempt: Option<VmPodAttempt>,
+    /// Published Pod netns bind-mount path.
     #[serde(default)]
     pub network_namespace: Option<String>,
     /// Pod IP assigned by the CNI chain.

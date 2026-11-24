@@ -5,6 +5,7 @@ mod share;
 use super::guest::canonical_uuid;
 use super::resources::VmResources;
 use crate::core::config::VmConfig;
+use crate::network::vm::VmNetwork;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -266,6 +267,16 @@ impl PodVmStore {
         config: &VmConfig,
         resources: &VmResources,
     ) -> io::Result<String> {
+        self.start_with_network(id, config, resources, None).await
+    }
+
+    pub(crate) async fn start_with_network(
+        &self,
+        id: &str,
+        config: &VmConfig,
+        resources: &VmResources,
+        network: Option<&VmNetwork>,
+    ) -> io::Result<String> {
         let lease = self
             .lease(id, Operation::Start)
             .await?
@@ -319,7 +330,7 @@ impl PodVmStore {
                 }
             }
         });
-        let result = match lease.launch(&mut owner, &assets, resources).await {
+        let result = match lease.launch(&mut owner, &assets, resources, network).await {
             Err(cause) => match lease.remove(&mut owner).await {
                 Ok(()) => Err(cause),
                 Err(cleanup) => Err(io::Error::new(
@@ -347,6 +358,65 @@ impl PodVmStore {
             ));
         }
         lease.online_with_deadline(&owner).await
+    }
+
+    /// Authenticate the workload endpoint while the per-Pod read lease pins this attempt.
+    pub(crate) async fn workload_channel(&self, id: &str) -> io::Result<super::workload::Channel> {
+        timeout(UNIT_BUDGET, async {
+            let lease = self
+                .lease(id, Operation::Status)
+                .await?
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+            let owner = lease
+                .load(id)?
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+            let boot = owner
+                .boot
+                .as_deref()
+                .filter(|_| !owner.removing)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "Pod VM has not committed its startup identity",
+                    )
+                })?;
+            let (_fd, dir) = lease.open_socket_directory(&owner)?;
+            let socket = dir.join("vsock.sock");
+            let metadata = fs::symlink_metadata(&socket)?;
+            if !metadata.file_type().is_socket()
+                || owner.sockets[1] != Some(FileIdentity::from_meta(&metadata))
+            {
+                return Err(invalid("workload endpoint ownership mismatch"));
+            }
+            let stream = super::connect_guest(&socket, 4083).await?;
+            super::workload::Channel::authenticate(stream, id, &owner.nonce, boot).await
+        })
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, "connecting to guest workload service"))?
+    }
+
+    pub(crate) async fn verify_network(&self, id: &str, network: &VmNetwork) -> io::Result<()> {
+        let lease = self
+            .lease(id, Operation::Status)
+            .await?
+            .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+        let owner = lease
+            .load(id)?
+            .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+        let boot = owner
+            .boot
+            .as_deref()
+            .filter(|_| !owner.removing)
+            .ok_or_else(|| invalid("VM network has no active boot"))?;
+        let (_fd, directory) = lease.open_socket_directory(&owner)?;
+        let socket = directory.join("vsock.sock");
+        let metadata = fs::symlink_metadata(&socket)?;
+        if !metadata.file_type().is_socket()
+            || Some(FileIdentity::from_meta(&metadata)) != owner.sockets[1]
+        {
+            return Err(invalid("VM network endpoint ownership mismatch"));
+        }
+        network.verify_guest(&socket, boot).await
     }
 
     /// Reopen a committed guest or finish the abandoned operation under the same lease.
@@ -596,6 +666,7 @@ impl Lease {
         owner: &mut Owner,
         assets: &VmConfig,
         resources: &VmResources,
+        network: Option<&VmNetwork>,
     ) -> io::Result<String> {
         // Journal the directory inode before publishing it at the canonical path.
         let staging = self.root.join(format!(".{}.work", owner.nonce));
@@ -630,6 +701,20 @@ impl Lease {
         } else {
             ""
         };
+        let mut cmdline = format!(
+            "rdinit=/init panic=1 nautilus.sandbox_id={} nautilus.nonce={}",
+            owner.id, owner.nonce
+        );
+        if let Some(nic) = network {
+            cmd.arg("--property")
+                .arg(format!("NetworkNamespacePath={}", nic.netns_path));
+            cmdline.push(' ');
+            cmdline.push_str(&nic.cmdline);
+            if !nic.hostname.is_empty() {
+                cmdline.push_str(" nautilus.hostname=");
+                cmdline.push_str(&nic.hostname);
+            }
+        }
         cmd.arg("--")
             .arg(&assets.vmm)
             .arg("--kernel")
@@ -651,10 +736,10 @@ impl Lease {
                 "cid=3,socket=vsock.sock",
                 "--cmdline",
             ])
-            .arg(format!(
-                "rdinit=/init panic=1 nautilus.sandbox_id={} nautilus.nonce={}",
-                owner.id, owner.nonce
-            ));
+            .arg(cmdline);
+        if let Some(nic) = network {
+            cmd.arg("--net").arg(format!("tap=nttap0,mac={}", nic.mac));
+        }
         if assets.virtiofsd.is_some() {
             cmd.args(["--fs", "tag=podfs,socket=fs.sock"]);
         }
