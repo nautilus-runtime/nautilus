@@ -547,7 +547,7 @@ impl RuntimeService for NautilusRuntimeService {
             let details = match self.pod_manager.vm_store().status(&pod.id).await {
                 Ok(Some(id)) => serde_json::json!({ "guestReachable": true, "bootId": id }),
                 Ok(None) => serde_json::json!({ "guestReachable": false }),
-                Err(error) => serde_json::json!({ "guestReachable": false, "error": error.to_string() }),
+                Err(error) => serde_json::json!({ "guestReachable": null, "error": error.to_string() }),
             };
             info.insert("nautilus.vm".into(), details.to_string());
         }

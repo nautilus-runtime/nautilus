@@ -412,6 +412,12 @@ async fn a_persisted_vm_attempt_without_an_owner_is_failed_and_can_be_removed() 
         )
         .await?
     };
+    // Recovery must still handle this VM when an unrelated Pod cannot be decoded.
+    {
+        let raw = sled::open(&db)?;
+        raw.insert(b"pod:broken", b"{".as_slice())?;
+        raw.flush()?;
+    }
     let state = Arc::new(StateManager::new(&db)?);
     let service = NautilusRuntimeService::new(config, state.clone());
     service.recover_vm_pods().await?;
@@ -456,6 +462,39 @@ async fn a_persisted_vm_attempt_without_an_owner_is_failed_and_can_be_removed() 
     ensure!(
         !dir.path().join("vms").exists(),
         "cleanup materialized missing VM owner directory"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_vm_start_failure_is_recorded_immediately() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.runtime.state_dir = dir.path().into();
+    config.runtime.sandboxes.vm = Some(VmConfig {
+        vmm: dir.path().join("missing-vmm"),
+        kernel: dir.path().join("kernel"),
+        initramfs: dir.path().join("agent"),
+    });
+    let config = Arc::new(config);
+    let state = Arc::new(StateManager::new(dir.path().join("state.db"))?);
+    let registry = Arc::new(SandboxRegistry::new(&config)?);
+    let containers = Arc::new(ContainerManager::new(
+        config.clone(),
+        state.clone(),
+        registry,
+    ));
+    let pods = PodManager::new(config, state.clone(), containers);
+    let id = create_attempt(&pods, "failed-start").await?;
+    ensure!(pods.start_pod(&id).await.is_err());
+    ensure!(pods.get_pod_status(&id).await? == Some(nautilus::core::PodStatus::Failed));
+    ensure!(
+        state
+            .get_pod_state(&id)
+            .await?
+            .context("lost failed attempt")?
+            .status
+            == nautilus::core::PodStatus::Failed
     );
     Ok(())
 }

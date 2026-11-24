@@ -125,16 +125,18 @@ impl PodManager {
         }
 
         if pod_state.runtime_handler == "vm" {
-            let images = self
-                .config
-                .runtime
-                .sandboxes
-                .vm
-                .as_ref()
-                .ok_or_else(|| Error::Config("Pod VM images are not configured".into()))?;
-            self.vm_store()
-                .start(pod_id, &images.vmm, &images.kernel, &images.initramfs)
-                .await?;
+            let store = self.vm_store();
+            let start = match &self.config.runtime.sandboxes.vm {
+                Some(images) => store
+                    .start(pod_id, &images.vmm, &images.kernel, &images.initramfs)
+                    .await
+                    .map_err(Error::from),
+                None => Err(Error::Config("Pod VM images are not configured".into())),
+            };
+            if let Err(error) = start {
+                self.reconcile_vm_pod(&store, &pod_state).await?;
+                return Err(error);
+            }
             // Guest reachability alone does not satisfy RunPodSandbox readiness.
             return Ok(());
         }
@@ -304,33 +306,36 @@ impl PodManager {
     /// Reconcile the recorded VM attempts before accepting CRI requests.
     pub async fn recover_vm_pods(&self) -> Result<()> {
         let store = self.vm_store();
-        let pods = self.list_pods().await?;
-        let attempts = pods
-            .into_iter()
-            .filter(|p| p.runtime_handler == "vm" && p.status != PodStatus::Succeeded);
+        let attempts = self.state_manager.vm_pods_for_recovery().await?;
         // Independent VMs can be queried concurrently. Bound the number of
         // simultaneous system manager requests during a large node restart.
         let mut recovery = stream::iter(attempts)
             .map(|pod| {
                 let store = &store;
-                async move {
-                    let status = match store.recover(&pod.id).await {
-                        Ok(Some(_)) => PodStatus::Pending,
-                        Ok(None) => PodStatus::Failed,
-                        Err(error) => {
-                            tracing::warn!(pod_id=%pod.id, %error, "Cannot verify Pod VM ownership");
-                            PodStatus::Unknown
-                        }
-                    };
-                    if status != pod.status {
-                        self.update_pod_status(&pod.id, status).await?;
-                    }
-                    Ok::<_, Error>(())
-                }
+                async move { self.reconcile_vm_pod(store, &pod).await }
             })
             .buffer_unordered(8);
         while let Some(result) = recovery.next().await {
             result?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_vm_pod(
+        &self,
+        store: &crate::vm::owner::PodVmStore,
+        pod: &PodState,
+    ) -> Result<()> {
+        let status = match store.recover(&pod.id).await {
+            Ok(Some(_)) => PodStatus::Pending,
+            Ok(None) => PodStatus::Failed,
+            Err(error) => {
+                tracing::warn!(pod_id=%pod.id, %error, "Cannot verify Pod VM ownership");
+                PodStatus::Unknown
+            }
+        };
+        if status != pod.status {
+            self.update_pod_status(&pod.id, status).await?;
         }
         Ok(())
     }

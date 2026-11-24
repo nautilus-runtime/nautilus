@@ -37,7 +37,7 @@
 
 每个 sandbox attempt 使用独立的临时服务。systemd 在 nautilusd 退出后继续持有 VMM 的进程组。Nautilus 在 `runtime.state_dir/vms` 记录 sandbox ID、启动 nonce、systemd InvocationID、私有目录及 socket 的文件身份和 guest boot ID。启动恢复时，匹配已登记的 VM 后重新连接，继续回收中断的创建或删除。遇到身份冲突时保留记录，在 CRI 中报告 NOTREADY，避免停止其他工作负载。
 
-实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。已启动的实验 Pod 保持 NOTREADY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
+实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。成功验证时 `guestReachable` 为 true，确认缺失时为 false。状态查询发生错误时该字段为 null，`error` 给出原因。已启动的实验 Pod 保持 NOTREADY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
 
 ```sh
 NAUTILUS_VM_VMM=/opt/cloud-hypervisor/bin/cloud-hypervisor \
