@@ -2,6 +2,8 @@
 
 Use `rtk` for shell commands in workspaces configured with the user's local `~/.codex/RTK.md`.
 
+Write GitHub issue and pull request titles, descriptions and review comments in English.
+
 ## Runtime changes
 
 - Read [the architecture](docs/ARCHITECTURE.md) before changing runtime behaviour. Workload commands and kubelet use the daemon's CRI socket. The local VM probe runs directly on the node.
