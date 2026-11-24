@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import json
+import ipaddress
 import os
 from pathlib import Path
 import pty
@@ -150,7 +151,22 @@ def main():
         node = json.loads(kube("get", "node", args.node, "-o", "json"))
         names = {h["name"] for h in node["status"].get("runtimeHandlers", [])}
         return {"", "runc", "vm"}.issubset(names)
+    def node_resources():
+        state = Path(cfg["runtime"]["state_dir"])
+        paths = set((state / "vms").glob("*")) | set((state / "vm-network").glob("*.json"))
+        paths.update(Path(cfg["network"]["netns_dir"]).glob("vm-*"))
+        for entry in args.ipam_dir.glob("*"):
+            try:
+                ipaddress.ip_address(entry.name)
+                paths.add(entry)
+            except ValueError:
+                pass
+        units = run(["systemctl", "list-units", "--state=running", "--no-legend", "--plain",
+                     "nautilus-vm-*.service", "nautilus-fs-*.service"])
+        return paths, {line.split()[0] for line in units.splitlines()}
+
     wait(advertised)
+    baseline_paths, baseline_units = node_resources()
     kube("create", "namespace", namespace)
     records = []
     vm_units = {}
@@ -237,7 +253,9 @@ def main():
                         return False
                     if run(["systemctl", "list-units", "--state=running", "--no-legend", "--plain", f"nautilus-*-{id_}-*.service"]):
                         return False
-                return all(not (args.ipam_dir / ip).exists() for ip, _, _ in before)
+                remaining, running = node_resources()
+                return (not (remaining - baseline_paths) and not (running - baseline_units)
+                        and not run([*cri, "pods", "--namespace", "^" + namespace + "$", "-q"]))
             wait(cleaned, 120)
             print("Released VMM/virtiofsd units, owner journals and network namespaces:", records)
     finally:
