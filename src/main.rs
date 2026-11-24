@@ -110,6 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     info!("State manager initialized at {:?}", state_dir);
 
+    nautilus::storage::snapshot::recover(&config.storage.container_dir, &state_manager).await?;
+
     // Finish reconciliation before serving requests that can restart a container.
     if let Err(e) = nautilus::network::publish::sweep_network(&state_manager).await {
         warn!(error = %e, "Skipped startup cleanup of published ports");

@@ -412,6 +412,14 @@ pub async fn materialize_rootfs(
     image_ref: &str,
     rootfs_dir: &Path,
 ) -> Result<ImageWorkload> {
+    prepare_root(config, image_ref, rootfs_dir, false).await
+}
+
+pub(crate) async fn prepare_bundle(config: &Config, image_ref: &str, bundle: &Path, overlay: bool) -> Result<ImageWorkload> {
+    prepare_root(config, image_ref, &bundle.join("rootfs"), overlay && config.storage.overlay.enabled).await
+}
+
+async fn prepare_root(config: &Config, image_ref: &str, rootfs_dir: &Path, overlay: bool) -> Result<ImageWorkload> {
     let reference = resolve_ref(config, image_ref)?;
     // Offline fast path: cached manifest+config and every layer blob present.
     let cached = match load_cached(config, &reference).await {
@@ -432,44 +440,44 @@ pub async fn materialize_rootfs(
         }
     };
 
-    // Extraction is sync CPU/IO work — keep it off the async workers.
-    let work = cached.blobs.clone();
-    let root = rootfs_dir.to_path_buf();
-    let layers_meta = work
-        .iter()
-        .map(|(p, m)| (p.to_string_lossy().to_string(), m.clone()))
-        .collect::<Vec<_>>();
+    let workload = cached.workload();
+    let root = rootfs_dir.to_owned();
+    let image_dir = config.storage.image_dir.clone();
+    let options = config.storage.overlay.mount_options.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        for (path, media_type) in &layers_meta {
-            let blob = std::fs::read(path)
-                .map_err(|e| Error::Image(format!("read {}: {e}", path)))?;
-            crate::storage::unpack::apply_layer(&root, &blob, media_type)?;
+        // Old manifest-cache entries may lack a digest. Their resolved OCI
+        // manifest still records the ordered layers and configuration.
+        let identity = if cached.manifest_digest.is_empty() {
+            serde_json::to_vec(&cached.manifest)?
+        } else {
+            cached.manifest_digest.as_bytes().to_owned()
+        };
+        let key = super::snapshot::key(&cached.manifest.config.digest, &identity);
+        let unpack = |dst: &Path| -> Result<()> {
+            for (path, media_type) in &cached.blobs {
+                crate::storage::unpack::apply_layer(dst, &std::fs::read(path)?, media_type)?;
+            }
+            let meta = serde_json::json!({
+                "image_id": cached.manifest.config.digest,
+                "created": cached.config.created.map(|c| c.to_rfc3339()),
+                "size": dir_size(dst),
+            });
+            let sidecar = image_dir.join(format!("{}.nmeta",
+                super::image::safe_image_name(&cached.manifest.config.digest)));
+            // Size is optional display metadata. Never expose a partial JSON file.
+            if let Ok(mut file) = tempfile::NamedTempFile::new_in(&image_dir) {
+                if serde_json::to_writer(&mut file, &meta).is_ok() {
+                    let _ = file.persist(sidecar);
+                }
+            }
+            Ok(())
+        };
+        if !overlay || !super::snapshot::prepare(root.parent().unwrap(), &key, &options, unpack)? {
+            unpack(&root)?;
         }
         Ok(())
-    })
-    .await
-    .map_err(|e| Error::Runtime(format!("extract worker join failed: {e}")))??;
-
-    // Persist docker-parity display facts next to the image store: uncompressed
-    // rootfs size (docker's SIZE column), config-digest image id and build time.
-    let size_bytes = dir_size(rootfs_dir);
-    let meta = serde_json::json!({
-        "image_id": cached.manifest.config.digest,
-        "created": cached.config.created.map(|c| c.to_rfc3339()),
-        "size": size_bytes,
-    });
-    let sidecar = config
-        .storage
-        .image_dir
-        .join(format!("{}.nmeta", crate::storage::image::safe_image_name(&cached.manifest.config.digest)));
-    let _ = super::atomic_write(&sidecar, meta.to_string().as_bytes()).await;
-
-    tracing::info!(
-        image = %image_ref,
-        layers = cached.manifest.layers.len(),
-        "rootfs materialized from native pull"
-    );
-    Ok(cached.workload())
+    }).await.map_err(|e| Error::Runtime(format!("rootfs worker: {e}")))??;
+    Ok(workload)
 }
 
 #[cfg(test)]

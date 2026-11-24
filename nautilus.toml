@@ -35,8 +35,9 @@ gc_threshold = 0.8                          # 垃圾回收触发阈值
 cache_size = "512MB"                        # 存储缓存大小
 
 [storage.overlay]
+enabled = true  # Reuse unpacked OCI image snapshots when OverlayFS is supported
 # OverlayFS 存储驱动配置
-mount_options = ["nodev"]                   # 挂载选项
+mount_options = ["nodev"]                   # nodev is always set; optional nosuid, noexec, noatime, relatime
 ignore_chown_errors = false                 # 忽略 chown 错误
 
 [storage.gc]

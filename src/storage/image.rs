@@ -217,6 +217,11 @@ impl ImageManager {
 
     async fn finish_pull(&self, pending: &PendingPull) -> Result<String> {
         let facts = super::pull::publish_cached(&self.config, &pending.image_ref, &pending.requested, &pending.pinned).await?;
+        let dir = self.config.storage.container_dir.clone();
+        let image_id = facts.config_digest.clone();
+        let digest = facts.manifest_digest.clone();
+        tokio::task::spawn_blocking(move || super::snapshot::retain(&dir, &image_id, &digest))
+            .await.map_err(|e| Error::Storage(format!("retain rootfs snapshot: {e}")))??;
         let id = self.record_pull(&pending.image_ref, facts).await?;
         fs::remove_file(self.image_store_path.join("pull.pending")).await?;
         Ok(id)
@@ -448,6 +453,12 @@ impl ImageManager {
             return Ok(());
         }
 
+        // Retire before deleting the index so a failed removal can be retried.
+        // Live bundles keep the unpacked tree pinned until their own removal.
+        let dir = self.config.storage.container_dir.clone();
+        let image_id = info.image_id.clone();
+        tokio::task::spawn_blocking(move || super::snapshot::retire(&dir, &image_id))
+            .await.map_err(|e| Error::Storage(format!("retire rootfs snapshot: {e}")))??;
         // Full removal of the record.
         let f = self
             .image_store_path

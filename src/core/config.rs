@@ -194,6 +194,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub mount_options: Vec<String>,
     pub ignore_chown_errors: bool,
 }
@@ -420,6 +422,7 @@ impl Default for Config {
                 gc_threshold: 0.8,
                 cache_size: "512MB".to_string(),
                 overlay: OverlayConfig {
+                    enabled: true,
                     mount_options: vec!["nodev".to_string()],
                     ignore_chown_errors: false,
                 },

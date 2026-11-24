@@ -50,6 +50,7 @@ fn load_lifecycle_container(root: PathBuf) -> Result<Option<Container>> {
     Ok(Some(container))
 }
 
+#[derive(Clone)]
 pub struct RuncBackend {
     config: Arc<Config>,
 }
@@ -132,7 +133,7 @@ impl RuncBackend {
 
         let pid = {
             let id = id.clone();
-            tokio::task::spawn_blocking(move || -> Result<u32> {
+            tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || -> Result<u32> {
             let lc = |e: libcontainer::error::LibcontainerError| {
                 Error::Runtime(format!("libcontainer {id}: {e}"))
             };
@@ -174,7 +175,7 @@ impl RuncBackend {
                 builder = builder.with_stdin(fd);
             }
             let mut container = builder
-                .as_init(bundle)
+                .as_init(bundle.clone())
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: create: {e}")))?;
             container.start().map_err(|e| {
@@ -199,7 +200,7 @@ impl RuncBackend {
             // profile before the workload execve (fork 2867015+); no host-side
             // attr write needed here.
             Ok(container.pid().map(|p| p.as_raw() as u32).unwrap_or(0))
-            })
+            }))
             .await
             .map_err(|e| Error::Runtime(format!("libcontainer worker join failed: {e}")))?
         }?;
@@ -403,7 +404,7 @@ impl RuncBackend {
     /// behind (`create`). The init process inherits runc's stdio; if those are
     /// pipes, `.output()` blocks on EOF until the container dies. Point them at
     /// files instead and surface failures through the captured log.
-    async fn run_runc_lifecycle(
+    fn run_runc_lifecycle(
         &self,
         bundle: &Path,
         args: &[&str],
@@ -419,7 +420,7 @@ impl RuncBackend {
             .open(&log_path)
             .map_err(|e| Error::Runtime(format!("open {}: {e}", log_path.display())))?;
 
-        let mut cmd = Command::new(self.config.runtime.runc.path.clone());
+        let mut cmd = std::process::Command::new(self.config.runtime.runc.path.clone());
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -427,7 +428,6 @@ impl RuncBackend {
 
         let status = cmd
             .status()
-            .await
             .map_err(|e| Error::Runtime(format!("failed to spawn {what}: {e}")))?;
         if !status.success() {
             let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -465,7 +465,7 @@ impl RuncBackend {
     /// The workload is exec'd directly; output capture happens through stdio
     /// pipes wired in `start_libcontainer` (see `spawn_output_logger`).
     #[allow(clippy::too_many_arguments)]
-    async fn write_spec(
+    fn write_spec(
         &self,
         bundle_id: &str,
         _bundle: &Path,
@@ -727,8 +727,7 @@ impl RuncBackend {
             }
         }
 
-        fs::write(bundle.join("config.json"), serde_json::to_vec_pretty(&spec)?)
-            .await
+        std::fs::write(bundle.join("config.json"), serde_json::to_vec_pretty(&spec)?)
             .map_err(|e| Error::Runtime(format!("write config.json: {e}")))?;
         Ok(())
     }
@@ -844,17 +843,10 @@ const DEFAULT_CAPS: [&str; 14] = [
 impl RuncBackend {
     /// Shared body of prepare(), split so failure cleanup can wrap it.
     async fn prepare_inner(&self, bundle: &Path, spec: &WorkloadSpec) -> Result<()> {
-        // Native pull also returns the typed image config.
-        let img_meta = Some(
-            crate::storage::pull::materialize_rootfs(
-                &self.config,
-                &spec.image_ref,
-                &bundle.join("rootfs"),
-            )
-            .await?,
-        );
-        // Native pull always yields the typed config.
-        let w = img_meta.expect("native materialize returns image metadata");
+        // A bidirectional host mount needs the daemon's original shared
+        // propagation topology. Preserve it with the ordinary OCI bundle.
+        let overlay = !spec.volumes.iter().any(|v| v.propagation == "rshared");
+        let w = crate::storage::pull::prepare_bundle(&self.config, &spec.image_ref, bundle, overlay).await?;
         let (entrypoint, cmd, img_env, workdir) = (w.entrypoint, w.cmd, w.env, w.working_dir);
         // docker/k8s-compatible argv merge:
         //   explicit entrypoint  → [entrypoint…, args…]
@@ -890,9 +882,15 @@ impl RuncBackend {
 
         // Scratch-style images ship no shell; detect once for both the exec
         // strategy and the log-capture mount.
-        self.write_spec(
+        let backend = self.clone();
+        let spec = spec.clone();
+        let bundle = bundle.to_owned();
+        let id = spec.id.clone();
+        let image = spec.image_ref.clone();
+        tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || {
+        backend.write_spec(
             &spec.id,
-            bundle,
+            &bundle,
             merged_args,
             full_env,
             &workdir,
@@ -908,8 +906,8 @@ impl RuncBackend {
             spec.pid_ns.as_deref(),
             spec.security.as_ref(),
         )
-        .await?;
-        tracing::info!(container_id = %spec.id, image = %spec.image_ref, "runc bundle prepared");
+        })).await.map_err(|e| Error::Runtime(format!("prepare rootfs view: {e}")))??;
+        tracing::info!(container_id = %id, image = %image, "runc bundle prepared");
         Ok(())
     }
 }
@@ -922,19 +920,18 @@ impl SandboxBackend for RuncBackend {
 
     async fn prepare(&self, spec: &WorkloadSpec) -> Result<()> {
         let bundle = self.bundle_dir(&spec.id);
-        fs::create_dir_all(bundle.join("rootfs"))
-            .await
-            .map_err(|e| Error::Runtime(format!("create bundle dir: {e}")))?;
-        fs::create_dir_all(&spec.output_dir)
-            .await
-            .map_err(|e| Error::Runtime(format!("create output dir: {e}")))?;
-        // (Historically chmod 0777 went here for the in-container log writer;
-        // the daemon-side logger now owns the file.)
-
-        let result = self.prepare_inner(&bundle, spec).await;
+        crate::storage::snapshot::begin(&bundle)?;
+        let result = async {
+            fs::create_dir(bundle.join("rootfs")).await?;
+            fs::create_dir_all(&spec.output_dir).await?;
+            self.prepare_inner(&bundle, spec).await
+        }.await;
         if result.is_err() {
-            // Best-effort: do not leave half-built bundles behind.
-            let _ = fs::remove_dir_all(&bundle).await;
+            self.remove_bundle(bundle).await?;
+            let internal = self.config.storage.container_dir.join(format!("{}-out", spec.id));
+            if spec.output_dir == internal && fs::try_exists(&internal).await? {
+                fs::remove_dir_all(internal).await?;
+            }
         }
         result
     }
@@ -961,10 +958,18 @@ impl SandboxBackend for RuncBackend {
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
+        let bundle = self.bundle_dir(id);
+        let lock_path = bundle.clone();
+        let guard = tokio::task::spawn_blocking(move || crate::storage::snapshot::view_lock(&lock_path))
+            .await.map_err(|e| Error::Runtime(format!("lock rootfs: {e}")))??;
         match self.driver() {
             Driver::Libcontainer => self.remove_libcontainer(id).await,
             Driver::Exec => self.remove_exec(id).await,
-        }
+        }?;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            crate::storage::snapshot::remove_locked(&bundle)
+        }).await.map_err(|e| Error::Runtime(format!("remove rootfs: {e}")))?
     }
 
     async fn exec_sync(
@@ -1472,14 +1477,12 @@ impl RuncBackend {
         let bundle = self.bundle_dir(&spec.id);
 
         // `runc create` forks the long-lived init; use file-backed stdio.
-        self.run_runc_lifecycle(
-            &bundle,
-            &["create", "-b", bundle.to_string_lossy().as_ref(), &spec.id],
-            &format!("runc create {}", spec.id),
-        )
-        .await?;
-        self.run_runc_lifecycle(&bundle, &["start", &spec.id], &format!("runc start {}", spec.id))
-            .await?;
+        let backend = self.clone();
+        let id = spec.id.clone();
+        tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || {
+            backend.run_runc_lifecycle(&bundle, &["create", "-b", &bundle.to_string_lossy(), &id], "runc create")?;
+            backend.run_runc_lifecycle(&bundle, &["start", &id], "runc start")
+        })).await.map_err(|e| Error::Runtime(format!("runc view worker: {e}")))??;
 
         let pid = self
             .state_field(&spec.id, "pid")
@@ -1491,18 +1494,17 @@ impl RuncBackend {
         Ok(StartOutcome::Detached { pid })
     }
 
+    async fn remove_bundle(&self, bundle: PathBuf) -> Result<()> {
+        tokio::task::spawn_blocking(move || crate::storage::snapshot::remove(&bundle))
+            .await.map_err(|e| Error::Runtime(format!("remove rootfs: {e}")))?
+    }
+
     async fn remove_exec(&self, id: &str) -> Result<()> {
         let mut del = Command::new(self.config.runtime.runc.path.clone());
         del.args(["delete", "-f", id]);
-        if let Err(e) = self.run_capture(del, &format!("runc delete {id}")).await {
-            tracing::warn!(container_id = %id, error = %e, "runc delete failed (may be gone)");
-        }
-        let bundle = self.bundle_dir(id);
-        if bundle.exists() {
-            fs::remove_dir_all(&bundle)
-                .await
-                .map_err(|e| Error::Runtime(format!("remove bundle dir: {e}")))?;
-        }
+        // --force succeeds for an absent container. Preserve the mount and
+        // its pin if deleting a real runtime instance failed.
+        self.run_capture(del, &format!("runc delete {id}")).await?;
         Ok(())
     }
 }
@@ -1541,6 +1543,7 @@ mod stop_tests {
 
         let mut config = Config::default();
         config.runtime.runc.root = tmp.path().into();
+        config.storage.container_dir = tmp.path().join("bundles");
         let backend = RuncBackend::new(Arc::new(config));
         for _ in 0..2 {
             backend.stop("test", Duration::ZERO).await.unwrap();

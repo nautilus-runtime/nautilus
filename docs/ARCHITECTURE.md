@@ -165,6 +165,24 @@ hostNetwork 为 pod 级字段,容器强制继承(跳过 netns/CNI/port-publish)�
   归并单记录;remove 为 docker untag 语义;引用定位器支持精确键/tag/digest/ID 前缀。
 - manifest+config 本地缓存 → 已缓存镜像的 create 完全离线。
 
+#### OCI 根文件系统快照
+
+同一镜像创建多个容器时，默认复用已经解包的文件树。首次创建在
+`storage.container_dir/.snapshots-v1` 内的临时目录按层处理 OCI whiteout、权限和属主，
+完成后原子重命名发布。缓存键包含镜像配置及已解析的平台 manifest 摘要。旧缓存缺少摘要时，
+使用其完整 manifest 派生键。同一缓存分片的文件锁协调并发首次创建和回收。
+
+每个 bundle 独占 OverlayFS 的 upper 和 work。创建和启动分别在短生命周期线程的挂载命名空间内挂载 rootfs，启用 inode 索引以保留硬链接写时复制语义。操作结束即释放该线程的挂载，运行中的容器保留自己的视图。镜像树是只读 lower，
+容器写入及运行时生成的 hosts、resolv.conf 都进入各自的 upper。bundle 和缓存之间的
+硬链接把镜像树的生命周期与容器绑定，两者放在同一文件系统。删除镜像的最后一个索引引用后，
+空闲快照立即回收，仍有容器引用的快照延迟到最后一个 bundle 卸载删除后回收。
+显式重新拉取同一镜像可撤销待回收标记。压缩层仍使用原有镜像缓存。
+
+启动时清理未完成发布的临时树和未写入容器状态的受管 bundle。已创建或已停止的容器
+在 Start 时用原 upper 重新挂载；Pod 辅助进程不会将其他容器的挂载保留在守护进程的命名空间中。删除时先结束运行时实例，再释放 bundle 和引用。
+升级前创建的普通 rootfs 继续使用原目录。宿主不支持 OverlayFS 时可自动回退到逐容器解包，
+双向传播（rshared）的宿主卷使用逐容器解包以保留宿主挂载传播关系。也可设置 `storage.overlay.enabled = false` 为新容器显式选择此路径。WASI 不经过 OCI 快照。
+
 ### 4.6 流式 server(exec / attach / portforward)
 
 `src/cri/streaming.rs` + spdystream-rs,SPDY/3.1 remotecommand v4.channel.k8s.io

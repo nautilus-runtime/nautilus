@@ -1,5 +1,6 @@
 pub mod image;
 pub mod pull;
+pub mod snapshot;
 pub mod unpack;
 pub(crate) mod user;
 
