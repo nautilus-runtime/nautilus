@@ -1,5 +1,6 @@
 mod stats;
 
+use super::list_stream::{batches, ListStream};
 use crate::cri::version;
 use crate::core::{Config, StateManager};
 use crate::runtime::{ContainerManager, PodManager};
@@ -1653,49 +1654,64 @@ impl RuntimeService for NautilusRuntimeService {
         }))
     }
 
-    // ---- k8s 1.32-1.34 surface: implemented as explicit `unimplemented`,
-    // matching how containerd/CRI-O advertise newer RPCs before support. ----
-
-    type StreamPodSandboxesStream =
-        Pin<Box<dyn Stream<Item = Result<StreamPodSandboxesResponse, Status>> + Send + 'static>>;
+    type StreamPodSandboxesStream = ListStream<StreamPodSandboxesResponse>;
 
     async fn stream_pod_sandboxes(
         &self,
-        _request: Request<StreamPodSandboxesRequest>,
+        request: Request<StreamPodSandboxesRequest>,
     ) -> Result<Response<Self::StreamPodSandboxesStream>, Status> {
-        Err(Status::unimplemented("streaming watch API not implemented yet"))
+        let reply = self
+            .list_pod_sandbox(request.map(|r| ListPodSandboxRequest { filter: r.filter }))
+            .await?
+            .into_inner();
+        Ok(Response::new(batches(reply.items, |pod_sandboxes| {
+            StreamPodSandboxesResponse { pod_sandboxes }
+        })))
     }
 
-    type StreamContainersStream =
-        Pin<Box<dyn Stream<Item = Result<StreamContainersResponse, Status>> + Send + 'static>>;
+    type StreamContainersStream = ListStream<StreamContainersResponse>;
 
     async fn stream_containers(
         &self,
-        _request: Request<StreamContainersRequest>,
+        request: Request<StreamContainersRequest>,
     ) -> Result<Response<Self::StreamContainersStream>, Status> {
-        Err(Status::unimplemented("streaming watch API not implemented yet"))
+        let reply = self
+            .list_containers(request.map(|r| ListContainersRequest { filter: r.filter }))
+            .await?
+            .into_inner();
+        Ok(Response::new(batches(reply.containers, |containers| {
+            StreamContainersResponse { containers }
+        })))
     }
 
-    type StreamContainerStatsStream = Pin<
-        Box<dyn Stream<Item = Result<StreamContainerStatsResponse, Status>> + Send + 'static>,
-    >;
+    type StreamContainerStatsStream = ListStream<StreamContainerStatsResponse>;
 
     async fn stream_container_stats(
         &self,
-        _request: Request<StreamContainerStatsRequest>,
+        request: Request<StreamContainerStatsRequest>,
     ) -> Result<Response<Self::StreamContainerStatsStream>, Status> {
-        Err(Status::unimplemented("streaming watch API not implemented yet"))
+        let reply = self
+            .list_container_stats(request.map(|r| ListContainerStatsRequest { filter: r.filter }))
+            .await?
+            .into_inner();
+        Ok(Response::new(batches(reply.stats, |container_stats| {
+            StreamContainerStatsResponse { container_stats }
+        })))
     }
 
-    type StreamPodSandboxStatsStream = Pin<
-        Box<dyn Stream<Item = Result<StreamPodSandboxStatsResponse, Status>> + Send + 'static>,
-    >;
+    type StreamPodSandboxStatsStream = ListStream<StreamPodSandboxStatsResponse>;
 
     async fn stream_pod_sandbox_stats(
         &self,
-        _request: Request<StreamPodSandboxStatsRequest>,
+        request: Request<StreamPodSandboxStatsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxStatsStream>, Status> {
-        Err(Status::unimplemented("streaming watch API not implemented yet"))
+        let reply = self
+            .list_pod_sandbox_stats(request.map(|r| ListPodSandboxStatsRequest { filter: r.filter }))
+            .await?
+            .into_inner();
+        Ok(Response::new(batches(reply.stats, |pod_sandbox_stats| {
+            StreamPodSandboxStatsResponse { pod_sandbox_stats }
+        })))
     }
 
     type StreamPodSandboxMetricsStream = Pin<
