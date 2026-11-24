@@ -4,6 +4,10 @@
 - 测试工具为 kubernetes-sigs/cri-tools 的 `critest v1.31.1`。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-24 引擎升级验证
+
+youki 0.8.0 通过 27 项库测试、13 项 OCI 安全配置测试和 2 项集成测试。另以 CRI 验证了 exec 退出码、工作负载退出码、NoNewPrivs、seccomp 过滤器继承、双向挂载传播及旧版容器升级。2026-08-28 的 96 项 critest 结果对应当时的引擎版本。本轮测量口径和原始数据见[性能报告](PERFORMANCE.md)。
+
 ## 基线演进
 
 | 日期 | 结果 | 说明 |

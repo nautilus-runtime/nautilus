@@ -12,8 +12,8 @@
 | CRI 一致性 | **critest v1.31.1 96/0 全绿**(两连跑确认) | crictl 命令可用 |
 | 单元/集成测试 | cargo test 6 套件 28/28 绿 + e2e 5(e2e 偶发 wait4 挂起待查) | 套件绿色 |
 | 空闲内存 | **PSS 10 MiB**(RSS 11 MiB / 12 线程,release 实测) | < 100MB ✅ 大幅超额 |
-| 容器启动时间 | 预热 BusyBox，串行 CreateContainer + StartContainer P95 为 103.0 ms，containerd 为 67.7 ms。见[测试口径和数据](PERFORMANCE.md) | < 100 ms (P95)，本轮未达到 |
-| 并发操作 | 已测 4 路并发，Nautilus 的创建加启动 P95 为 138.1 ms | 1000+，容量上限待测 |
+| 容器启动时间 | 预热 BusyBox，串行 CreateContainer + StartContainer P95 为 47.2 ms，同轮 containerd 为 71.8 ms。见[测试口径和数据](PERFORMANCE.md) | < 100 ms (P95)，本轮预热场景达到 |
+| 并发操作 | 已测 4 路并发，Nautilus 的创建加启动 P95 为 91.1 ms | 1000+，容量上限待测 |
 | 生产加固 | socket 0660、SIGTERM 优雅退出、registry auth、脚手架删除、警告清零 | — ✅ |
 | 多沙箱 | runc(libcontainer)+ wasmtime 双后端路由、RuntimeClass 路由验证通过 | — ✅ |
 | Wasm 策略引擎 | hooks 热加载 + fuel/timeout 限额,demo 验证通过 | — ✅ |

@@ -2,7 +2,48 @@
 
 This benchmark measures how long a CRI client waits for an OCI workload to run on Nautilus and containerd. Run both on the same Linux host. The serial case measures individual request latency. The parallel case shows how that latency changes when several pods start together.
 
-## Warm-image baseline · 2026-11-24
+## OCI snapshots and youki 0.8.0 · 2026-11-24
+
+The optimized runtime completed serial warm-image CreateContainer + StartContainer in **47.2 ms at P95**, down from **101.3 ms**. Both runs used the same pinned BusyBox image. The previous runtime unpacked the image for every container. Nautilus now reuses a shared image tree and gives each container its own writable OverlayFS upper directory.
+
+Each cell shows **P50 / P95 in milliseconds**. “Before” is Nautilus `fe26273`. “After” is `b801cc1`. The containerd rows below are the control paired with the optimized runtime. Each row covers 50 measured serial workloads or 48 workloads in 12 batches of four. The raw CSV also includes the warm-ups and the separate containerd measurements paired with the previous runtime. [Raw samples](benchmarks/snapshot-lifecycle-arm64.csv)
+
+| Parallel pods | Runtime | Pod sandbox | Create container | Start container | Create + start | Pod to ready |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | Nautilus before | 7.2 / 8.0 | 66.7 / 68.0 | 31.8 / 35.0 | 98.5 / 101.3 | 110.7 / 113.7 |
+| 1 | Nautilus after | 7.8 / 9.4 | 10.8 / 12.6 | 33.1 / 35.7 | 44.1 / 47.2 | 52.4 / 54.7 |
+| 1 | containerd 2.2.2 | 68.0 / 75.8 | 13.0 / 16.0 | 48.1 / 54.7 | 62.3 / 71.8 | 129.9 / 142.6 |
+| 4 | Nautilus before | 15.6 / 21.4 | 81.4 / 114.8 | 40.8 / 49.4 | 125.5 / 159.9 | 150.0 / 183.3 |
+| 4 | Nautilus after | 14.6 / 18.4 | 18.1 / 23.9 | 43.2 / 68.0 | 62.7 / 91.1 | 78.3 / 106.8 |
+| 4 | containerd 2.2.2 | 129.6 / 150.2 | 31.6 / 43.0 | 73.8 / 89.4 | 105.0 / 120.2 | 234.3 / 257.9 |
+
+Serial CreateContainer P95 fell by 81.5%. At concurrency four, StartContainer P95 increased from 49.4 to 68.0 ms, while the reduction in create time brought the combined P95 down to 91.1 ms. Full-lifecycle throughput increased from 6.07 to 7.79 workloads/s serially and from 16.43 to 22.86 at concurrency four. The two changes were measured together. The separate measurement windows also showed substantial variation in containerd's concurrent start latency.
+
+### First use of a cached image
+
+The first container pays for unpacking, probing OverlayFS and publishing the reusable tree. With compressed layers already present and the unpacked cache empty, CreateContainer + StartContainer P95 increased from **100.1 to 168.7 ms**. The cached pull stayed inexpensive. This matters for images used only once. With 15 samples per runtime, nearest-rank P95 is the largest observation.
+
+| Runtime | Cached pull | First create | First create + start | Pod to ready |
+| --- | ---: | ---: | ---: | ---: |
+| Nautilus before | 0.9 / 1.2 | 67.0 / 68.5 | 98.5 / 100.1 | 110.0 / 112.8 |
+| Nautilus after | 1.0 / 2.2 | 117.9 / 134.3 | 152.7 / 168.7 | 166.4 / 182.0 |
+
+The first-create driver alternates the previous and optimized runtime for 15 pairs. Before each sample it removes the image record, verifies that the candidate's dedicated unpacked store is empty, and pulls the pinned digest from the local compressed cache. It times the pull separately, then runs the same workload and readiness check as the warm benchmark. Use two preloaded, dedicated Nautilus endpoints and the candidate’s existing snapshot directory.
+
+```sh
+sudo env PYTHONPATH="$bench/proto" "$bench/venv/bin/python" scripts/benchmark_first_create.py \
+  --before "$BEFORE_SOCK" --after "$AFTER_SOCK" --image "$image" \
+  --snapshot-dir "$AFTER_CONTAINER_DIR/.snapshots-v1" --workdir "$bench/probes" \
+  --output "$bench/first-create.csv" --pairs 15
+```
+
+### Validation and scope
+
+The comparison used release binaries on 4 logical ARM64 CPUs, Linux 6.8, ext4, cgroup v2, rustc 1.98.0 and runc 1.3.4. One isolated systemd manager and D-Bus served the dedicated daemons. Both Nautilus versions used in-process libcontainer. The driver used the measurement boundaries below. Preliminary runs with the previous runtime engine encountered a concurrent start notification error and accumulating D-Bus connections. The tables use the complete reruns with the isolated manager. On the updated daemon the D-Bus connection count was zero between series, and the number of open sockets stayed at four.
+
+Separate CRI checks verified private writes, shared immutable content, image removal while in use, daemon restart with a retained writable layer, deferred eviction, bidirectional mounts, ordinary bundles created by the previous version, and the external runc driver. Assertions also checked workload exit codes, exec output and exec's seccomp filter count. The latency samples cover one small image at concurrency one and four. Larger images, CNI and kubelet scheduling remain separate measurements.
+
+## Original warm-image baseline · 2026-11-24
 
 The table shows **P50 / P95 in milliseconds**. Each runtime completed 50/50 measured serial lifecycles and 48/48 measured lifecycles in 12 batches of four. All readiness, running-state and cleanup checks passed. The [raw samples](benchmarks/cri-lifecycle-arm64.csv) include the excluded warm-up rows.
 
@@ -13,7 +54,7 @@ The table shows **P50 / P95 in milliseconds**. Each runtime completed 50/50 meas
 | 4 | Nautilus | 15.3 / 20.0 | 79.7 / 97.2 | 40.4 / 49.3 | 122.6 / 138.1 | 146.4 / 161.2 |
 | 4 | containerd | 127.8 / 154.4 | 30.5 / 42.5 | 78.2 / 106.2 | 110.2 / 136.8 | 238.3 / 285.0 |
 
-Nautilus reached the workload marker sooner at both concurrency levels. Within an existing sandbox, containerd completed CreateContainer and StartContainer sooner. The largest serial P95 gap in Nautilus's favor was sandbox creation (8.0 vs 72.5 ms). Its largest deficit was container creation (70.7 vs 16.0 ms). Nautilus materializes the root filesystem when preparing the container. Profiling that step and separating unpacking from other create work would help explain the gap.
+Nautilus reached the workload marker sooner at both concurrency levels. Within an existing sandbox, containerd completed CreateContainer and StartContainer sooner. The largest serial P95 gap in Nautilus's favor was sandbox creation (8.0 vs 72.5 ms). Its largest deficit was container creation (70.7 vs 16.0 ms). At that revision Nautilus materialized the full root filesystem for each container.
 
 Full-lifecycle throughput, including status checks and teardown, was 6.32 vs 4.15 workloads/s at concurrency 1 and 17.87 vs 8.46 workloads/s at concurrency 4 (Nautilus vs containerd). Results cover a single run window. The 48 concurrent samples share 12 batches and provide a first look at contention with four workers.
 
