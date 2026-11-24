@@ -604,9 +604,11 @@ async fn cmd_run(
         cpuset_cpus: cpuset_cpus.unwrap_or_default(),
         ..Default::default()
     };
-    // OCI backends share the cache; WASI modules are node-local files.
+    // OCI workloads and packaged WASI modules share the image cache.
     let mut image = image;
-    if matches!(runtime.as_str(), "" | "runc" | "vm") {
+    let is_local_module = is_wasi && (image.starts_with("file://") || image.starts_with('/')
+        || ((image.ends_with(".wasm") || image.ends_with(".wat")) && std::path::Path::new(&image).is_file()));
+    if !is_local_module && matches!(runtime.as_str(), "" | "runc" | "vm" | "wasi" | "wasm") {
         if let Some(resolved) = ensure_image(i, &image).await? {
             image = resolved;
         }
@@ -697,7 +699,7 @@ async fn cmd_run(
             Ok(0)
         } else {
             if is_wasi {
-                return follow_workload(r, &id, false, false).await;
+                return follow_workload(r, &id, true, false).await;
             }
             tokio::select! {
                 result = follow_workload(r, &id, true, !is_vm) => result,

@@ -67,7 +67,18 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads the module from its local filesystem. WASI stdout and stderr are captured in the workload log. The WASI backend executes batch commands to completion during start.
+The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. WASI jobs execute to completion during start.
+
+For Kubernetes, package the module in an OCI image and use its absolute path as the entrypoint. Build for the Linux node platform. In this example, set `IMAGE` to a registry tag that your node can pull.
+
+```sh
+docker buildx build --platform linux/amd64 --push -t "$IMAGE" examples/wasi-command
+kubectl apply -f examples/wasi-command/runtimeclass.yaml
+kubectl run wasi-hello --image="$IMAGE" --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"nautilus-wasi","automountServiceAccountToken":false}}'
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/wasi-hello --timeout=90s
+kubectl logs wasi-hello
+```
 
 ### Run a container in a Pod VM
 

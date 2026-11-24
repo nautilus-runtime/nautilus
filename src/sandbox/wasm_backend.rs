@@ -8,26 +8,110 @@
 use crate::core::{Config, Error, Result};
 use crate::sandbox::{SandboxBackend, SandboxKind, StartOutcome, WorkloadSpec};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::{OutputFile, WasiCtxBuilder};
+use wasmtime_wasi::{
+    HostOutputStream, StdoutStream, StreamError, StreamResult, Subscribe, WasiCtxBuilder,
+};
 
 pub struct WasmBackend {
-    #[allow(dead_code)]
     config: Arc<Config>,
     engine: Engine,
 }
 
-fn module_path(image_ref: &str) -> Result<PathBuf> {
-    let raw = image_ref.strip_prefix("file://").unwrap_or(image_ref);
-    if raw.starts_with("http://") || raw.starts_with("https://") {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ImageCommand {
+    module_name: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+fn local_module(reference: &str) -> Option<&Path> {
+    if let Some(path) = reference.strip_prefix("file://") {
+        return Some(Path::new(path));
+    }
+    let path = Path::new(reference);
+    let legacy_path = path
+        .extension()
+        .is_some_and(|ext| ext == "wasm" || ext == "wat")
+        && path.is_file();
+    (path.is_absolute() || legacy_path).then_some(path)
+}
+
+async fn image_module(root: &Path, entrypoint: &str) -> Result<PathBuf> {
+    let path = Path::new(entrypoint);
+    let relative = path.strip_prefix("/").map_err(|_| {
+        Error::Image("WASI image module must use an absolute path inside the image".into())
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(Error::Image("invalid WASI image module path".into()));
+    }
+    let resolved = tokio::fs::canonicalize(root.join(relative)).await?;
+    if !resolved.starts_with(root) || !tokio::fs::metadata(&resolved).await?.is_file() {
         return Err(Error::Image(
-            "remote wasm modules are not supported yet; use file:// paths".into(),
+            "WASI module must be a regular file inside the image".into(),
         ));
     }
-    Ok(PathBuf::from(raw))
+    Ok(resolved)
+}
+
+#[derive(Clone)]
+struct LogStream {
+    path: PathBuf,
+    channel: &'static str,
+}
+
+impl StdoutStream for LogStream {
+    fn stream(&self) -> Box<dyn HostOutputStream> {
+        Box::new(self.clone())
+    }
+
+    fn isatty(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+impl Subscribe for LogStream {
+    async fn ready(&mut self) {}
+}
+
+impl HostOutputStream for LogStream {
+    fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
+        use std::io::Write;
+        // Reopen on output so kubelet can rotate the log file while a job runs.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
+        let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        for piece in bytes.split_inclusive(|&byte| byte == b'\n') {
+            let tag = if piece.ends_with(b"\n") { 'F' } else { 'P' };
+            let mut record = format!("{time} {} {tag} ", self.channel).into_bytes();
+            record.extend_from_slice(piece);
+            if tag == 'P' {
+                record.push(b'\n');
+            }
+            file.write_all(&record)
+                .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(16 * 1024)
+    }
 }
 
 impl WasmBackend {
@@ -38,26 +122,34 @@ impl WasmBackend {
         })
     }
 
+    fn prepared(&self, id: &str) -> PathBuf {
+        self.config.storage.container_dir.join(format!("{id}-wasi"))
+    }
+
     /// Compile + instantiate + run one WASI command to completion.
     fn run_module_blocking(
         engine: Engine,
         path: PathBuf,
-        args: Vec<String>,
-        env: Vec<(String, String)>,
-        log: std::fs::File,
+        command: ImageCommand,
+        log: PathBuf,
     ) -> Result<i32> {
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
         preview1::add_to_linker_sync(&mut linker, |t| t)
             .map_err(|e| Error::Runtime(format!("wasi linker setup failed: {e}")))?;
 
         let mut builder = WasiCtxBuilder::new();
-        builder.stdout(OutputFile::new(log.try_clone()?));
-        builder.stderr(OutputFile::new(log));
-        // argv[0] convention: the module path itself.
-        let mut argv = vec![path.display().to_string()];
-        argv.extend(args);
+        builder.stdout(LogStream {
+            path: log.clone(),
+            channel: "stdout",
+        });
+        builder.stderr(LogStream {
+            path: log,
+            channel: "stderr",
+        });
+        let mut argv = vec![command.module_name];
+        argv.extend(command.args);
         builder.args(&argv);
-        for (k, v) in env {
+        for (k, v) in command.env {
             builder.env(&k, &v);
         }
         let wasi_ctx = builder.build_p1();
@@ -105,43 +197,96 @@ impl SandboxBackend for WasmBackend {
     }
 
     async fn prepare(&self, spec: &WorkloadSpec) -> Result<()> {
-        let path = module_path(&spec.image_ref)?;
-        if !tokio::fs::try_exists(&path)
-            .await
-            .map_err(|e| Error::Image(format!("stat wasm module: {e}")))?
-        {
-            return Err(Error::Image(format!(
-                "wasm module not found: {}",
-                path.display()
-            )));
+        self.prepare_image(spec).await.map(|_| ())
+    }
+
+    async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
+        if let Some(path) = local_module(&spec.image_ref) {
+            Module::from_file(&self.engine, path)
+                .map_err(|e| Error::Image(format!("compile local WASI module: {e}")))?;
+            return Ok(String::new());
         }
-        // Fail fast: fully validate compilation at create-time, not start-time.
-        Module::from_file(&self.engine, &path)
-            .map_err(|e| Error::Runtime(format!("compile wasm module: {e}")))?;
-        tracing::info!(container_id = %spec.id, module = %path.display(), "wasm module prepared");
-        Ok(())
+        if spec.image_ref.starts_with("file://") {
+            return Err(Error::Image(
+                "file:// WASI module paths must be absolute".into(),
+            ));
+        }
+        let storage = &self.config.storage.container_dir;
+        tokio::fs::create_dir_all(storage).await?;
+        let stage = tempfile::tempdir_in(storage)?;
+        let rootfs = stage.path().join("rootfs");
+        tokio::fs::create_dir(&rootfs).await?;
+        let image =
+            crate::storage::pull::materialize_rootfs(&self.config, &spec.image_ref, &rootfs)
+                .await?;
+        let (entrypoint, args) = if spec.entrypoint.is_empty() {
+            (
+                &image.entrypoint,
+                if spec.args.is_empty() {
+                    &image.cmd
+                } else {
+                    &spec.args
+                },
+            )
+        } else {
+            (&spec.entrypoint, &spec.args)
+        };
+        let (module_name, entry_args) = entrypoint.split_first().ok_or_else(|| {
+            Error::Image("WASI image requires a module path in its OCI entrypoint".into())
+        })?;
+        let resolved = image_module(&rootfs.canonicalize()?, module_name).await?;
+        Module::from_file(&self.engine, &resolved)
+            .map_err(|e| Error::Image(format!("compile OCI WASI module: {e}")))?;
+        tokio::fs::copy(&resolved, stage.path().join("module.wasm")).await?;
+        tokio::fs::remove_dir_all(&rootfs).await?;
+        let mut env: std::collections::BTreeMap<_, _> = image
+            .env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        env.extend(spec.env.clone());
+        let command = ImageCommand {
+            module_name: module_name.clone(),
+            args: entry_args.iter().chain(args).cloned().collect(),
+            env: env.into_iter().collect(),
+        };
+        tokio::fs::write(
+            stage.path().join("command.json"),
+            serde_json::to_vec(&command)?,
+        )
+        .await?;
+        tokio::fs::rename(stage.path(), self.prepared(&spec.id)).await?;
+        Ok(image.image_id)
     }
 
     async fn start(&self, spec: &WorkloadSpec) -> Result<StartOutcome> {
-        let path = module_path(&spec.image_ref)?;
         let engine = self.engine.clone();
-        let args = spec.args.clone();
-        let env: Vec<(String, String)> = spec
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let (path, command) = if let Some(path) = local_module(&spec.image_ref) {
+            (
+                path.to_owned(),
+                ImageCommand {
+                    module_name: path.display().to_string(),
+                    args: spec.args.clone(),
+                    env: spec.env.clone().into_iter().collect(),
+                },
+            )
+        } else {
+            let prepared = self.prepared(&spec.id);
+            let data = tokio::fs::read(prepared.join("command.json")).await?;
+            (prepared.join("module.wasm"), serde_json::from_slice(&data)?)
+        };
 
         tokio::fs::create_dir_all(&spec.output_dir).await?;
-        let log = tokio::fs::OpenOptions::new()
+        let log = spec.output_dir.join(&spec.log_relpath);
+        tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(spec.output_dir.join(&spec.log_relpath))
-            .await?
-            .into_std()
-            .await;
+            .open(&log)
+            .await?;
+
         let exit_code = tokio::task::spawn_blocking(move || {
-            Self::run_module_blocking(engine, path, args, env, log)
+            Self::run_module_blocking(engine, path, command, log)
         })
         .await
         .map_err(|e| Error::Runtime(format!("wasm worker join failed: {e}")))??;
@@ -155,7 +300,11 @@ impl SandboxBackend for WasmBackend {
         Ok(None)
     }
 
-    async fn remove(&self, _id: &str) -> Result<()> {
-        Ok(())
+    async fn remove(&self, id: &str) -> Result<()> {
+        match tokio::fs::remove_dir_all(self.prepared(id)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
