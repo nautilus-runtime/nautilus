@@ -531,19 +531,26 @@ impl ContainerManager {
             .await
     }
 
+    /// Connect a stream to the guest identified by its owning Pod and boot.
+    pub(crate) async fn guest_stream(
+        &self,
+        pod: &str,
+        id: &str,
+        operation: crate::vm::workload::Operation<'_>,
+        options: crate::vm::workload::StreamOptions,
+        closed: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::vm::stream::GuestStream> {
+        let owner = crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"));
+        let channel = owner.workload_channel(pod).await.map_err(|err| {
+            std::io::Error::new(err.kind(), format!("connect to Pod VM guest agent: {err}"))
+        })?;
+        crate::vm::stream::open(channel, id, operation, options, closed).await
+    }
+
     /// Live-stdio exec for the CRI streaming interfaces. Same container-state
     /// tolerance as `exec_sync`: a short batch workload can finish between
     /// start and exec, so only backends decide when the container is truly
     /// gone.
-    pub(crate) async fn guest_stream(
-        &self, pod: &str, id: &str, operation: crate::vm::workload::Operation<'_>,
-        options: crate::vm::workload::StreamOptions, closed: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<crate::vm::stream::GuestStream> {
-        let owner = crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"));
-        let channel = owner.workload_channel(pod).await?;
-        crate::vm::stream::open(channel, id, operation, options, closed).await
-    }
-
     pub async fn exec_stream(
         &self,
         container_id: &str,
