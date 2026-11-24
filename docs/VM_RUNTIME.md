@@ -13,6 +13,16 @@
 
 生产协议按 sandbox、container 和请求 ID 寻址。对创建与删除等可重试操作保存结果；流式操作区分 stdout、stderr、结束状态和取消。guest 启动时校验宿主协商的协议与能力。设计需覆盖消息长度、请求超时、重连、并发以及消息与目标 VM 的绑定。节点探针的单次固定握手只用于检查宿主、内核和传输链路。[Kata Pod 模型](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture_4.0/architecture.md) · [Cloud Hypervisor vsock](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v55.0/docs/vsock.md)
 
+### guest 启动身份
+
+`guest/build-initramfs.sh OUTPUT [KERNEL_RELEASE]` 构建自研 guest agent 的 initramfs。该程序作为 PID 1，在端口 4082 接受来自宿主 CID 2 的 `IDENTIFY 1` 请求。它从内核命令行读取 sandbox ID 与每次启动的 nonce，从 guest 的 procfs 读取 boot ID。宿主核对 sandbox ID 和 nonce，校验 boot ID 的格式并将它返回。生命周期管理器将在 #3 把它与持久化的 boot ID 比对。探针使用的示例 initramfs 与此镜像分别构建。
+
+| 输入或事件 | 可观察结果 |
+| --- | --- |
+| 合法 sandbox ID 与 nonce | 返回 `IDENTITY 1 <sandbox-id> <nonce> <boot-id>`。 |
+| 版本、sandbox ID 或 nonce 不匹配，boot ID 格式无效，或应答超长、被截断 | 宿主拒绝把这条连接认作该 sandbox 的 guest。 |
+| 同一 guest 上多次查询 | boot ID 保持一致；宿主据此识别 guest 是否在两次调用之间重新引导。 |
+
 ## 创建、恢复与删除
 
 1. `RunPodSandbox` 先解析 handler、策略和所请求的 namespace、资源、网络配置。以原子方式登记 Pending attempt，再分配该 attempt 的资源。拒绝无法满足的请求，禁止回退到宿主容器执行。
