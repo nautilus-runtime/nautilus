@@ -326,6 +326,18 @@ impl RuntimeService for NautilusRuntimeService {
             .map_err(Status::from)?;
         let handler = self.sandbox_registry.canonical(&req.runtime_handler);
 
+        let vm_resources = if handler == "vm" {
+            Some(crate::vm::resources::VmResources::from_cri(config.linux.as_ref()).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::Unsupported {
+                    Status::unimplemented(e.to_string())
+                } else {
+                    Status::invalid_argument(e.to_string())
+                }
+            })?)
+        } else {
+            None
+        };
+
         // P1b: in-process policy gate before any pod resources are touched.
         {
             use crate::policy::PolicyRequest;
@@ -482,7 +494,10 @@ impl RuntimeService for NautilusRuntimeService {
                     }
                 }
             }
-            self.pod_manager.start_pod_locked(&pod_id).await.map_err(Status::from)
+            match &vm_resources {
+                Some(resources) => self.pod_manager.start_pod_with_resources_locked(&pod_id, resources).await,
+                None => self.pod_manager.start_pod_locked(&pod_id).await,
+            }.map_err(Status::from)
         }.await;
         if let Err(error) = setup {
             self.release_pod_resources(&pod_id, network.as_ref(), pause_pid, ipc_pid).await.map_err(|cleanup| {

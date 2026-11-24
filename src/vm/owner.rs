@@ -3,6 +3,7 @@
 mod share;
 
 use super::guest::canonical_uuid;
+use super::resources::VmResources;
 use crate::core::config::VmConfig;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -255,6 +256,16 @@ impl PodVmStore {
     }
 
     pub async fn start_configured(&self, id: &str, config: &VmConfig) -> io::Result<String> {
+        self.start_with_resources(id, config, &VmResources::default())
+            .await
+    }
+
+    pub async fn start_with_resources(
+        &self,
+        id: &str,
+        config: &VmConfig,
+        resources: &VmResources,
+    ) -> io::Result<String> {
         let lease = self
             .lease(id, Operation::Start)
             .await?
@@ -267,14 +278,16 @@ impl PodVmStore {
                 io::Error::other("VM attempt has exited or is incomplete; remove before retrying")
             });
         }
-        let vmm = config.vmm.canonicalize()?;
-        let kernel = config.kernel.canonicalize()?;
-        let initramfs = config.initramfs.canonicalize()?;
-        let virtiofsd = config
-            .virtiofsd
-            .as_ref()
-            .map(fs::canonicalize)
-            .transpose()?;
+        let assets = VmConfig {
+            vmm: config.vmm.canonicalize()?,
+            kernel: config.kernel.canonicalize()?,
+            initramfs: config.initramfs.canonicalize()?,
+            virtiofsd: config
+                .virtiofsd
+                .as_ref()
+                .map(fs::canonicalize)
+                .transpose()?,
+        };
         let mut owner = Owner {
             id: id.into(),
             nonce: Uuid::new_v4().to_string(),
@@ -284,7 +297,7 @@ impl PodVmStore {
             invocation: None,
             boot: None,
             removing: false,
-            share: virtiofsd.as_ref().map(|_| Share::default()),
+            share: assets.virtiofsd.as_ref().map(|_| Share::default()),
         };
         // Confirm the system manager can be reached before recording intent.
         if lease.unit(&owner, Service::Vmm).await?.is_some()
@@ -306,10 +319,7 @@ impl PodVmStore {
                 }
             }
         });
-        let result = match lease
-            .launch(&mut owner, &vmm, &kernel, &initramfs, virtiofsd.as_deref())
-            .await
-        {
+        let result = match lease.launch(&mut owner, &assets, resources).await {
             Err(cause) => match lease.remove(&mut owner).await {
                 Ok(()) => Err(cause),
                 Err(cleanup) => Err(io::Error::new(
@@ -584,10 +594,8 @@ impl Lease {
     async fn launch(
         &self,
         owner: &mut Owner,
-        vmm: &Path,
-        kernel: &Path,
-        initramfs: &Path,
-        virtiofsd: Option<&Path>,
+        assets: &VmConfig,
+        resources: &VmResources,
     ) -> io::Result<String> {
         // Journal the directory inode before publishing it at the canonical path.
         let staging = self.root.join(format!(".{}.work", owner.nonce));
@@ -606,25 +614,33 @@ impl Lease {
         let token = self.launch_token(owner);
         File::create_new(&token)?.sync_all()?;
         File::open(&self.directory)?.sync_all()?;
-        if let Some(executable) = virtiofsd {
-            self.start_share(owner, executable).await?;
+        if let Some(executable) = &assets.virtiofsd {
+            self.start_share(owner, executable, resources.slice.as_deref())
+                .await?;
         }
         let mut cmd = self.service_command(owner, Service::Vmm);
+        if let Some(slice) = &resources.slice {
+            cmd.arg("--slice").arg(slice);
+        }
+        for property in resources.systemd_properties() {
+            cmd.arg("--property").arg(property);
+        }
+        let shared = if assets.virtiofsd.is_some() {
+            ",shared=on"
+        } else {
+            ""
+        };
         cmd.arg("--")
-            .arg(vmm)
+            .arg(&assets.vmm)
             .arg("--kernel")
-            .arg(kernel)
+            .arg(&assets.kernel)
             .arg("--initramfs")
-            .arg(initramfs)
+            .arg(&assets.initramfs)
+            .arg("--cpus")
+            .arg(format!("boot={}", resources.vcpus))
+            .arg("--memory")
+            .arg(format!("size={}{}", resources.guest_memory_bytes, shared))
             .args([
-                "--cpus",
-                "boot=1",
-                "--memory",
-                if virtiofsd.is_some() {
-                    "size=384M,shared=on"
-                } else {
-                    "size=384M"
-                },
                 "--console",
                 "off",
                 "--serial",
@@ -639,7 +655,7 @@ impl Lease {
                 "rdinit=/init panic=1 nautilus.sandbox_id={} nautilus.nonce={}",
                 owner.id, owner.nonce
             ));
-        if virtiofsd.is_some() {
+        if assets.virtiofsd.is_some() {
             cmd.args(["--fs", "tag=podfs,socket=fs.sock"]);
         }
         let output = self.submit(cmd).await?;

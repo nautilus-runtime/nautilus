@@ -43,7 +43,12 @@ fn pinned(dir: &File) -> PathBuf {
 }
 
 impl Lease {
-    pub(super) async fn start_share(&self, owner: &mut Owner, executable: &Path) -> io::Result<()> {
+    pub(super) async fn start_share(
+        &self,
+        owner: &mut Owner,
+        executable: &Path,
+        slice: Option<&str>,
+    ) -> io::Result<()> {
         let export = self.directory.join(EXPORT);
         let containers = export.join("containers");
         DirBuilder::new().mode(0o700).create(&export)?;
@@ -55,6 +60,9 @@ impl Lease {
         File::open(&self.directory)?.sync_all()?;
         self.save(owner)?;
         let mut cmd = self.service_command(owner, Service::Virtiofsd);
+        if let Some(slice) = slice {
+            cmd.arg("--slice").arg(slice);
+        }
         cmd.arg("--").arg(executable).args([
             "--socket-path",
             SOCKET,
