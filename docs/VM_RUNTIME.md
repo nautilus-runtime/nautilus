@@ -26,6 +26,7 @@
 本地执行 `nautilus vm probe` 会启动一台使用 1 个 vCPU、384 MiB 内存的临时 VM，经 guest 端口 4081 交换 `PING 1` 和 `PONG 1`，然后回收子进程和 socket。它可以在 nautilusd 启动之前运行。测试 guest 仅应答就绪请求，无网络、持久磁盘或执行任意命令的接口。
 
 在 x86_64 Linux 验证机上准备已校验的 Cloud Hypervisor 可执行文件、可读的 guest 内核，以及与该内核版本匹配的模块。示例脚本使用静态 C 工具链、kmod、GNU cpio 和 gzip；压缩模块需要对应的解压工具。运行探针的账号需要能够读写 `/dev/kvm`。
+若系统为 `TMPDIR` 设置了很深的目录，可用 `TMPDIR=/tmp` 运行探针，让生成的 Unix socket 路径满足 Linux 的长度限制。
 
 ```sh
 ./examples/vm-probe/build-initramfs.sh /tmp/nautilus-probe.cpio.gz "$(uname -r)"

@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{sleep, timeout};
 
@@ -76,17 +76,52 @@ async fn run(mut command: Command, dir: &Path, budget: Duration) -> io::Result<(
         _ = interrupt.recv() => Err(io::Error::new(ErrorKind::Interrupted, "VM probe interrupted")),
         _ = terminate.recv() => Err(io::Error::new(ErrorKind::Interrupted, "VM probe terminated")),
     };
-    child.kill().await?;
+    if let Err(cleanup) = terminate_vmm(&mut child).await {
+        return Err(match result {
+            Err(probe) => io::Error::new(cleanup.kind(), format!("{probe}; {cleanup}")),
+            Ok(()) => cleanup,
+        });
+    }
     result
+}
+
+async fn terminate_vmm(child: &mut Child) -> io::Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    if let Err(e) = child.start_kill() {
+        // The guest can exit between the handshake and the signal.
+        if e.raw_os_error() != Some(libc::ESRCH) && !matches!(child.try_wait(), Ok(Some(_))) {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("SIGKILL failed for VMM PID {pid}, exit unconfirmed: {e}"),
+            ));
+        }
+    }
+    wait_for_exit(child, pid, Duration::from_secs(2)).await
+}
+
+async fn wait_for_exit(child: &mut Child, pid: u32, budget: Duration) -> io::Result<()> {
+    match timeout(budget, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(io::Error::new(
+            e.kind(),
+            format!("VMM PID {pid} exit unconfirmed: {e}"),
+        )),
+        Err(_) => Err(io::Error::new(
+            ErrorKind::TimedOut,
+            format!("VMM PID {pid} exit unconfirmed {budget:?} after SIGKILL"),
+        )),
+    }
 }
 
 async fn wait_for_guest(socket: &Path) -> io::Result<()> {
     let mut stream = loop {
-        match timeout(Duration::from_secs(1), connect_guest(socket)).await {
-            Ok(Ok(stream)) => break stream,
+        match connect_guest(socket).await {
+            Ok(stream) => break stream,
             // The VMM can listen before the guest has bound its port. In that
             // window it may close the stream without acknowledging CONNECT.
-            Ok(Err(e))
+            Err(e)
                 if !matches!(
                     e.kind(),
                     ErrorKind::NotFound
@@ -199,8 +234,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
-    #[tokio::test]
-    async fn slow_pong_uses_the_acknowledged_connection_once() {
+    async fn delayed_exchange_uses_one_connection(delay_ack: bool) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("vsock.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -208,18 +242,22 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut peer = BufReader::new(stream);
             let mut request = String::new();
-            peer.read_line(&mut request).await.unwrap();
-            assert_eq!(request, "CONNECT 4081\n");
-            peer.get_mut().write_all(b"OK 1073741824\n").await.unwrap();
-            request.clear();
-            peer.read_line(&mut request).await.unwrap();
-            assert_eq!(request, "PING 1\n");
-            tokio::select! {
-                _ = sleep(Duration::from_millis(1200)) => (),
-                _ = listener.accept() => panic!("client reopened an acknowledged connection"),
-                _ = peer.read_line(&mut request) => panic!("client closed or reused the stream before PONG"),
+            for (expected, reply, delayed) in [
+                ("CONNECT 4081\n", "OK 1073741824\n", delay_ack),
+                ("PING 1\n", "PONG 1\n", !delay_ack),
+            ] {
+                request.clear();
+                peer.read_line(&mut request).await.unwrap();
+                assert_eq!(request, expected);
+                if delayed {
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(1200)) => (),
+                        _ = listener.accept() => panic!("client opened a second connection"),
+                        _ = peer.read_line(&mut request) => panic!("client closed or reused the stream before {reply:?}"),
+                    }
+                }
+                peer.get_mut().write_all(reply.as_bytes()).await.unwrap();
             }
-            peer.get_mut().write_all(b"PONG 1\n").await.unwrap();
         };
         timeout(Duration::from_secs(4), async {
             let (result, ()) = tokio::join!(wait_for_guest(&socket), guest);
@@ -230,11 +268,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_pong_uses_the_acknowledged_connection_once() {
+        delayed_exchange_uses_one_connection(false).await;
+    }
+
+    #[tokio::test]
+    async fn slow_ack_uses_the_original_connection() {
+        delayed_exchange_uses_one_connection(true).await;
+    }
+
+    #[tokio::test]
     async fn unresponsive_guest_times_out_and_reaps_vmm() {
         let err = exercise(None, Duration::from_millis(300))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn reap_timeout_identifies_child_and_repeated_termination_succeeds() {
+        // A live child exercises the wait deadline without forcing kernel I/O to stall.
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let err = timeout(
+            Duration::from_secs(1),
+            wait_for_exit(&mut child, pid, Duration::from_millis(25)),
+        )
+        .await
+        .expect("reap must respect its deadline")
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(err
+            .to_string()
+            .contains(&format!("VMM PID {pid} exit unconfirmed")));
+        terminate_vmm(&mut child).await.unwrap();
+        terminate_vmm(&mut child).await.unwrap();
     }
 
     #[tokio::test]
