@@ -114,6 +114,7 @@ pub struct WorkloadSpec {
     ///   else                 → [args…] (replaces image cmd)
     pub args: Vec<String>,
     pub working_dir: String,
+    pub strict_groups: bool,
     /// Entrypoint override from CRI `command` (empty = use image default).
     pub entrypoint: Vec<String>,
     /// Extra environment variables.

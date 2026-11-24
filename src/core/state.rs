@@ -45,6 +45,15 @@ pub struct ContainerState {
     /// before a client attaches.
     #[serde(default)]
     pub open_stdin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<VmContainer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmContainer {
+    pub preparing: bool,
+    pub relative_log: String,
+    pub cursor: crate::runtime::vm_log::Cursor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

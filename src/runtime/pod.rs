@@ -11,7 +11,7 @@ pub struct PodManager {
     state_manager: Arc<StateManager>,
     container_manager: Arc<ContainerManager>,
     pods: Arc<RwLock<HashMap<String, PodState>>>,
-    operations: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    operations: crate::runtime::OperationLocks,
 }
 
 impl PodManager {
@@ -31,17 +31,7 @@ impl PodManager {
 
     /// Serialize resource and membership changes for this sandbox across RPCs.
     pub async fn operation_guard(&self, pod_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut operations = self.operations.lock().unwrap();
-            operations.retain(|_, lock| lock.strong_count() > 0);
-            let slot = operations.entry(pod_id.to_owned()).or_default();
-            slot.upgrade().unwrap_or_else(|| {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                *slot = Arc::downgrade(&lock);
-                lock
-            })
-        };
-        lock.lock_owned().await
+        self.operations.lock(pod_id).await
     }
 
     /// Create a new pod

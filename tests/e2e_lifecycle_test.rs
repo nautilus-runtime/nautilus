@@ -312,6 +312,7 @@ async fn test_e2e_state_persistence() {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             open_stdin: false,
+            vm: None,
         };
         
         state_manager.save_pod_state(&pod_state).await.unwrap();

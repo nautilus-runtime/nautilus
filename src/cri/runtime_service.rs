@@ -65,6 +65,39 @@ pub struct NautilusRuntimeService {
     policy: Arc<crate::policy::PolicyEngine>,
 }
 
+fn validate_vm_container(config: &ContainerConfig) -> Result<(), Status> {
+    let unsupported = |msg| Status::unimplemented(msg);
+    if config.windows.is_some() || !config.devices.is_empty() || !config.cdi_devices.is_empty()
+        || config.tty || config.stdin || config.stdin_once || config.stop_signal != 0 || !config.mounts.is_empty() {
+        return Err(unsupported("VM guest does not support requested devices, mounts, terminal, stdin, stop signal or Windows configuration"));
+    }
+    if config.envs.iter().any(|e| std::str::from_utf8(&e.value).is_err() || e.key.is_empty() || e.key.contains('=')) {
+        return Err(Status::invalid_argument("invalid guest environment"));
+    }
+    if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
+        if r.oom_score_adj != 0 || r.memory_swap_limit_in_bytes != 0 || !r.hugepage_limits.is_empty()
+            || !r.unified.is_empty() || !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() {
+            return Err(unsupported("VM guest supports container CPU shares, period, quota and memory limit"));
+        }
+    }
+    let sc = config.linux.as_ref().and_then(|l| l.security_context.as_ref())
+        .ok_or_else(|| unsupported("VM containers require a private PID namespace"))?;
+    let ns = sc.namespace_options.as_ref().ok_or_else(|| unsupported("VM containers require an explicit container PID namespace"))?;
+    if ns.network != NamespaceMode::Pod as i32 || ns.pid != NamespaceMode::Container as i32 || ns.ipc != NamespaceMode::Pod as i32
+        || !ns.target_id.is_empty() || ns.userns_options.as_ref().is_some_and(|u| !u.uids.is_empty() || !u.gids.is_empty() || u.mode != NamespaceMode::Node as i32) {
+        return Err(unsupported("VM containers require private PID, shared Pod network and IPC, and unmapped IDs"));
+    }
+    if sc.selinux_options.is_some() || sc.capabilities.as_ref().is_some_and(|c| !c.add_ambient_capabilities.is_empty())
+        || !matches!(sc.supplemental_groups_policy, 0 | 1) {
+        return Err(unsupported("VM guest cannot apply the requested security configuration"));
+    }
+    if sc.supplemental_groups.iter().copied().chain(sc.run_as_user.iter().chain(sc.run_as_group.iter()).map(|v| v.value))
+        .any(|id| u32::try_from(id).is_err()) {
+        return Err(Status::invalid_argument("guest user and group IDs must be unsigned 32-bit values"));
+    }
+    Ok(())
+}
+
 impl NautilusRuntimeService {
     pub fn new(
         config: Arc<Config>,
@@ -102,7 +135,8 @@ impl NautilusRuntimeService {
 
 impl NautilusRuntimeService {
     pub async fn recover_vm_pods(&self) -> crate::core::Result<()> {
-        self.pod_manager.recover_vm_pods().await
+        self.pod_manager.recover_vm_pods().await?;
+        self.container_manager.recover_guest_containers().await
     }
 
     async fn release_pod_resources(
@@ -161,6 +195,7 @@ impl NautilusRuntimeService {
             .ok_or_else(|| Status::not_found(format!("container {} not found", container_id)))?;
 
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        if c.sandbox_kind == "vm" { return Err(Status::unimplemented("guest container metrics unavailable")); }
         let (cpu_ns, mem_bytes) = match c.pid {
             Some(pid) if pid > 0 => {
                 let stat = tokio::fs::read_to_string(format!("/proc/{}/stat", pid))
@@ -642,11 +677,11 @@ impl RuntimeService for NautilusRuntimeService {
             Status::invalid_argument("Container config is required")
         })?;
         
-        let metadata = config.metadata.ok_or_else(|| {
+        let metadata = config.metadata.as_ref().ok_or_else(|| {
             Status::invalid_argument("Container metadata is required")
         })?;
         
-        let image = config.image.ok_or_else(|| {
+        let image = config.image.as_ref().ok_or_else(|| {
             Status::invalid_argument("Container image is required")
         })?;
 
@@ -678,6 +713,12 @@ impl RuntimeService for NautilusRuntimeService {
         if pod.status != PodStatus::Running {
             return Err(Status::failed_precondition("pod sandbox is not ready"));
         }
+
+        if pod.runtime_handler == "vm" {
+            validate_vm_container(&config)?;
+        }
+        let strict_groups = config.linux.as_ref().and_then(|l| l.security_context.as_ref())
+            .is_some_and(|s| s.supplemental_groups_policy == SupplementalGroupsPolicy::Strict as i32);
 
         // CRI resource constraints → backend-agnostic limits.
         let resources = config
@@ -901,7 +942,7 @@ impl RuntimeService for NautilusRuntimeService {
             }
         }
 
-        let container_id = self.container_manager.create_container(
+        let container_id = self.container_manager.create_with_process_options(
             &req.pod_sandbox_id,
             &metadata.name,
             &image.image,
@@ -925,6 +966,8 @@ impl RuntimeService for NautilusRuntimeService {
             config.labels,
             config.annotations,
             config.stdin,
+            &config.working_dir,
+            strict_groups,
         ).await.map_err(|e| Status::internal(format!("Failed to create container: {}", e)))?;
         
         if let Err(error) = self.pod_manager.add_container_to_pod(&req.pod_sandbox_id, &container_id).await {
@@ -1185,6 +1228,10 @@ impl RuntimeService for NautilusRuntimeService {
             .await
             .map_err(Status::from)?
         {
+            if c.sandbox_kind == "vm" {
+                self.container_manager.reopen_guest_log(&c.id).await.map_err(Status::from)?;
+                return Ok(Response::new(ReopenContainerLogResponse {}));
+            }
             if let Some(lp) = c.log_path {
                 if let Some(parent) = std::path::Path::new(&lp).parent() {
                     let _ = std::fs::create_dir_all(parent);

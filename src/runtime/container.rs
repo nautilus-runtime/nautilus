@@ -83,7 +83,11 @@ async fn wait_for_workload(pid: i32) -> std::io::Result<i32> {
     }
 }
 
+mod vm;
+
+#[derive(Clone)]
 pub struct ContainerManager {
+    vm_operations: Arc<crate::runtime::OperationLocks>,
     _config: Arc<Config>,
     state_manager: Arc<StateManager>,
     sandbox_registry: Arc<SandboxRegistry>,
@@ -97,6 +101,7 @@ impl ContainerManager {
         sandbox_registry: Arc<SandboxRegistry>,
     ) -> Self {
         Self {
+            vm_operations: Default::default(),
             _config: config,
             state_manager,
             sandbox_registry,
@@ -150,6 +155,29 @@ impl ContainerManager {
         annotations: HashMap<String, String>,
         stdin: bool,
     ) -> Result<String> {
+        self.create_with_process_options(pod_id, name, image, sandbox_kind, command, args,
+            log_path, volumes, env, resources, security, labels, annotations, stdin, "", false).await
+    }
+
+    pub(crate) async fn create_with_process_options(
+        &self,
+        pod_id: &str,
+        name: &str,
+        image: &str,
+        sandbox_kind: &str,
+        command: Vec<String>,
+        args: Vec<String>,
+        log_path: &str,
+        volumes: Vec<crate::sandbox::VolumeMount>,
+        env: HashMap<String, String>,
+        resources: Option<crate::sandbox::ResourceLimits>,
+        security: Option<crate::sandbox::ContainerSecurity>,
+        labels: HashMap<String, String>,
+        annotations: HashMap<String, String>,
+        stdin: bool,
+        working_dir: &str,
+        strict_groups: bool,
+    ) -> Result<String> {
         let container_id = StateManager::generate_container_id();
         let open_stdin = stdin;
 
@@ -168,7 +196,13 @@ impl ContainerManager {
         // With a CRI log target the container writes through the shared
         // log-capture bind; keep the HOST destination file in sync by making
         // the capture dir the log file's parent and binding it.
-        let (log_file, log_relpath, log_captured) = if !pod_log_dir.is_empty() && !log_path.is_empty()
+        let mut vm = None;
+        let (log_file, log_relpath, log_captured) = if sandbox_kind == "vm" {
+            let target = crate::runtime::vm_log::Target::new(std::path::Path::new(&pod_log_dir), std::path::Path::new(log_path),
+                &self._config.storage.container_dir, &container_id)?;
+            vm = Some(crate::core::state::VmContainer { preparing: true, relative_log: log_path.into(), cursor: target.prepare()? });
+            (target.path().to_owned(), String::new(), false)
+        } else if !pod_log_dir.is_empty() && !log_path.is_empty()
         {
             let rel = log_path.trim_start_matches('/').to_string();
             let host = std::path::Path::new(&pod_log_dir).join(&rel);
@@ -213,13 +247,19 @@ impl ContainerManager {
             volumes,
             finish_reason: String::new(),
             open_stdin,
+            vm,
         };
 
         // Prepare backend resources now (bundle / wasm compile) to fail fast.
         let mut spec = self.workload_spec_with_net(&container_state).await?;
+        spec.working_dir = working_dir.to_owned();
+        spec.strict_groups = strict_groups;
         spec.entrypoint = command;
         spec.args = args;
         spec.log_relpath = log_relpath;
+        if sandbox_kind == "vm" {
+            return self.create_guest(container_state, spec).await;
+        }
         let backend = self.backend_for(&container_state)?;
         backend.prepare(&spec).await?;
         if let Err(error) = self.state_manager.save_container_state(&container_state).await {
@@ -250,6 +290,7 @@ impl ContainerManager {
             args: Vec::new(), // P0: image defaults; CRI command/args merge lands with oci-distribution
             entrypoint: Vec::new(),
             working_dir: String::new(),
+            strict_groups: false,
             env: state.env.clone(),
             // Host-side capture directory; RuncBackend bind-mounts it into the
             // container at /.nautilus-log. When the CRI log path points into
@@ -333,6 +374,11 @@ impl ContainerManager {
     pub async fn start_container(&self, container_id: &str) -> Result<()> {
         let mut container_state = self.get_container_state(container_id).await?
             .ok_or_else(|| Error::Container(format!("Container {} not found", container_id)))?;
+
+        if container_state.sandbox_kind == "vm" {
+            self.guest_transition(container_id, crate::vm::workload::Operation::Start).await?;
+            return Ok(());
+        }
 
         match container_state.status {
             ContainerStatus::Created | ContainerStatus::Stopped => {}
@@ -501,6 +547,13 @@ impl ContainerManager {
         let mut container_state = self.get_container_state(container_id).await?
             .ok_or_else(|| Error::Container(format!("Container {} not found", container_id)))?;
 
+        if container_state.sandbox_kind == "vm" {
+            let ms = timeout.unwrap_or_default().checked_mul(1000).filter(|v| *v <= 300_000)
+                .ok_or_else(|| Error::Experimental("guest stop timeout exceeds 300 seconds".into()))?;
+            self.guest_transition(container_id, crate::vm::workload::Operation::Stop { timeout_ms: ms as i64 }).await?;
+            return Ok(());
+        }
+
         match container_state.status {
             ContainerStatus::Running => {}
             // Idempotent like docker: stopping an already-stopped container
@@ -544,6 +597,10 @@ impl ContainerManager {
     pub async fn remove_container(&self, container_id: &str) -> Result<()> {
         let container_state = self.get_container_state(container_id).await?
             .ok_or_else(|| Error::Container(format!("Container {} not found", container_id)))?;
+
+        if container_state.sandbox_kind == "vm" {
+            return self.remove_guest(container_id).await;
+        }
 
         // CRI allows removing a running container; runtime force-stops it.
         if container_state.status == ContainerStatus::Running {

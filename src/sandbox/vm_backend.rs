@@ -93,6 +93,12 @@ impl SandboxBackend for VmBackend {
         let root = pathrs::Root::open(&rootfs)?;
         let security = spec.security.as_ref();
         let (uid, gid) = crate::storage::user::resolve(&root, &image.user, security)?;
+        let groups = crate::storage::user::groups(
+            &root,
+            uid,
+            security.map_or(&[][..], |s| s.supplemental_groups.as_slice()),
+            spec.strict_groups,
+        )?;
         let argv = if spec.entrypoint.is_empty() {
             image.entrypoint.extend(
                 if spec.args.is_empty() {
@@ -139,7 +145,7 @@ impl SandboxBackend for VmBackend {
         let spec_json = json!({
             "ociVersion":"1.1.0",
             "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
-            "process":{"terminal":false,"user":{"uid":uid,"gid":gid,"additionalGids":security.map_or(&[][..],|s| s.supplemental_groups.as_slice())},
+            "process":{"terminal":false,"user":{"uid":uid,"gid":gid,"additionalGids":groups},
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},
             "linux":{"namespaces":[{"type":"mount"},{"type":"pid"}],"resources":resources}
         });

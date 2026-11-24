@@ -63,6 +63,26 @@ pub(crate) fn resolve(
     Ok((uid, gid))
 }
 
+/// Add the primary user's memberships from the image when CRI requests Merge.
+pub(crate) fn groups(root: &Root, uid: u32, requested: &[u32], strict: bool) -> Result<Vec<u32>> {
+    let mut groups = requested.to_vec();
+    if !strict {
+        if let Some(name) = lookup(root, "etc/passwd", |f| {
+            (f.get(2)?.parse::<u32>().ok()? == uid).then(|| f[0].to_owned())
+        })? {
+            lookup::<()>(root, "etc/group", |f| {
+                if f.get(3)?.split(',').any(|user| user == name) {
+                    groups.push(f.get(2)?.parse::<u32>().ok()?);
+                }
+                None
+            })?;
+        }
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(groups)
+}
+
 fn lookup<T>(
     root: &Root,
     path: &str,
