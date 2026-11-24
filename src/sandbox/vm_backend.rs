@@ -80,7 +80,10 @@ impl VmBackend {
             }
         }
         if let Some(r) = &spec.resources {
-            if !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() || !(-1000..=1000).contains(&r.oom_score_adj) {
+            if !r.cpuset_cpus.is_empty()
+                || !r.cpuset_mems.is_empty()
+                || !(-1000..=1000).contains(&r.oom_score_adj)
+            {
                 return Err(unsupported(
                     "unsupported container cpuset or OOM adjustment",
                 ));
@@ -148,9 +151,15 @@ impl VmBackend {
                     resources["cpu"][name] = Value::from(value);
                 }
             }
-            if !r.guest_unified.is_empty() { resources["unified"] = json!(r.guest_unified); }
+            if !r.guest_unified.is_empty() {
+                resources["unified"] = json!(r.guest_unified);
+            }
             if !r.guest_no_hugepages.is_empty() {
-                resources["hugepageLimits"] = json!(r.guest_no_hugepages.iter().map(|page| json!({"pageSize": page, "limit": 0})).collect::<Vec<_>>());
+                resources["hugepageLimits"] = json!(r
+                    .guest_no_hugepages
+                    .iter()
+                    .map(|page| json!({"pageSize": page, "limit": 0}))
+                    .collect::<Vec<_>>());
             }
             if r.memory_limit_in_bytes != 0 {
                 resources["memory"] = json!({"limit":r.memory_limit_in_bytes});
