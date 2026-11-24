@@ -63,7 +63,7 @@ fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), (toni
     if config.hostname.len() > 64 || !config.hostname.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
         return Err((tonic::Code::InvalidArgument, "invalid guest hostname"));
     }
-    let linux = config.linux.as_ref().ok_or_else(|| (tonic::Code::Unimplemented, "VM requires Linux Pod namespaces"))?;
+    let linux = config.linux.as_ref().ok_or((tonic::Code::Unimplemented, "VM requires Linux Pod namespaces"))?;
     if !linux.sysctls.is_empty() {
         return Err((tonic::Code::Unimplemented, "VM Pod sysctls are unsupported"));
     }
