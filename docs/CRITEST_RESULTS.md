@@ -20,7 +20,7 @@
 
 在 pro6000 的隔离节点使用 crictl v1.37.0、Cloud Hypervisor v55.0 和实际 guest，通过 CRI 单独核对 Exec、Attach、PortForward。修订前标准输入的 3 MiB 二进制内容经 guest cat 只返回 2,387,968 字节。修订后 3,145,728 字节逐字节一致。另验证了独立 stderr、非零退出码、终端尺寸、重连到原 init、客户端断开时取消执行、目标端口不存在、连续转发两个连接和 guest 失联的错误。在单独的 SPDY 测试中，一条流半关闭后仍能读取，将其复位后另一条流仍能传输。
 
-`347c4dc` 上默认 OCI 的未过滤 critest v1.31.1 为 **95 通过、1 失败、17 跳过**，耗时 245.738 秒。唯一失败是 HostNetwork=false 清理快速退出容器时缺失 systemd scope，由 #25 跟踪。单独运行随项目引入的 SPDY 测试，36 项通过。[协议及验证步骤](GUEST_OCI_PROTOCOL.md)
+`347c4dc` 上默认 OCI 的未过滤 critest v1.31.1 为 **95 通过、1 失败、17 跳过**，耗时 245.738 秒。唯一失败是 HostNetwork=false 清理快速退出容器时缺失 systemd scope。合入 #25 对应修复后，在最终组合 `a594097` 的新状态目录重跑，结果为 **96 通过、0 失败、17 跳过**，耗时 234.533 秒。单独运行随项目引入的 SPDY 测试，36 项通过。Cloud Hypervisor v55.0 的双 Pod 测试在 15.94 秒内完成卷、流、daemon 恢复和清理的联合验收。[协议及验证步骤](GUEST_OCI_PROTOCOL.md)
 
 ## 2026-11-24 普通 OCI 容器快速退出
 
