@@ -6,6 +6,7 @@ pub mod owner;
 pub mod resources;
 
 pub mod guest;
+pub(crate) mod workload;
 
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;

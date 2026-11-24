@@ -220,7 +220,7 @@ impl ContainerManager {
         spec.entrypoint = command;
         spec.args = args;
         spec.log_relpath = log_relpath;
-        let backend = self.sandbox_registry.resolve(sandbox_kind)?;
+        let backend = self.backend_for(&container_state)?;
         backend.prepare(&spec).await?;
         if let Err(error) = self.state_manager.save_container_state(&container_state).await {
             backend.remove(&container_id).await?;
@@ -236,12 +236,20 @@ impl ContainerManager {
         Ok(container_id)
     }
 
+    fn backend_for(&self, state: &ContainerState) -> Result<Arc<dyn crate::sandbox::SandboxBackend>> {
+        if state.sandbox_kind == "vm" {
+            return Ok(Arc::new(crate::sandbox::vm_backend::VmBackend::new(self._config.clone(), &state.pod_id)));
+        }
+        self.sandbox_registry.resolve(&state.sandbox_kind)
+    }
+
     fn workload_spec(&self, state: &ContainerState) -> Result<WorkloadSpec> {
         Ok(WorkloadSpec {
             id: state.id.clone(),
             image_ref: state.image.clone(),
             args: Vec::new(), // P0: image defaults; CRI command/args merge lands with oci-distribution
             entrypoint: Vec::new(),
+            working_dir: String::new(),
             env: state.env.clone(),
             // Host-side capture directory; RuncBackend bind-mounts it into the
             // container at /.nautilus-log. When the CRI log path points into
@@ -344,13 +352,17 @@ impl ContainerManager {
         // Persist the transient state so concurrent starts observe a sane view.
         self.state_manager.save_container_state(&container_state).await?;
 
-        let backend = self.sandbox_registry.resolve(&container_state.sandbox_kind)?;
+        let backend = self.backend_for(&container_state)?;
         let spec = self.workload_spec_with_net(&container_state).await?;
         match backend.start(&spec).await? {
             StartOutcome::Detached { pid } => {
                 container_state.status = ContainerStatus::Running;
                 container_state.started_at = Some(chrono::Utc::now());
                 container_state.pid = Some(pid);
+            }
+            StartOutcome::Guest => {
+                container_state.status = ContainerStatus::Running;
+                container_state.started_at = Some(chrono::Utc::now());
             }
             StartOutcome::Finished { exit_code } => {
                 // Batch workload already completed (typical for wasi modules).
@@ -453,7 +465,7 @@ impl ContainerManager {
                 container_id, state.status
             )));
         }
-        let backend = self.sandbox_registry.resolve(&state.sandbox_kind)?;
+        let backend = self.backend_for(&state)?;
         // CRI spec: execSync with timeout aborts once the deadline lapses —
         // backends own the deadline so the exec'd process is killed and
         // reaped, not merely abandoned by a dropped future.
@@ -481,7 +493,7 @@ impl ContainerManager {
                 container_id, state.status
             )));
         }
-        let backend = self.sandbox_registry.resolve(&state.sandbox_kind)?;
+        let backend = self.backend_for(&state)?;
         backend.exec_stream(container_id, args, env, cwd).await
     }
 
@@ -502,7 +514,7 @@ impl ContainerManager {
             }
         }
 
-        let backend = self.sandbox_registry.resolve(&container_state.sandbox_kind)?;
+        let backend = self.backend_for(&container_state)?;
         let grace = Duration::from_secs(timeout.unwrap_or(0));
         let exit_code = backend.stop(container_id, grace).await?;
         // The exit watcher may already have recorded the actual status.
@@ -535,12 +547,12 @@ impl ContainerManager {
 
         // CRI allows removing a running container; runtime force-stops it.
         if container_state.status == ContainerStatus::Running {
-            let backend = self.sandbox_registry.resolve(&container_state.sandbox_kind)?;
+            let backend = self.backend_for(&container_state)?;
             backend.stop(container_id, Duration::ZERO).await?;
             crate::network::publish::remove(container_id).await;
         }
 
-        let backend = self.sandbox_registry.resolve(&container_state.sandbox_kind)?;
+        let backend = self.backend_for(&container_state)?;
         backend.remove(container_id).await?;
 
         // Best-effort cleanup of the output capture directory.

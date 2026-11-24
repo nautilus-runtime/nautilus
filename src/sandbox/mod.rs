@@ -9,6 +9,7 @@
 pub mod runc_backend;
 pub mod spec;
 pub mod wasm_backend;
+pub(crate) mod vm_backend;
 
 use crate::core::{Config, Error, Result};
 use async_trait::async_trait;
@@ -20,6 +21,8 @@ use std::sync::Arc;
 pub enum SandboxKind {
     /// OCI containers managed through runc.
     Runc,
+    /// OCI workloads inside a Pod VM.
+    Vm,
     /// WASM/WASI modules executed in-process by wasmtime.
     Wasm,
 }
@@ -29,6 +32,7 @@ impl SandboxKind {
         match self {
             SandboxKind::Runc => "runc",
             SandboxKind::Wasm => "wasm",
+            SandboxKind::Vm => "vm",
         }
     }
 }
@@ -109,6 +113,7 @@ pub struct WorkloadSpec {
     ///   else image has entrypoint → [image-entrypoint…, args…]
     ///   else                 → [args…] (replaces image cmd)
     pub args: Vec<String>,
+    pub working_dir: String,
     /// Entrypoint override from CRI `command` (empty = use image default).
     pub entrypoint: Vec<String>,
     /// Extra environment variables.
@@ -160,6 +165,8 @@ pub struct VolumeMount {
 pub enum StartOutcome {
     /// Long-running workload: OS pid while it keeps running.
     Detached { pid: u32 },
+    /// Guest-owned process, observed using its authenticated agent.
+    Guest,
     /// Batch workload that already ran to completion inside `start`.
     Finished { exit_code: i32 },
 }

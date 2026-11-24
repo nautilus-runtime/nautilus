@@ -349,6 +349,41 @@ impl PodVmStore {
         lease.online_with_deadline(&owner).await
     }
 
+    /// Authenticate the workload endpoint while the per-Pod read lease pins this attempt.
+    pub(crate) async fn workload_channel(&self, id: &str) -> io::Result<super::workload::Channel> {
+        timeout(UNIT_BUDGET, async {
+            let lease = self
+                .lease(id, Operation::Status)
+                .await?
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+            let owner = lease
+                .load(id)?
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+            let boot = owner
+                .boot
+                .as_deref()
+                .filter(|_| !owner.removing)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "Pod VM has not committed its startup identity",
+                    )
+                })?;
+            let (_fd, dir) = lease.open_socket_directory(&owner)?;
+            let socket = dir.join("vsock.sock");
+            let metadata = fs::symlink_metadata(&socket)?;
+            if !metadata.file_type().is_socket()
+                || owner.sockets[1] != Some(FileIdentity::from_meta(&metadata))
+            {
+                return Err(invalid("workload endpoint ownership mismatch"));
+            }
+            let stream = super::connect_guest(&socket, 4083).await?;
+            super::workload::Channel::authenticate(stream, id, &owner.nonce, boot).await
+        })
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, "connecting to guest workload service"))?
+    }
+
     /// Reopen a committed guest or finish the abandoned operation under the same lease.
     pub async fn recover(&self, id: &str) -> io::Result<Option<String>> {
         timeout(RECOVERY_BUDGET, async {
