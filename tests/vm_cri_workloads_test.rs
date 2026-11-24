@@ -1,6 +1,8 @@
 //! Run on an isolated root/systemd/KVM Linux host with a workload initramfs:
 //! NAUTILUS_VM_{VMM,KERNEL,INITRAMFS,VIRTIOFSD}, NAUTILUS_CNI_BIN_DIR and
 //! NAUTILUS_TEST_BUSYBOX (static). NAUTILUS_TEST_DAEMON selects a copied daemon.
+//! Set NAUTILUS_TEST_CRICTL to an upstream crictl binary (verified with v1.37.0)
+//! for live SPDY checks. The fixture uses host python3 and iproute2 in its private network namespace.
 //! cargo test --locked --test vm_cri_workloads_test -- --ignored --nocapture
 #![cfg(target_os = "linux")]
 
@@ -413,6 +415,43 @@ async fn scenario(
         exec(cli, &a, "/bin/busybox readlink /proc/self/ns/pid").await?
             != exec(cli, &b, "/bin/busybox readlink /proc/self/ns/pid").await?
     );
+    if std::env::var_os("NAUTILUS_TEST_CRICTL").is_some() {
+        let mut config = workload("console", image, "echo guest-spdy-only > index.html; /bin/busybox httpd -f -p 127.0.0.1:18080 -h /workspace & n=0; while read v; do n=$((n+1)); echo original-$$-$n-$v; done");
+        config.stdin = true;
+        config.tty = true;
+        let console = create(cli, &id, &pod, config).await?;
+        cli.start_container(StartContainerRequest {
+            container_id: console.clone(),
+        })
+        .await?;
+        let token_url = cli
+            .exec(ExecRequest {
+                container_id: a.clone(),
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                stdout: true,
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .url;
+        let result = Command::new("python3")
+            .arg("-c")
+            .arg(include_str!("fixtures/vm_streams/cri.py"))
+            .arg(asset("NAUTILUS_TEST_CRICTL")?)
+            .arg(root.join("cri.sock"))
+            .arg(&id)
+            .arg(&a)
+            .arg(&console)
+            .arg(token_url)
+            .kill_on_drop(true)
+            .status()
+            .await?;
+        ensure!(result.success(), "crictl streaming failed: {result}");
+        cli.remove_container(RemoveContainerRequest {
+            container_id: console,
+        })
+        .await?;
+    }
     for n in 1..=10 {
         let out = exec(cli, &a, "echo x >> count; /bin/busybox wc -l < count").await?;
         ensure!(std::str::from_utf8(&out)?.trim() == n.to_string());
@@ -638,6 +677,14 @@ async fn vm_workloads_through_cri_recover_after_daemon_restart() -> Result<()> {
         ensure!(status.success(), "isolated scenario failed: {status}");
         return Ok(());
     }
+    ensure!(
+        Command::new("ip")
+            .args(["link", "set", "lo", "up"])
+            .status()
+            .await?
+            .success(),
+        "enable the isolated host namespace loopback for CRI streaming"
+    );
     let dir = tempfile::tempdir_in("/tmp")?;
     let root = dir.path();
     let image = configure(root)?;
