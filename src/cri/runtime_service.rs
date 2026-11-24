@@ -1212,6 +1212,7 @@ impl RuntimeService for NautilusRuntimeService {
                 ContainerStatus::Unknown => runtime::v1::ContainerState::ContainerUnknown,
             };
             
+            let image_id = self.images.container_image_id(&container).await;
             filtered_containers.push(Container {
                 id: container.id,
                 pod_sandbox_id: container.pod_id,
@@ -1226,7 +1227,7 @@ impl RuntimeService for NautilusRuntimeService {
                     user_specified_image: String::new(),
                     image_ref: String::new(),
                 }),
-                image_id: container.vm.map_or_else(|| container.image.clone(), |vm| vm.image_id),
+                image_id,
                 image_ref: container.image.clone(),
                 state: container_status as i32,
                 created_at: container.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -1258,6 +1259,7 @@ impl RuntimeService for NautilusRuntimeService {
             ContainerStatus::Unknown => runtime::v1::ContainerState::ContainerUnknown,
         };
 
+        let image_id = self.images.container_image_id(&c).await;
         Ok(Response::new(ContainerStatusResponse {
             status: Some(runtime::v1::ContainerStatus {
                 id: c.id.clone(),
@@ -1301,7 +1303,7 @@ impl RuntimeService for NautilusRuntimeService {
                     .collect(),
                 log_path: c.log_path.unwrap_or_default(),
                 resources: None,
-                image_id: c.vm.map_or(c.id, |vm| vm.image_id),
+                image_id,
                 user: None,
                 stop_signal: 0, // SIGTERM (proto enum 0); not configurable yet
             }),

@@ -898,7 +898,7 @@ const DEFAULT_CAPS: [&str; 14] = [
 
 impl RuncBackend {
     /// Shared body of prepare(), split so failure cleanup can wrap it.
-    async fn prepare_inner(&self, bundle: &Path, spec: &WorkloadSpec) -> Result<()> {
+    async fn prepare_inner(&self, bundle: &Path, spec: &WorkloadSpec) -> Result<String> {
         // A bidirectional host mount needs the daemon's original shared
         // propagation topology. Preserve it with the ordinary OCI bundle.
         let overlay = !spec.volumes.iter().any(|v| v.propagation == "rshared");
@@ -965,7 +965,7 @@ impl RuncBackend {
         )
         })).await.map_err(|e| Error::Runtime(format!("prepare rootfs view: {e}")))??;
         tracing::info!(container_id = %id, image = %image, "runc bundle prepared");
-        Ok(())
+        Ok(w.image_id)
     }
 }
 
@@ -976,6 +976,10 @@ impl SandboxBackend for RuncBackend {
     }
 
     async fn prepare(&self, spec: &WorkloadSpec) -> Result<()> {
+        self.prepare_image(spec).await.map(drop)
+    }
+
+    async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
         let bundle = self.bundle_dir(&spec.id);
         crate::storage::snapshot::begin(&bundle)?;
         let result = async {

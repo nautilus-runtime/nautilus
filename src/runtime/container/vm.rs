@@ -43,7 +43,7 @@ impl ContainerManager {
                 state.vm.as_mut().unwrap().cursor = claim.cursor();
                 manager.save_guest(&state).await?;
                 claim.publish()?;
-                state.vm.as_mut().unwrap().image_id = backend.prepare_workload(&spec).await?;
+                state.image_id = backend.prepare_image(&spec).await?;
                 let created = backend.call(&state.id, Operation::Status).await?;
                 observe(&mut state, created)?;
                 state.vm.as_mut().expect("VM creation intent").preparing = false;

@@ -382,6 +382,33 @@ impl ImageManager {
         Err(Error::Image(format!("no pulled manifest for image ID {image}")))
     }
 
+    /// Legacy bundles can identify their immutable manifest or snapshot after
+    /// an upgrade. A mutable tag alone cannot establish what was executed.
+    pub(crate) async fn container_image_id(&self, state: &crate::core::ContainerState) -> String {
+        if !state.image_id.is_empty() {
+            return state.image_id.clone();
+        }
+        if let Some(vm) = &state.vm {
+            return vm.image_id.clone();
+        }
+        if matches!(state.sandbox_kind.as_str(), "wasi" | "wasm") {
+            return state.image.clone();
+        }
+        if state.image.contains('@') {
+            if let Some(facts) = super::pull::cached_image_facts(&self.config, &state.image).await {
+                return facts.config_digest;
+            }
+        }
+        let bundle = self.config.storage.container_dir.join(&state.id);
+        if let Some(key) = super::snapshot::pinned_image_key(&bundle).await {
+            if let Some(record) = self.images.read().await.values()
+                .find(|r| !r.image_id.is_empty() && super::snapshot::image_key(&r.image_id) == key) {
+                return record.image_id.clone();
+            }
+        }
+        String::new()
+    }
+
     /// Get image status/information
     pub async fn get_image_status(&self, image_ref: &str) -> Result<Option<ImageInfo>> {
         let images = self.images.read().await;

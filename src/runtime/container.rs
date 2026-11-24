@@ -232,12 +232,13 @@ impl ContainerManager {
         // Stored in the workload spec below via state.
         let _ = log_captured;
 
-        let container_state = ContainerState {
+        let mut container_state = ContainerState {
             id: container_id.clone(),
             pod_id: pod_id.to_string(),
             attempt,
             name: name.to_string(),
             image: image.to_string(),
+            image_id: String::new(),
             status: ContainerStatus::Created,
             created_at: chrono::Utc::now(),
             started_at: None,
@@ -270,7 +271,7 @@ impl ContainerManager {
             return self.create_guest(container_state, spec).await;
         }
         let backend = self.backend_for(&container_state)?;
-        backend.prepare(&spec).await?;
+        container_state.image_id = backend.prepare_image(&spec).await?;
         if let Err(error) = self.state_manager.save_container_state(&container_state).await {
             backend.remove(&container_id).await?;
             return Err(error);

@@ -15,6 +15,9 @@ pub struct ContainerState {
     pub attempt: u32,
     pub name: String,
     pub image: String,
+    /// Config digest of the manifest that supplied the prepared OCI rootfs.
+    #[serde(default)]
+    pub image_id: String,
     pub status: ContainerStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -53,7 +56,8 @@ pub struct ContainerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmContainer {
-    #[serde(default)]
+    // Older Pod VM records kept the config digest here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_id: String,
     pub preparing: bool,
     #[serde(default)]

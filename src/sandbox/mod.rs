@@ -210,6 +210,13 @@ pub trait SandboxBackend: Send + Sync {
     /// bundle, compile the wasm module... Must fail fast on unusable inputs.
     async fn prepare(&self, spec: &WorkloadSpec) -> Result<()>;
 
+    /// Prepare once and return the image identity used by this container. An
+    /// OCI backend obtains this from the same manifest that supplied its rootfs.
+    async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
+        self.prepare(spec).await?;
+        Ok(spec.image_ref.clone())
+    }
+
     /// Start the workload.
     async fn start(&self, spec: &WorkloadSpec) -> Result<StartOutcome>;
 

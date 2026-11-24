@@ -212,6 +212,10 @@ impl SandboxBackend for VmBackend {
         self.prepare_workload(spec).await.map(drop)
     }
 
+    async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
+        self.prepare_workload(spec).await
+    }
+
     async fn start(&self, spec: &WorkloadSpec) -> Result<StartOutcome> {
         self.call(&spec.id, Operation::Start).await?;
         Ok(StartOutcome::Guest)
