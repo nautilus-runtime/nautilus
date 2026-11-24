@@ -18,13 +18,15 @@ type user struct {
 	Groups []uint32 `json:"additionalGids,omitempty"`
 }
 type process struct {
-	Terminal bool                `json:"terminal"`
-	User     *user               `json:"user"`
-	Args     []string            `json:"args"`
-	Env      []string            `json:"env"`
-	Cwd      string              `json:"cwd"`
-	Caps     map[string][]string `json:"capabilities"`
-	NNP      bool                `json:"noNewPrivileges"`
+	OpenStdin bool                `json:"-"`
+	StdinOnce bool                `json:"-"`
+	Terminal  bool                `json:"terminal"`
+	User      *user               `json:"user"`
+	Args      []string            `json:"args"`
+	Env       []string            `json:"env"`
+	Cwd       string              `json:"cwd"`
+	Caps      map[string][]string `json:"capabilities"`
+	NNP       bool                `json:"noNewPrivileges"`
 }
 type root struct {
 	Path     string `json:"path"`
@@ -56,11 +58,12 @@ type linuxSpec struct {
 	Resources  *resources  `json:"resources,omitempty"`
 }
 type spec struct {
-	Version string      `json:"ociVersion"`
-	Root    root        `json:"root"`
-	Process process     `json:"process"`
-	Linux   linuxSpec   `json:"linux"`
-	Mounts  []mountSpec `json:"mounts,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+	Version     string            `json:"ociVersion"`
+	Root        root              `json:"root"`
+	Process     process           `json:"process"`
+	Linux       linuxSpec         `json:"linux"`
+	Mounts      []mountSpec       `json:"mounts,omitempty"`
 }
 
 func absolute(s string) bool {
@@ -136,8 +139,18 @@ func prepare(id, private string) (process, error) {
 	if err = strictJSON(b, &s); err != nil {
 		return s.Process, err
 	}
-	if (s.Version != "1.0.2" && s.Version != "1.1.0" && s.Version != "1.2.0") || s.Root.Path != "rootfs" || !validArgv(s.Process.Args) || s.Process.User == nil || s.Process.Terminal || !s.Process.NNP || !absolute(s.Process.Cwd) {
+	if (s.Version != "1.0.2" && s.Version != "1.1.0" && s.Version != "1.2.0") || s.Root.Path != "rootfs" || !validArgv(s.Process.Args) || s.Process.User == nil || !s.Process.NNP || !absolute(s.Process.Cwd) {
 		return s.Process, errors.New("unsupported OCI process, root, or version")
+	}
+	for k, v := range s.Annotations {
+		if (k != "io.nautilus.stdin" && k != "io.nautilus.stdinOnce") || (v != "true" && v != "false") {
+			return s.Process, errors.New("invalid guest stdin annotation")
+		}
+	}
+	s.Process.OpenStdin = s.Annotations["io.nautilus.stdin"] == "true"
+	s.Process.StdinOnce = s.Annotations["io.nautilus.stdinOnce"] == "true"
+	if s.Process.StdinOnce && !s.Process.OpenStdin {
+		return s.Process, errors.New("stdinOnce requires stdin")
 	}
 	for _, v := range s.Process.Env {
 		name, _, ok := strings.Cut(v, "=")
@@ -169,6 +182,7 @@ func prepare(id, private string) (process, error) {
 	mounts := []mountSpec{
 		{"proc", "proc", "/proc", []string{"nosuid", "nodev", "noexec"}},
 		{"tmpfs", "tmpfs", "/dev", []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{"devpts", "devpts", "/dev/pts", []string{"newinstance", "nosuid", "noexec", "ptmxmode=0666", "mode=0620", "gid=5"}},
 		{"mqueue", "mqueue", "/dev/mqueue", []string{"nosuid", "nodev", "noexec"}},
 	}
 	if ns["ipc"] {

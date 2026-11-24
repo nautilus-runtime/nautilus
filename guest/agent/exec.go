@@ -5,18 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"golang.org/x/sys/unix"
 	"io"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// Each attached runc exec owns a guest cgroup. Killing the whole cgroup also
-// reaches children that have changed their process group or closed stdio.
 type capture struct {
 	buf      bytes.Buffer
 	overflow bool
@@ -34,38 +31,6 @@ func (w *capture) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// runc can continue forwarding stdio from descendants after the requested
-// process has exited. Its pidfd identifies that process throughout its lifetime.
-func waitExecLeader(listener *net.UnixListener) error {
-	conn, err := listener.AcceptUnix()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	var payload [4096]byte
-	rights := make([]byte, unix.CmsgSpace(4))
-	_, n, flags, _, err := conn.ReadMsgUnix(payload[:], rights)
-	if err != nil {
-		return err
-	}
-	msgs, err := unix.ParseSocketControlMessage(rights[:n])
-	if err != nil || len(msgs) != 1 || flags&unix.MSG_CTRUNC != 0 {
-		return errors.New("invalid runc pidfd")
-	}
-	fds, err := unix.ParseUnixRights(&msgs[0])
-	if err != nil || len(fds) != 1 {
-		return errors.New("missing runc pidfd")
-	}
-	defer unix.Close(fds[0])
-	poll := []unix.PollFd{{Fd: int32(fds[0]), Events: unix.POLLIN}}
-	for {
-		_, err = unix.Poll(poll, -1)
-		if !errors.Is(err, unix.EINTR) {
-			return err
-		}
-	}
-}
-
 func (c *container) exec(parent context.Context, q request) response {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -74,6 +39,20 @@ func (c *container) exec(parent context.Context, q request) response {
 		ctx, stop = context.WithTimeout(ctx, time.Duration(*q.Timeout)*time.Millisecond)
 		defer stop()
 	}
+	stdout, stderr := &capture{cancel: cancel}, &capture{cancel: cancel}
+	res := c.runExec(ctx, q.Argv, false, false, func(_ *processIO) error { return nil }, stdout, stderr)
+	if stdout.overflow || stderr.overflow {
+		return fail("limit", "exec output exceeds 256 KiB per stream")
+	}
+	if res.OK {
+		res.Stdout, res.Stderr = stdout.buf.Bytes(), stderr.buf.Bytes()
+	}
+	return res
+}
+
+// As guest subreaper, wait for the exact process spawned by detached runc.
+// Its private cgroup also covers descendants that outlive or detach from it.
+func (c *container) runExec(ctx context.Context, argv []string, tty, stdin bool, ready func(*processIO) error, stdout, stderr io.Writer) response {
 	dir, err := os.MkdirTemp(c.dir, "exec-")
 	if err != nil {
 		return fail("runtime", err)
@@ -88,8 +67,10 @@ func (c *container) exec(parent context.Context, q request) response {
 	if _, err = os.Stat(filepath.Join(group, "cgroup.kill")); err != nil {
 		return fail("runtime", "exec requires cgroup v2 cgroup.kill")
 	}
+	defer kill()
 	p := c.p
-	p.Args = q.Argv
+	p.Args = argv
+	p.Terminal = tty
 	data, err := json.Marshal(p)
 	if err != nil {
 		return fail("invalid", err)
@@ -98,98 +79,65 @@ func (c *container) exec(parent context.Context, q request) response {
 	if err = os.WriteFile(cfg, data, 0600); err != nil {
 		return fail("runtime", err)
 	}
-	// Keep the runc supervisor alive to reap the exec process and report its status.
-	runctx, abort := context.WithCancel(context.Background())
-	defer abort()
-	runtimeLog := filepath.Join(dir, "runtime.log")
-	socket := filepath.Join(dir, "pidfd.sock")
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	setup, stop := context.WithTimeout(ctx, 10*time.Second)
+	defer stop()
+	cmd := runc(setup, "--log", filepath.Join(dir, "runtime.log"), "exec", "--detach", "--pid-file", filepath.Join(dir, "pid"), "--cgroup", filepath.Base(dir), "--process", cfg)
+	pio, pid, err := launchIO(cmd, dir, c.id, tty, stdin)
 	if err != nil {
-		return fail("runtime", err)
-	}
-	defer listener.Close()
-	cmd := runc(runctx, "--log", runtimeLog, "exec", "--pidfd-socket", socket, "--cgroup", filepath.Base(dir), "--process", cfg, c.id)
-	stdout, stderr := &capture{cancel: cancel}, &capture{cancel: cancel}
-	outR, outW, err := os.Pipe()
-	if err != nil {
-		return fail("runtime", err)
-	}
-	defer outR.Close()
-	defer outW.Close()
-	errR, errW, err := os.Pipe()
-	if err != nil {
-		return fail("runtime", err)
-	}
-	defer errR.Close()
-	defer errW.Close()
-	cmd.Stdout, cmd.Stderr = outW, errW
-	if err = cmd.Start(); err != nil {
-		return fail("runtime", err)
-	}
-	outW.Close()
-	errW.Close()
-	watched := make(chan struct{})
-	go func() {
-		defer close(watched)
-		if waitExecLeader(listener) == nil {
-			kill()
+		if ctx.Err() != nil {
+			return fail("timeout", ctx.Err())
 		}
-	}()
-	defer func() { listener.Close(); <-watched }()
-	// Wait observes the runc supervisor independently of descendants holding
-	// stdout/stderr open. Once the cgroup is empty, both pipes reach EOF.
+		return fail("runtime", err)
+	}
+	defer pio.close()
+	if err = ready(pio); err != nil {
+		kill()
+	}
 	var streams sync.WaitGroup
-	streams.Add(2)
-	go func() { defer streams.Done(); io.Copy(stdout, outR) }()
-	go func() { defer streams.Done(); io.Copy(stderr, errR) }()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		// Cancellation can race runc placement. Keep killing until its supervisor
-		// has exited (and once afterwards); bound a broken runtime's setup.
-		timer := time.NewTimer(3 * time.Second)
-		defer timer.Stop()
-		tick := time.NewTicker(10 * time.Millisecond)
-		defer tick.Stop()
-	waiting:
+	for name, file := range pio.outputs {
+		w := stdout
+		if name == "stderr" {
+			w = stderr
+		}
+		streams.Add(1)
+		go func() { defer streams.Done(); io.Copy(w, file) }()
+	}
+	done := make(chan struct{})
+	var ws unix.WaitStatus
+	var waitErr error
+	go func() {
+		defer close(done)
 		for {
-			kill()
-			select {
-			case <-done:
-				break waiting
-			case <-tick.C:
-			case <-timer.C:
-				abort()
-				<-done
-				break waiting
+			_, waitErr = unix.Wait4(pid, &ws, 0, nil)
+			if !errors.Is(waitErr, unix.EINTR) {
+				return
 			}
 		}
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		kill()
+		<-done
 	}
-	if killErr := kill(); killErr != nil && !errors.Is(killErr, os.ErrNotExist) {
-		outR.Close()
-		errR.Close()
+	if e := kill(); e != nil && !errors.Is(e, os.ErrNotExist) {
+		pio.close()
 		streams.Wait()
-		return fail("runtime", killErr)
+		return fail("runtime", e)
 	}
 	streams.Wait()
-	if stdout.overflow || stderr.overflow {
-		return fail("limit", "exec output exceeds 256 KiB per stream")
+	if err != nil {
+		return fail("runtime", err)
 	}
 	if ctx.Err() != nil {
 		return fail("timeout", ctx.Err())
 	}
-	code := 0
-	if err != nil {
-		var exit *exec.ExitError
-		if !errors.As(err, &exit) {
-			return fail("runtime", err)
-		}
-		code = exit.ExitCode()
-		if b, _ := os.ReadFile(runtimeLog); bytes.Contains(b, []byte("level=error")) {
-			return fail("runtime", string(b))
-		}
+	if waitErr != nil {
+		return fail("runtime", waitErr)
 	}
-	return response{OK: true, status: status{ExitCode: code}, Stdout: stdout.buf.Bytes(), Stderr: stderr.buf.Bytes()}
+	code := ws.ExitStatus()
+	if ws.Signaled() {
+		code = 128 + int(ws.Signal())
+	}
+	return success(status{ExitCode: code})
 }

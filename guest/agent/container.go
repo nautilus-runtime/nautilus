@@ -25,6 +25,8 @@ type logState struct {
 }
 
 type container struct {
+	io               *processIO
+	attach           attachHub
 	runtimeAttempted bool
 	logState         logState
 	mu               sync.Mutex
@@ -68,7 +70,7 @@ func command(args ...string) error {
 func (c *container) copyLog(stream string, r *os.File, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer r.Close()
-	reader := bufio.NewReaderSize(r, 16<<10)
+	reader := bufio.NewReaderSize(io.TeeReader(r, attachmentWriter{&c.attach, stream}), 16<<10)
 	for {
 		line, err := reader.ReadSlice('\n')
 		if len(line) > 0 {
@@ -112,39 +114,25 @@ func (c *container) create() error {
 			os.Remove(logpath)
 		}
 	}()
-	outR, outW, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-	defer outW.Close()
-	errR, errW, err := os.Pipe()
-	if err != nil {
-		outR.Close()
-		return err
-	}
-	defer errW.Close()
-	var streams sync.WaitGroup
-	streams.Add(2)
-	go c.copyLog("stdout", outR, &streams)
-	go c.copyLog("stderr", errR, &streams)
 	pidfile := filepath.Join(c.dir, "pid")
-	runtimeLog := filepath.Join(c.dir, "runtime.log")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := runc(ctx, "--log", runtimeLog, "create", "--no-pivot", "--bundle", c.dir, "--pid-file", pidfile, c.id)
-	cmd.Stdout, cmd.Stderr = outW, errW
+	cmd := runc(ctx, "--log", filepath.Join(c.dir, "runtime.log"), "create", "--no-pivot", "--bundle", c.dir, "--pid-file", pidfile)
 	c.runtimeAttempted = true
-	if err = cmd.Run(); err != nil {
-		b, _ := os.ReadFile(runtimeLog)
-		return fmt.Errorf("runc create: %w: %.2048s", err, b)
-	}
-	raw, err := os.ReadFile(pidfile)
+	pio, pid, err := launchIO(cmd, c.dir, c.id, p.Terminal, p.OpenStdin)
 	if err != nil {
 		return err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid < 2 {
-		return errors.New("invalid runc PID")
+	c.io = pio
+	defer func() {
+		if !complete {
+			pio.close()
+		}
+	}()
+	var streams sync.WaitGroup
+	for name, file := range pio.outputs {
+		streams.Add(1)
+		go c.copyLog(name, file, &streams)
 	}
 	c.pidfd, err = unix.PidfdOpen(pid, 0)
 	if err != nil {
@@ -172,6 +160,7 @@ func (c *container) create() error {
 		}
 		c.exited = status{ExitCode: code, Finished: time.Now().UnixNano()}
 		streams.Wait()
+		pio.close()
 		close(c.done)
 	}()
 	complete = true
@@ -255,7 +244,7 @@ func (s *server) dispatch(ctx context.Context, q request) response {
 	default:
 		return fail("invalid", "unknown operation")
 	}
-	if (useExec && (!validArgv(q.Argv) || q.Timeout == nil)) || (!useExec && q.Argv != nil) ||
+	if q.Stream != nil || (useExec && (!validArgv(q.Argv) || q.Timeout == nil)) || (!useExec && q.Argv != nil) ||
 		(q.Timeout != nil && ((!useExec && !useStop) || *q.Timeout < 0 || *q.Timeout > 300000)) ||
 		(readLog && (q.Offset == nil || *q.Offset < 0 || q.Limit == nil || *q.Limit < 1 || *q.Limit > maxOutput)) || (!readLog && (q.Offset != nil || q.Limit != nil)) {
 		return fail("invalid", "invalid operation arguments")
