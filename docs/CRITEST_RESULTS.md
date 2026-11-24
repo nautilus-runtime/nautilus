@@ -14,7 +14,7 @@ guest 与宿主均读到对方写入的 hostPath 文件。ConfigMap 在 guest �
 
 在同一 daemon 替换测试 CNI 配置并触发一次 VM 创建失败，CRI 和 Node 均撤回 `vm`，修复配置后两者自动恢复。以升级前的运行中 VM 验证，daemon 升级后保持 guest boot，依据 MainPID 持有的 OFD 锁登记原 inode 131691，随后 VMM 被强制终止，整个 attempt 可回收。另一台升级前已退出的 VM 保留了遗留锁的原 inode 131687，Pod 和原 IP 均成功回收。[VMM 锁的恢复规则](VM_RUNTIME.md#首版使用系统级-systemd-托管-vmm)
 
-新版 critest v1.37.0 首轮为 101 通过、4 失败、37 跳过。两个失败涉及镜像配置 ID，另两项涉及并发 RemoveImage 和 sandbox attempt。修复后、加入 VMM 锁恢复前的 `385b34d` 为 105 通过、0 失败、37 跳过，v1.31.1 为 96 通过、0 失败、17 跳过。最终在 `58e5ea5` 上分别以同一 daemon 的 Unix socket 作为 runtime 和 image endpoint，未过滤的 **v1.37.0 为 105 通过、0 失败、37 跳过**，耗时 320.568 秒，**v1.31.1 为 96 通过、0 失败、17 跳过**，耗时 235.510 秒。两个独立节点在各自套件结束后均通过 CRI 确认 Pod 和容器数为零。该提交运行完整 Rust 测试得到 104 通过、0 失败、8 项默认忽略。全库 fmt 涉及与主线基线相同的 31 个文件，Clippy 在 `-D warnings` 下均报告 29 项诊断。
+新版 critest v1.37.0 首轮为 101 通过、4 失败、37 跳过。两个失败涉及镜像配置 ID，另两项涉及并发 RemoveImage 和 sandbox attempt。修复后、加入 VMM 锁恢复前的 `385b34d` 为 105 通过、0 失败、37 跳过，v1.31.1 为 96 通过、0 失败、17 跳过。最终在 `58e5ea5` 上分别以同一 daemon 的 Unix socket 作为 runtime 和 image endpoint，未过滤的 **v1.37.0 为 105 通过、0 失败、37 跳过**，耗时 320.568 秒，**v1.31.1 为 96 通过、0 失败、17 跳过**，耗时 235.510 秒。另用 v1.31.1 聚焦 HostNetwork=false 的快速退出清理用例，1 通过、0 失败、112 项未选中，耗时 5.032 秒。两个独立节点在各自套件结束后均通过 CRI 确认 Pod 和容器数为零。该提交运行完整 Rust 测试得到 104 通过、0 失败、8 项默认忽略。全库 fmt 涉及与主线基线相同的 31 个文件，Clippy 在 `-D warnings` 下均报告 29 项诊断。
 
 ## 2026-11-24 Pod VM 宿主卷
 
