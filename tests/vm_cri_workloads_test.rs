@@ -878,7 +878,11 @@ async fn scenario(
     fs::rename(&socket, &detached)?;
     let disconnected = exec(cli, &a, "echo unexpected").await;
     let unavailable = container_usage(cli, &a).await;
-    let foreign_stats = cli.pod_sandbox_stats(PodSandboxStatsRequest { pod_sandbox_id: other.clone() }).await;
+    let foreign_stats = cli
+        .pod_sandbox_stats(PodSandboxStatsRequest {
+            pod_sandbox_id: other.clone(),
+        })
+        .await;
     let observed = state(cli, &a).await;
     let listing = cli.list_containers(ListContainersRequest::default()).await;
     let other_boot = boot_id(cli, &other).await;

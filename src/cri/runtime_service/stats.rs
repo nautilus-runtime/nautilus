@@ -32,9 +32,9 @@ pub(super) fn pod_attributes(p: &PodState) -> rt::PodSandboxAttributes {
     }
 }
 
-fn readings(s: Sample) -> Result<(rt::CpuUsage, rt::MemoryUsage), Status> {
+fn readings(s: Sample) -> Result<(rt::CpuUsage, rt::MemoryUsage), &'static str> {
     if s.timestamp <= 0 || s.working_set_bytes > s.memory_usage_bytes {
-        return Err(Status::data_loss("invalid guest cgroup sample"));
+        return Err("invalid guest cgroup sample");
     }
     let value = |n| rt::UInt64Value { value: n };
     Ok((
@@ -57,7 +57,7 @@ fn readings(s: Sample) -> Result<(rt::CpuUsage, rt::MemoryUsage), Status> {
     ))
 }
 
-fn container_stats(c: &ContainerState, s: Sample) -> Result<rt::ContainerStats, Status> {
+fn container_stats(c: &ContainerState, s: Sample) -> Result<rt::ContainerStats, &'static str> {
     let (cpu, memory) = readings(s)?;
     Ok(rt::ContainerStats {
         attributes: Some(container_attributes(c)),
@@ -102,7 +102,7 @@ impl NautilusRuntimeService {
         let (sample, _) = self
             .guest_sample(&c.pod_id, &c.id, Operation::Stats)
             .await?;
-        container_stats(c, sample)
+        container_stats(c, sample).map_err(Status::data_loss)
     }
 
     pub(super) async fn guest_pod_stats(
@@ -110,7 +110,7 @@ impl NautilusRuntimeService {
         pod: &PodState,
     ) -> Result<rt::PodSandboxStats, Status> {
         let (sample, mut reply) = self.guest_sample(&pod.id, "", Operation::PodStats).await?;
-        let (cpu, memory) = readings(sample)?;
+        let (cpu, memory) = readings(sample).map_err(Status::data_loss)?;
         let mut containers = Vec::new();
         for c in self
             ._state_manager
@@ -119,7 +119,7 @@ impl NautilusRuntimeService {
             .map_err(Status::from)?
         {
             if let Some(s) = reply.containers.remove(&c.id) {
-                containers.push(container_stats(&c, s)?);
+                containers.push(container_stats(&c, s).map_err(Status::data_loss)?);
             }
         }
         Ok(rt::PodSandboxStats {
