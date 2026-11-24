@@ -1,5 +1,7 @@
 //! Local Cloud Hypervisor compatibility probe.
 
+pub mod guest;
+
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -117,7 +119,7 @@ async fn wait_for_exit(child: &mut Child, pid: u32, budget: Duration) -> io::Res
 
 async fn wait_for_guest(socket: &Path) -> io::Result<()> {
     let mut stream = loop {
-        match connect_guest(socket).await {
+        match connect_guest(socket, 4081).await {
             Ok(stream) => break stream,
             // The VMM can listen before the guest has bound its port. In that
             // window it may close the stream without acknowledging CONNECT.
@@ -150,9 +152,9 @@ async fn wait_for_guest(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
-async fn connect_guest(socket: &Path) -> io::Result<BufReader<UnixStream>> {
+async fn connect_guest(socket: &Path, port: u32) -> io::Result<BufReader<UnixStream>> {
     let mut stream = BufReader::new(UnixStream::connect(socket).await?);
-    stream.get_mut().write_all(b"CONNECT 4081\n").await?;
+    stream.get_mut().write_all(format!("CONNECT {port}\n").as_bytes()).await?;
     // Cloud Hypervisor replies with its assigned host-side port.
     let mut header = String::new();
     if (&mut stream).take(16).read_line(&mut header).await? == 0 {
