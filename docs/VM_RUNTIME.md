@@ -15,12 +15,12 @@
 
 ### guest 启动身份
 
-`guest/build-initramfs.sh OUTPUT [KERNEL_RELEASE]` 构建自研 guest agent 的 initramfs。该程序作为 PID 1，在端口 4082 接受来自宿主 CID 2 的 `IDENTIFY 1` 请求。它从内核命令行读取 sandbox ID 与每次启动的 nonce，从 guest 的 procfs 读取 boot ID。宿主校验应答中的三项身份，再与持久化记录核对。探针使用的示例 initramfs 与此镜像分别构建。
+`guest/build-initramfs.sh OUTPUT [KERNEL_RELEASE]` 构建自研 guest agent 的 initramfs。该程序作为 PID 1，在端口 4082 接受来自宿主 CID 2 的 `IDENTIFY 1` 请求。它从内核命令行读取 sandbox ID 与每次启动的 nonce，从 guest 的 procfs 读取 boot ID。宿主核对 sandbox ID 和 nonce，校验 boot ID 的格式并将它返回。生命周期管理器将在 #3 把它与持久化的 boot ID 比对。探针使用的示例 initramfs 与此镜像分别构建。
 
 | 输入或事件 | 可观察结果 |
 | --- | --- |
 | 合法 sandbox ID 与 nonce | 返回 `IDENTITY 1 <sandbox-id> <nonce> <boot-id>`。 |
-| 版本、sandbox ID、nonce 或 boot ID 不匹配；应答超长或被截断 | 宿主拒绝把这条连接认作该 sandbox 的 guest。 |
+| 版本、sandbox ID 或 nonce 不匹配，boot ID 格式无效，或应答超长、被截断 | 宿主拒绝把这条连接认作该 sandbox 的 guest。 |
 | 同一 guest 上多次查询 | boot ID 保持一致；宿主据此识别 guest 是否在两次调用之间重新引导。 |
 
 ## 创建、恢复与删除

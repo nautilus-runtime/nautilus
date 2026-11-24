@@ -107,7 +107,6 @@ static void identify(int peer, const char *response)
 int main(void)
 {
     if (!mount_guest_fs("proc", "/proc", MS_NOSUID | MS_NOEXEC | MS_NODEV) ||
-        !mount_guest_fs("devtmpfs", "/dev", MS_NOSUID | MS_NOEXEC) ||
         load_modules() < 0) {
         perror("guest initialization");
         return EXIT_FAILURE;
