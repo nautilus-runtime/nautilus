@@ -119,6 +119,7 @@ impl RuncBackend {
     /// into the CRI log file by `spawn_output_logger`.
     async fn start_libcontainer(&self, spec: &WorkloadSpec) -> Result<StartOutcome> {
         let root = self.lc_root();
+        let systemd = self.config.runtime.runc.systemd_cgroup;
         let id = spec.id.clone();
         let bundle = self.bundle_dir(&spec.id);
 
@@ -211,6 +212,7 @@ impl RuncBackend {
             }
             let (mut container, _pty) = builder
                 .as_init(bundle.clone())
+                .with_systemd(systemd)
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: create: {e}")))?;
             container.start().map_err(|e| {
@@ -248,14 +250,21 @@ impl RuncBackend {
         // removes the scope right after death, so the reaper cannot read it
         // post-mortem without racing).
         let oom_id = spec.id.clone();
-        let scope_mem_events = systemd_scope(&spec.id).join("memory.events");
-        if let Some(base) = system_slice_oom_kill() {
-            oom_baselines().lock().unwrap().insert(spec.id.clone(), base);
+        let scope_mem_events = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
+            .and_then(|text| text.lines().find_map(|line| line.strip_prefix("0::/").map(str::to_owned)))
+            .map(|cgroup| Path::new("/sys/fs/cgroup").join(cgroup).join("memory.events"));
+        if let Some(ref scope) = scope_mem_events {
+            if let Some(parent) = scope.parent().and_then(Path::parent) {
+                let events = parent.join("memory.events");
+                if let Some(base) = read_oom_kill(&events) {
+                    oom_baselines().lock().unwrap().insert(spec.id.clone(), (events, base));
+                }
+            }
         }
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
             loop {
-                match read_oom_kill(&scope_mem_events) {
+                match scope_mem_events.as_deref().and_then(read_oom_kill) {
                     Some(n) if n > 0 => {
                         oom_hits().lock().unwrap().insert(oom_id);
                         return;
@@ -453,6 +462,9 @@ impl RuncBackend {
             .map_err(|e| Error::Runtime(format!("open {}: {e}", log_path.display())))?;
 
         let mut cmd = std::process::Command::new(self.config.runtime.runc.path.clone());
+        if self.config.runtime.runc.systemd_cgroup {
+            cmd.arg("--systemd-cgroup");
+        }
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -501,6 +513,7 @@ impl RuncBackend {
         &self,
         bundle_id: &str,
         _bundle: &Path,
+        cgroup_parent: &str,
         args: Vec<String>,
         env: Vec<String>,
         cwd: &str,
@@ -720,6 +733,20 @@ impl RuncBackend {
             }));
         }
 
+        if !cgroup_parent.is_empty() {
+            spec["linux"]["cgroupsPath"] = if self.config.runtime.runc.systemd_cgroup {
+                let slice = crate::vm::resources::parent_slice(cgroup_parent)?
+                    .ok_or_else(|| Error::Config("missing systemd cgroup parent".into()))?;
+                serde_json::json!(format!("{slice}:nautilus:{bundle_id}"))
+            } else {
+                let parent = Path::new(cgroup_parent);
+                if !parent.is_absolute() || parent.components().any(|p| matches!(p, std::path::Component::ParentDir)) {
+                    return Err(Error::Config("invalid cgroupfs parent".into()));
+                }
+                serde_json::json!(parent.join(bundle_id))
+            };
+        }
+
         // Security context: per-request overrides over daemon defaults
         // (noNewPrivileges, readonly rootfs, seccomp profile resolution).
         crate::sandbox::spec::apply_security(&mut spec, security, &self.config.security);
@@ -784,8 +811,8 @@ impl RuncBackend {
 /// start; `OOM_HIT` is set by the per-container watcher that observes the
 /// container's own `memory.events` while the scope still exists. The reaper
 /// consults both when a workload dies with 137.
-fn oom_baselines() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
-    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+fn oom_baselines() -> &'static std::sync::Mutex<std::collections::HashMap<String, (PathBuf, u64)>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (PathBuf, u64)>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -827,10 +854,6 @@ pub(crate) fn read_oom_kill(path: &std::path::Path) -> Option<u64> {
     None
 }
 
-fn system_slice_oom_kill() -> Option<u64> {
-    read_oom_kill(std::path::Path::new("/sys/fs/cgroup/system.slice/memory.events"))
-}
-
 /// True when the container died from the kernel OOM killer (see reaper).
 pub fn oom_killed(container_id: &str) -> bool {
     if oom_hits().lock().unwrap().remove(container_id) {
@@ -840,8 +863,8 @@ pub fn oom_killed(container_id: &str) -> bool {
     // time the reaper runs; compare against the system-slice counter captured
     // at start (race-free — the slice outlives every scope).
     let baseline = oom_baselines().lock().unwrap().remove(container_id);
-    if let Some(base) = baseline {
-        if let Some(now) = system_slice_oom_kill() {
+    if let Some((events, base)) = baseline {
+        if let Some(now) = read_oom_kill(&events) {
             if now > base {
                 return true;
             }
@@ -923,6 +946,7 @@ impl RuncBackend {
         backend.write_spec(
             &spec.id,
             &bundle,
+            &spec.cgroup_parent,
             merged_args,
             full_env,
             &workdir,

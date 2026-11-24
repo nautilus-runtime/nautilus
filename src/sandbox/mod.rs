@@ -106,6 +106,7 @@ pub struct WorkloadSpec {
     /// Image reference. For runc: an OCI image ref pullable by the configured CLI.
     /// For wasm: `file://` path (or absolute path) to a `.wasm`/`.wat` module.
     pub image_ref: String,
+    pub cgroup_parent: String,
     /// Process arguments requested by the CRI caller.
     /// Merge semantics (docker/k8s compatible), applied by the backend:
     ///   entrypoint non-empty → [entrypoint…, args…]

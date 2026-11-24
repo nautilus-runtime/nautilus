@@ -84,6 +84,12 @@ pub struct PodState {
     /// Present for fully managed CRI VM attempts, including pending cleanup.
     #[serde(default)]
     pub vm_attempt: Option<VmPodAttempt>,
+    /// Internal startup probe; kubelet must never enumerate this sandbox.
+    #[serde(default)]
+    pub vm_probe: bool,
+    /// Exact CRI cgroup parent assigned by kubelet.
+    #[serde(default)]
+    pub cgroup_parent: String,
     /// Published Pod netns bind-mount path.
     #[serde(default)]
     pub network_namespace: Option<String>,
@@ -280,7 +286,7 @@ impl StateManager {
                     continue;
                 }
             };
-            if pod.runtime_handler == "vm" && pod.status != PodStatus::Succeeded {
+            if pod.runtime_handler == "vm" && (pod.vm_probe || pod.status != PodStatus::Succeeded) {
                 if key.strip_prefix(b"pod:") == Some(pod.id.as_bytes()) {
                     attempts.push(pod);
                 } else {

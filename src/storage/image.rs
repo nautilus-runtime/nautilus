@@ -351,6 +351,22 @@ impl ImageManager {
         Ok(result)
     }
 
+    /// Kubelet uses the config digest returned by PullImage or ImageStatus in
+    /// CreateContainer. Select a retained immutable repository manifest for it.
+    pub(crate) async fn workload_reference(&self, image: &str) -> Result<String> {
+        let Some(digest) = image.strip_prefix("sha256:") else {
+            return Ok(image.to_owned());
+        };
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(Error::Image(format!("invalid image config digest {image}")));
+        }
+        let records = self.images.read().await;
+        let manifest = records.values().find(|record| record.image_id == image)
+            .and_then(|record| record.repo_digests.first())
+            .ok_or_else(|| Error::Image(format!("no pulled manifest for image ID {image}")))?;
+        Ok(manifest.clone())
+    }
+
     /// Get image status/information
     pub async fn get_image_status(&self, image_ref: &str) -> Result<Option<ImageInfo>> {
         let images = self.images.read().await;
@@ -698,6 +714,8 @@ mod tests {
         assert_eq!(latest.size, 123);
         let old_digest = format!("example.test/project@{first}");
         assert_eq!(restarted.get_image_status(&old_digest).await.unwrap().unwrap().image_id, first);
+        assert_eq!(restarted.workload_reference(&first).await.unwrap(), old_digest);
+        assert!(restarted.workload_reference(&format!("sha256:{}", "0".repeat(64))).await.is_err());
     }
     #[tokio::test]
     async fn refresh_recovers_pending_manifest_and_normalizes_tag_aliases() {

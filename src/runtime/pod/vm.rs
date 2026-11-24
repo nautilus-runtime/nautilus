@@ -7,6 +7,16 @@ use crate::proto::runtime::v1::DnsConfig;
 use crate::vm::{owner::PodVmStore, resources::VmResources};
 
 impl PodManager {
+    pub(crate) async fn probe_workloads(&self) -> Result<()> {
+        let id = self.reserve_pod("", "", "", "vm", Default::default(), Default::default(), "",
+            "nautilus-probe", &[], &[], &[], false, false, false, false, None, "", true).await?;
+        let _guard = self.operation_guard(&id).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60),
+            self.create_vm_network_locked(&id, 0, None, &VmResources::default())).await;
+        self.rollback_vm_locked(&id).await?;
+        result.map_err(|_| Error::Runtime("VM startup probe timed out".into()))?
+    }
+
     async fn save_vm_pod(&self, pod: &PodState) -> Result<()> {
         self.state_manager.save_pod_state(pod).await?;
         self.pods.write().await.insert(pod.id.clone(), pod.clone());

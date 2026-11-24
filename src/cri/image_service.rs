@@ -29,6 +29,10 @@ impl NautilusImageService {
         }
     }
 
+    pub fn image_manager(&self) -> Arc<ImageManager> {
+        self.image_manager.clone()
+    }
+
     pub async fn initialize(&self) -> crate::core::Result<()> {
         self.image_manager.initialize().await
     }
@@ -331,7 +335,7 @@ impl ImageService for NautilusImageService {
         let filesystem_usage = FilesystemUsage {
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             fs_id: Some(FilesystemIdentifier {
-                mountpoint: "/var/lib/nautilus/images".to_string(),
+                mountpoint: self._config.storage.image_dir.to_string_lossy().into_owned(),
             }),
             used_bytes: Some(UInt64Value { value: used_bytes }),
             inodes_used: Some(UInt64Value { value: 0 }),

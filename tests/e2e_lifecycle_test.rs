@@ -266,6 +266,8 @@ async fn test_e2e_state_persistence() {
         
         let pod_state = nautilus::core::PodState {
             vm_attempt: None,
+            vm_probe: false,
+            cgroup_parent: String::new(),
             id: pod_id.clone(),
             name: "persistent-test-pod".to_string(),
             namespace: "default".to_string(),

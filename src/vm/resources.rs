@@ -63,7 +63,7 @@ fn validate(r: &LinuxContainerResources) -> io::Result<()> {
 
 // Accept a systemd slice name or its exact cgroupfs path. Moving the service
 // into a similarly named slice would charge the wrong Kubernetes Pod.
-fn parent_slice(parent: &str) -> io::Result<Option<String>> {
+pub(crate) fn parent_slice(parent: &str) -> io::Result<Option<String>> {
     if parent == "/" || parent == "-.slice" {
         return Ok(Some("-.slice".into()));
     }

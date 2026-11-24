@@ -296,6 +296,7 @@ impl ContainerManager {
         Ok(WorkloadSpec {
             id: state.id.clone(),
             image_ref: state.image.clone(),
+            cgroup_parent: String::new(),
             args: Vec::new(), // P0: image defaults; CRI command/args merge lands with oci-distribution
             entrypoint: Vec::new(),
             working_dir: String::new(),
@@ -347,6 +348,7 @@ impl ContainerManager {
         if state.sandbox_kind == "runc" {
             if let Some(pod) = self.state_manager.get_pod_state(&state.pod_id).await? {
                 spec.network_ns = pod.network_namespace;
+                spec.cgroup_parent = pod.cgroup_parent;
                 // Dedicated pod IPC ns exists only when its sysctls needed one.
                 let h = crate::network::podnet::ipcns_dir().join(&state.pod_id);
                 if h.exists() {

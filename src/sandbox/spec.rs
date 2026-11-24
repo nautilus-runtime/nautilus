@@ -182,33 +182,14 @@ pub fn apply_security(
         }
     }
 
-    // Masked paths (bind /dev/null) and read-only paths.
-    {
-        let masked: Vec<String> = security.map(|s| s.masked_paths.clone()).unwrap_or_default();
-        let ro_paths: Vec<String> = security.map(|s| s.readonly_paths.clone()).unwrap_or_default();
-        let mut mounts = spec
-            .get_mut("mounts")
-            .and_then(|m| m.as_array_mut())
-            .cloned()
-            .unwrap_or_default();
-        for p in &masked {
-            mounts.push(json!({
-                "destination": p,
-                "type": "bind",
-                "source": "/dev/null",
-                "options": ["bind", "ro", "rbind"]
-            }));
+    // The runtime applies these after entering the container rootfs. Paths
+    // absent from its procfs are permitted by the OCI runtime specification.
+    if let Some(security) = security {
+        if !security.masked_paths.is_empty() {
+            spec["linux"]["maskedPaths"] = json!(security.masked_paths);
         }
-        for p in &ro_paths {
-            mounts.push(json!({
-                "destination": p,
-                "type": "bind",
-                "source": p,
-                "options": ["bind", "ro", "rbind"]
-            }));
-        }
-        if !masked.is_empty() || !ro_paths.is_empty() {
-            spec["mounts"] = json!(mounts);
+        if !security.readonly_paths.is_empty() {
+            spec["linux"]["readonlyPaths"] = json!(security.readonly_paths);
         }
     }
 
