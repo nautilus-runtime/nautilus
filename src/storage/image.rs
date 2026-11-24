@@ -361,23 +361,27 @@ impl ImageManager {
             return Err(Error::Image(format!("invalid image config digest {image}")));
         }
         let records = self.images.read().await;
-        if let Some(manifest) = records.values().filter(|r| r.image_id == image)
-            .find_map(|r| r.repo_digests.first()) {
-            return Ok(manifest.clone());
-        }
-        // Older records stored tags and exposed the config ID lazily through
-        // ImageStatus. Match the actual cached manifest before pinning it.
-        let legacy: Vec<_> = records.values()
-            .filter(|r| r.image_id.is_empty() || (r.image_id == image && r.repo_digests.is_empty()))
-            .flat_map(|r| r.repo_digests.iter().chain(std::iter::once(&r.id)))
+        let pinned = records.values().filter(|r| r.image_id == image)
+            .find_map(|r| r.repo_digests.first()).cloned();
+        let legacy: Vec<_> = records.values().filter(|r| r.image_id.is_empty() || r.image_id == image)
+            .flat_map(|r| r.repo_tags.iter().chain(&r.repo_digests).chain(std::iter::once(&r.id)))
             .cloned().collect();
         drop(records);
-        for reference in legacy {
-            if let Some(facts) = super::pull::cached_image_facts(&self.config, &reference).await {
-                if facts.config_digest == image && !facts.manifest_digest.is_empty() {
-                    return Ok(format!("{}@{}", repo_part(&reference), facts.manifest_digest));
-                }
+        if let Some(reference) = &pinned {
+            let key = super::pull::resolve_ref(&self.config, reference)?;
+            if fs::try_exists(super::pull::manifest_cache_path(&self.config, &key)).await? {
+                return Ok(reference.clone());
             }
+        }
+        // Older stores may have only the tag's manifest file. Preserve its
+        // matching bytes under the immutable name before returning that name.
+        for reference in legacy {
+            if let Some(digest) = super::pull::cached_manifest_for_id(&self.config, &reference, image).await? {
+                return Ok(format!("{}@{digest}", repo_part(&reference)));
+            }
+        }
+        if let Some(reference) = pinned {
+            return Ok(reference);
         }
         Err(Error::Image(format!("no pulled manifest for image ID {image}")))
     }
@@ -800,7 +804,13 @@ mod tests {
         let data = serde_json::json!({"manifest": manifest, "config": ConfigFile::default(), "manifest_digest": pinned});
         let file = super::super::pull::manifest_cache_path(&config, &tag.parse().unwrap());
         fs::write(file, data.to_string()).await.unwrap();
-        assert_eq!(store.workload_reference(&id).await.unwrap(), format!("example.test/project@{pinned}"));
+        let resolved = store.workload_reference(&id).await.unwrap();
+        assert_eq!(resolved, format!("example.test/project@{pinned}"));
+        fs::remove_file(super::super::pull::manifest_cache_path(&config, &tag.parse().unwrap())).await.unwrap();
+        let bundle = dir.path().join("bundle");
+        fs::create_dir_all(bundle.join("rootfs")).await.unwrap();
+        let workload = super::super::pull::prepare_bundle(&config, &resolved, &bundle, false).await.unwrap();
+        assert_eq!(workload.image_id, id);
         assert!(store.workload_reference(&pinned).await.is_err());
     }
 

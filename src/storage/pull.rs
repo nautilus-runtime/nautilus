@@ -341,24 +341,37 @@ async fn cached_for_pull(config: &Config, reference: &Reference) -> Result<Optio
     if reference.digest().is_some() {
         return Ok(load_cached(config, reference).await);
     }
-    // Older stores cached a manifest only under its tag. Preserve its digest
-    // alias before the registry refresh replaces the tag's file.
-    let tagged = manifest_cache_path(config, reference);
-    match tokio::fs::read(&tagged).await {
-        Ok(json) => {
-            if let Ok(old) = serde_json::from_slice::<CachedManifestFile>(&json) {
-                if !old.manifest_digest.is_empty() {
-                    let pinned = Reference::with_digest(reference.registry().to_owned(), reference.repository().to_owned(), old.manifest_digest);
-                    let alias = manifest_cache_path(config, &pinned);
-                    if !alias.exists() { super::atomic_write(&alias, &json).await?; }
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    pin_cached_tag(config, reference).await?;
     // A mutable tag must always be looked up in the registry on explicit pull.
     Ok(None)
+}
+
+/// Capture both digests and publish the immutable alias from one read of
+/// the tag. Concurrent refreshes can replace that tag after we open it.
+async fn pin_cached_tag(config: &Config, reference: &Reference) -> Result<Option<(String, String)>> {
+    let json = match tokio::fs::read(manifest_cache_path(config, reference)).await {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(old) = serde_json::from_slice::<CachedManifestFile>(&json) else { return Ok(None) };
+    let digest = reference.digest().unwrap_or(&old.manifest_digest);
+    if digest.is_empty() || (!old.manifest_digest.is_empty() && old.manifest_digest != digest) {
+        return Ok(None);
+    }
+    let pinned = Reference::with_digest(reference.registry().to_owned(), reference.repository().to_owned(), digest.to_owned());
+    let alias = manifest_cache_path(config, &pinned);
+    if reference != &pinned && !tokio::fs::try_exists(&alias).await? {
+        super::atomic_write(&alias, &json).await?;
+    }
+    Ok(Some((old.manifest.config.digest, digest.to_owned())))
+}
+
+pub(super) async fn cached_manifest_for_id(config: &Config, image_ref: &str, id: &str) -> Result<Option<String>> {
+    let reference = resolve_ref(config, image_ref)?;
+    Ok(pin_cached_tag(config, &reference).await?.and_then(|(config_digest, manifest_digest)| {
+        (config_digest == id).then_some(manifest_digest)
+    }))
 }
 
 /// Registry-level facts derivable from the cached manifest/config without
