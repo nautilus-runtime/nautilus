@@ -351,6 +351,68 @@ impl ImageManager {
         Ok(result)
     }
 
+    /// Kubelet uses the config digest returned by PullImage or ImageStatus in
+    /// CreateContainer. Select a retained immutable repository manifest for it.
+    pub(crate) async fn workload_reference(&self, image: &str) -> Result<String> {
+        let Some(digest) = image.strip_prefix("sha256:") else {
+            return Ok(image.to_owned());
+        };
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(Error::Image(format!("invalid image config digest {image}")));
+        }
+        let records = self.images.read().await;
+        let pinned = records.values().filter(|r| r.image_id == image)
+            .find_map(|r| r.repo_digests.first()).cloned();
+        let legacy: Vec<_> = records.values().filter(|r| r.image_id.is_empty() || r.image_id == image)
+            .flat_map(|r| r.repo_tags.iter().chain(&r.repo_digests).chain(std::iter::once(&r.id)))
+            .cloned().collect();
+        drop(records);
+        if let Some(reference) = &pinned {
+            let key = super::pull::resolve_ref(&self.config, reference)?;
+            if fs::try_exists(super::pull::manifest_cache_path(&self.config, &key)).await? {
+                return Ok(reference.clone());
+            }
+        }
+        // Older stores may have only the tag's manifest file. Preserve its
+        // matching bytes under the immutable name before returning that name.
+        for reference in legacy {
+            if let Some(digest) = super::pull::cached_manifest_for_id(&self.config, &reference, image).await? {
+                return Ok(format!("{}@{digest}", repo_part(&reference)));
+            }
+        }
+        if let Some(reference) = pinned {
+            return Ok(reference);
+        }
+        Err(Error::Image(format!("no pulled manifest for image ID {image}")))
+    }
+
+    /// Legacy bundles can identify their immutable manifest or snapshot after
+    /// an upgrade. A mutable tag alone cannot establish what was executed.
+    pub(crate) async fn container_image_id(&self, state: &crate::core::ContainerState) -> String {
+        if !state.image_id.is_empty() {
+            return state.image_id.clone();
+        }
+        if let Some(vm) = &state.vm {
+            return vm.image_id.clone();
+        }
+        if matches!(state.sandbox_kind.as_str(), "wasi" | "wasm") {
+            return state.image.clone();
+        }
+        if state.image.contains('@') {
+            if let Some(facts) = super::pull::cached_image_facts(&self.config, &state.image).await {
+                return facts.config_digest;
+            }
+        }
+        let bundle = self.config.storage.container_dir.join(&state.id);
+        if let Some(key) = super::snapshot::pinned_image_key(&bundle).await {
+            if let Some(record) = self.images.read().await.values()
+                .find(|r| !r.image_id.is_empty() && super::snapshot::image_key(&r.image_id) == key) {
+                return record.image_id.clone();
+            }
+        }
+        String::new()
+    }
+
     /// Get image status/information
     pub async fn get_image_status(&self, image_ref: &str) -> Result<Option<ImageInfo>> {
         let images = self.images.read().await;
@@ -434,10 +496,10 @@ impl ImageManager {
 
         let mut images = self.images.write().await;
 
-        // Locate the record via the same matcher get_image_status uses.
-        let target_key = locate_image(&images, image_ref)
-            .map(|k| k.to_string())
-            .ok_or_else(|| Error::Image(format!("Image not found: {}", image_ref)))?;
+        // Decide absence while holding the same locks as the removal itself.
+        let Some(target_key) = locate_image(&images, image_ref).map(str::to_owned) else {
+            return Ok(());
+        };
 
         let mut info = images.get(&target_key).cloned().unwrap();
 
@@ -475,9 +537,9 @@ impl ImageManager {
         let f = self
             .image_store_path
             .join(format!("{}.json", safe_image_name(&target_key)));
-        if f.exists() {
-            fs::remove_file(f).await
-                .map_err(|e| Error::Image(format!("Failed to remove image file: {}", e)))?;
+        match fs::remove_file(f).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
         }
         images.remove(&target_key);
         log::info!("Successfully removed image: {}", target_key);
@@ -698,7 +760,60 @@ mod tests {
         assert_eq!(latest.size, 123);
         let old_digest = format!("example.test/project@{first}");
         assert_eq!(restarted.get_image_status(&old_digest).await.unwrap().unwrap().image_id, first);
+        assert_eq!(restarted.workload_reference(&first).await.unwrap(), old_digest);
+        assert!(restarted.workload_reference(&format!("sha256:{}", "0".repeat(64))).await.is_err());
     }
+    #[tokio::test]
+    async fn concurrent_removals_succeed_after_the_first_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.image_dir = dir.path().join("images");
+        config.storage.container_dir = dir.path().join("containers");
+        let store = ImageManager::new(Arc::new(config));
+        store.initialize().await.unwrap();
+        let tag = "example.test/project:temporary";
+        store.record_pull(tag, facts('a')).await.unwrap();
+        let (first, second) = tokio::join!(store.remove_image(tag, false), store.remove_image(tag, false));
+        first.unwrap();
+        second.unwrap();
+        assert!(store.get_image_status(tag).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_image_id_resolves_only_to_its_cached_manifest() {
+        use oci_distribution::{config::ConfigFile, manifest::OciImageManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.image_dir = dir.path().to_owned();
+        let config = Arc::new(config);
+        let store = ImageManager::new(config.clone());
+        store.initialize().await.unwrap();
+        let tag = "example.test/project:old";
+        let id = store.record_pull(tag, facts('a')).await.unwrap();
+        {
+            let mut records = store.images.write().await;
+            let mut legacy = records.drain().next().unwrap().1;
+            legacy.image_id.clear();
+            legacy.repo_digests.clear();
+            legacy.id = tag.into();
+            records.insert(tag.into(), legacy);
+        }
+        let mut manifest = OciImageManifest::default();
+        manifest.config.digest = id.clone();
+        let pinned = facts('b').manifest_digest;
+        let data = serde_json::json!({"manifest": manifest, "config": ConfigFile::default(), "manifest_digest": pinned});
+        let file = super::super::pull::manifest_cache_path(&config, &tag.parse().unwrap());
+        fs::write(file, data.to_string()).await.unwrap();
+        let resolved = store.workload_reference(&id).await.unwrap();
+        assert_eq!(resolved, format!("example.test/project@{pinned}"));
+        fs::remove_file(super::super::pull::manifest_cache_path(&config, &tag.parse().unwrap())).await.unwrap();
+        let bundle = dir.path().join("bundle");
+        fs::create_dir_all(bundle.join("rootfs")).await.unwrap();
+        let workload = super::super::pull::prepare_bundle(&config, &resolved, &bundle, false).await.unwrap();
+        assert_eq!(workload.image_id, id);
+        assert!(store.workload_reference(&pinned).await.is_err());
+    }
+
     #[tokio::test]
     async fn refresh_recovers_pending_manifest_and_normalizes_tag_aliases() {
         use oci_distribution::{config::ConfigFile, manifest::OciImageManifest, Reference};

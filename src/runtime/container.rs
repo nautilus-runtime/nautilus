@@ -232,12 +232,13 @@ impl ContainerManager {
         // Stored in the workload spec below via state.
         let _ = log_captured;
 
-        let container_state = ContainerState {
+        let mut container_state = ContainerState {
             id: container_id.clone(),
             pod_id: pod_id.to_string(),
             attempt,
             name: name.to_string(),
             image: image.to_string(),
+            image_id: String::new(),
             status: ContainerStatus::Created,
             created_at: chrono::Utc::now(),
             started_at: None,
@@ -270,7 +271,7 @@ impl ContainerManager {
             return self.create_guest(container_state, spec).await;
         }
         let backend = self.backend_for(&container_state)?;
-        backend.prepare(&spec).await?;
+        container_state.image_id = backend.prepare_image(&spec).await?;
         if let Err(error) = self.state_manager.save_container_state(&container_state).await {
             backend.remove(&container_id).await?;
             return Err(error);
@@ -296,6 +297,7 @@ impl ContainerManager {
         Ok(WorkloadSpec {
             id: state.id.clone(),
             image_ref: state.image.clone(),
+            cgroup_parent: String::new(),
             args: Vec::new(), // P0: image defaults; CRI command/args merge lands with oci-distribution
             entrypoint: Vec::new(),
             working_dir: String::new(),
@@ -347,6 +349,7 @@ impl ContainerManager {
         if state.sandbox_kind == "runc" {
             if let Some(pod) = self.state_manager.get_pod_state(&state.pod_id).await? {
                 spec.network_ns = pod.network_namespace;
+                spec.cgroup_parent = pod.cgroup_parent;
                 // Dedicated pod IPC ns exists only when its sysctls needed one.
                 let h = crate::network::podnet::ipcns_dir().join(&state.pod_id);
                 if h.exists() {

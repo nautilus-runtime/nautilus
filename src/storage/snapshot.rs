@@ -17,7 +17,7 @@ fn invalid(msg: &str) -> Error {
     Error::Storage(msg.into())
 }
 
-fn image_key(id: &str) -> String {
+pub(super) fn image_key(id: &str) -> String {
     format!("{:x}", Sha256::digest(id.as_bytes()))
 }
 
@@ -32,6 +32,11 @@ fn valid_key(key: &str) -> bool {
             .bytes()
             .enumerate()
             .all(|(i, b)| i == 64 || b.is_ascii_hexdigit())
+}
+
+pub(super) async fn pinned_image_key(bundle: &Path) -> Option<String> {
+    let key = tokio::fs::read_to_string(bundle.join(PIN)).await.ok()?;
+    valid_key(&key).then(|| key[..64].to_owned())
 }
 
 fn lock(store: &Path, key: &str) -> Result<File> {

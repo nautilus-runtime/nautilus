@@ -1,6 +1,6 @@
 # Pod 级虚机运行时
 
-设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。交互式 Exec、Attach 和 PortForward 连接到目标 guest。kubelet 的 RuntimeClass 发现和宿主卷接入跟踪于 #16。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
+设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。交互式 Exec、Attach 和 PortForward 连接到目标 guest。启用并通过探测的节点会向 kubelet 发布 `vm` handler，受信任的宿主文件和目录可挂载到对应的 guest 容器。[节点启用与真实 kubelet 验收](VM_RUNTIMECLASS.md) [CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
 
 ## 所有权与协议
 
@@ -37,7 +37,9 @@
 
 每个 sandbox attempt 使用独立的临时服务。systemd 在 nautilusd 退出后继续持有 VMM 的进程组。Nautilus 在 `runtime.state_dir/vms` 记录 sandbox ID、启动 nonce、systemd InvocationID、私有目录及 socket 的文件身份和 guest boot ID。启动恢复时，匹配已登记的 VM 后重新连接，继续回收中断的创建或删除。遇到身份冲突时保留记录，在 CRI 中报告 NOTREADY，避免停止其他工作负载。
 
-实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。成功验证时 `guestReachable` 为 true，确认缺失时为 false。状态查询发生错误时该字段为 null，`error` 给出原因。已启动的实验 Pod 保持 NOTREADY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
+Cloud Hypervisor v55 在 HTTP 服务期间持有 `api.sock.lock` 的整文件 OFD 写锁。为每次新启动，Nautilus 在私有目录预先登记该锁的设备号、inode 和 nonce。VMM 被强制终止后，清理流程取得同类写锁并核对身份，再释放文件。升级时，运行中旧 VMM 的 systemd 身份、MainPID 打开的 inode 和持有的写锁可以补全记录。如果旧 VMM 已经退出，Nautilus 会将符合私有文件条件的未登记锁原子移至 `runtime.state_dir/vms/.api-lock-recovery/`，原 inode 和可追溯名称均保留。文件身份冲突或尚有进程持锁时，清理保留沙箱记录供重试。[Cloud Hypervisor v55 锁的实现](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v55.0/vmm/src/locked_unix_listener.rs#L41-L80)
+
+实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。成功验证时 `guestReachable` 为 true，确认缺失时为 false。状态查询发生错误时该字段为 null，`error` 给出原因。仅具备身份握手的开发用 Pod 保持 NOTREADY，启用 VM 工作负载时，通过完整网络和工作负载握手的 Pod 报告 READY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
 
 ```sh
 NAUTILUS_VM_VMM=/opt/cloud-hypervisor/bin/cloud-hypervisor \
@@ -77,7 +79,7 @@ cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
 
 ### Pod 的初始资源
 
-`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。目前接受 systemd slice 名或对应层级路径，cgroupfs 布局的父路径会在分配前返回错误。kubelet 的 cgroup 驱动发现与节点配置在 #16 验收。资源热更新返回 CRI `Unimplemented`。
+`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。目前接受 systemd slice 名或对应层级路径，cgroupfs 布局的父路径会在分配前返回错误。`RuntimeConfig` 返回与原生 OCI 后端一致的 cgroup 驱动。VM handler 使用 systemd 驱动运行。资源热更新返回 CRI `Unimplemented`。
 
 使用 `bash guest/pack-initramfs.sh tests/fixtures/vm_resources_init.c /tmp/resources.cpio.gz` 构建资源测试 guest。将 `NAUTILUS_VM_RESOURCE_TEST_INITRAMFS` 指向该镜像后执行 `cargo test --locked --test vm_resources_test -- --ignored`，同时设置 VMM 和内核路径。guest 会核对在线 CPU 和可用物理内存，宿主测试会检查 VMM 配置及所在 cgroup。Linux 5.15.0-191、systemd 249、Cloud Hypervisor v54.1 上，1.5 CPU、448 MiB 内存加 0.1 CPU、64 MiB 开销，实测得到 2 个 vCPU、448 MiB guest RAM、`cpu.max=160000 100000` 和 `memory.max=536870912`。
 

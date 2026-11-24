@@ -56,26 +56,15 @@ impl PodManager {
         host_ipc: bool,
         pidns_holder_pid: Option<i32>,
     ) -> Result<String> {
-        let pod_id = StateManager::generate_pod_id();
-
-        let pod_state = PodState {
-            vm_attempt: None,
-            id: pod_id.clone(),
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            uid: uid.to_string(),
-            status: PodStatus::Pending,
-            created_at: chrono::Utc::now(),
-            containers: Vec::new(),
-            network_namespace: None,
-            network_ip: String::new(),
-            netns_holder_pid: None,
-            ipc_holder_pid: None,
-            runtime_handler: runtime_handler.to_string(),
+        self.reserve_pod(PodState {
+            namespace: namespace.into(),
+            name: name.into(),
+            uid: uid.into(),
+            runtime_handler: runtime_handler.into(),
             labels,
             annotations,
-            log_directory: log_directory.to_string(),
-            hostname: hostname.to_string(),
+            log_directory: log_directory.into(),
+            hostname: hostname.into(),
             dns_servers: dns_servers.to_vec(),
             dns_searches: dns_searches.to_vec(),
             dns_options: dns_options.to_vec(),
@@ -84,7 +73,15 @@ impl PodManager {
             host_pid,
             host_ipc,
             pidns_holder_pid,
-        };
+            ..Default::default()
+        }).await
+    }
+
+    pub(crate) async fn reserve_pod(&self, mut pod_state: PodState) -> Result<String> {
+        let pod_id = StateManager::generate_pod_id();
+        pod_state.id.clone_from(&pod_id);
+        pod_state.created_at = chrono::Utc::now();
+        tracing::info!(%pod_id, namespace = %pod_state.namespace, name = %pod_state.name, "Creating Pod");
 
         // Save to state manager
         self.state_manager.save_pod_state(&pod_state).await?;
@@ -95,7 +92,6 @@ impl PodManager {
             pods.insert(pod_id.clone(), pod_state);
         }
 
-        tracing::info!(pod_id = %pod_id, namespace = %namespace, name = %name, "Pod created");
         Ok(pod_id)
     }
 
@@ -332,7 +328,7 @@ impl PodManager {
 
     /// List all pods
     pub async fn list_pods(&self) -> Result<Vec<PodState>> {
-        self.state_manager.list_pods().await
+        Ok(self.state_manager.list_pods().await?.into_iter().filter(|pod| !pod.vm_probe).collect())
     }
 
     pub(crate) fn vm_store(&self) -> crate::vm::owner::PodVmStore {
@@ -362,6 +358,13 @@ impl PodManager {
         store: &crate::vm::owner::PodVmStore,
         pod: &PodState,
     ) -> Result<()> {
+        if pod.vm_probe {
+            let _guard = self.operation_guard(&pod.id).await;
+            if let Err(error) = self.rollback_vm_locked(&pod.id).await {
+                tracing::warn!(pod_id=%pod.id,%error,"VM startup probe cleanup retained");
+            }
+            return Ok(());
+        }
         if let Some(attempt) = &pod.vm_attempt {
             return self.recover_managed_vm(store, pod, attempt).await;
         }

@@ -1,8 +1,20 @@
 # Nautilus CRI validation results (critest)
 
 - 被测服务为 `nautilusd`。
-- 测试工具为 kubernetes-sigs/cri-tools 的 `critest v1.31.1`。
+- 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
+
+## 2026-11-24 真实 kubelet 和 RuntimeClass
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点验证提交 `58e5ea5`。API server、scheduler、controller-manager、kubelet 与 kubectl 均为 Kubernetes v1.37.2，节点为 Linux 6.12.118、systemd 257.13、Cloud Hypervisor v55.0 和 virtiofsd 1.13.2，guest 为 Linux 5.15.0-191。测试通过 Kubernetes API 提交两个 VM Pod，在三个 Ready 容器上核对日志、镜像 ID、同 Pod 共享和跨 Pod 独立的 boot ID、跨 Pod HTTP、原 init 的交互式 attach、端口转发和 `kubectl exec` 传回的退出码 35。[复验脚本](../tests/kubelet_vm_acceptance.py) [RuntimeClass 和节点配置](VM_RUNTIMECLASS.md)
+
+两个 Pod 的地址为 `10.232.0.41` 与 `10.232.0.40`。强制终止再启动 daemon 后，两个 IP、两个 boot ID 和三个容器 ID 均保持。随后向第二个 VMM 发 SIGKILL，第一个 Pod 保持原 boot ID，仍能通过 kubectl 路径提供 HTTP。kubelet 删除两者后，测试命名空间的 CRI sandbox 数归零，VMM、virtiofsd、owner 日志、网络命名空间与 IPAM 租约回到测试前状态。
+
+guest 与宿主均读到对方写入的 hostPath 文件。ConfigMap 在 guest 中只读，kubelet 切换投影后，轮询重新打开文件取得新值。宿主 cgroup 报告 1 个 CPU、512 MiB 上限和 `memory.oom.group=1`，guest 检出一个 vCPU 和扣除开销后的内存。CRI 容器与 Pod 的批量用量查询均省略 guest 条目。默认 OCI Pod 保持 Ready，进程位于 kubelet 指定的 systemd scope。独立 WASI 模块通过同一 daemon 运行，CRI 记录退出码 23。
+
+在同一 daemon 替换测试 CNI 配置并触发一次 VM 创建失败，CRI 和 Node 均撤回 `vm`，修复配置后两者自动恢复。以升级前的运行中 VM 验证，daemon 升级后保持 guest boot，依据 MainPID 持有的 OFD 锁登记原 inode 131691，随后 VMM 被强制终止，整个 attempt 可回收。另一台升级前已退出的 VM 保留了遗留锁的原 inode 131687，Pod 和原 IP 均成功回收。[VMM 锁的恢复规则](VM_RUNTIME.md#首版使用系统级-systemd-托管-vmm)
+
+新版 critest v1.37.0 首轮为 101 通过、4 失败、37 跳过。两个失败涉及镜像配置 ID，另两项涉及并发 RemoveImage 和 sandbox attempt。修复后、加入 VMM 锁恢复前的 `385b34d` 为 105 通过、0 失败、37 跳过，v1.31.1 为 96 通过、0 失败、17 跳过。最终在 `58e5ea5` 上分别以同一 daemon 的 Unix socket 作为 runtime 和 image endpoint，未过滤的 **v1.37.0 为 105 通过、0 失败、37 跳过**，耗时 320.568 秒，**v1.31.1 为 96 通过、0 失败、17 跳过**，耗时 235.510 秒。另用 v1.31.1 聚焦 HostNetwork=false 的快速退出清理用例，1 通过、0 失败、112 项未选中，耗时 5.032 秒。两个独立节点在各自套件结束后均通过 CRI 确认 Pod 和容器数为零。该提交运行完整 Rust 测试得到 104 通过、0 失败、8 项默认忽略。全库 fmt 涉及与主线基线相同的 31 个文件，Clippy 在 `-D warnings` 下均报告 29 项诊断。
 
 ## 2026-11-24 Pod VM 宿主卷
 

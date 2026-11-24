@@ -202,6 +202,35 @@ impl PodNet {
         }
     }
 
+    /// A static host-local network can acknowledge a kubelet PodCIDR when its
+    /// configured allocation subnet already matches. Never rewrite live IPAM.
+    pub(crate) fn matches_pod_cidr(&self, cidr: &str) -> Result<bool> {
+        let (_, _, plugins) = self.load_chain(false)?;
+        let mut matched = false;
+        for ipam in plugins.iter().filter_map(|plugin| plugin.get("ipam")) {
+            if ipam["type"] != "host-local" {
+                return Ok(false);
+            }
+            let subnet = ipam.get("subnet");
+            let ranges = ipam.get("ranges");
+            if subnet.is_none() && ranges.is_none() {
+                return Ok(false);
+            }
+            if subnet.is_some_and(|subnet| subnet != cidr) {
+                return Ok(false);
+            }
+            if let Some(ranges) = ranges {
+                let valid = ranges.as_array().is_some_and(|sets| !sets.is_empty() && sets.iter().all(|set|
+                    set.as_array().is_some_and(|group| !group.is_empty() && group.iter().all(|range| range["subnet"] == cidr))));
+                if !valid {
+                    return Ok(false);
+                }
+            }
+            matched = true;
+        }
+        Ok(matched)
+    }
+
     pub(super) fn load_chain(&self, require_config: bool) -> Result<(String, String, Vec<serde_json::Value>)> {
         use std::fs;
 
@@ -788,6 +817,24 @@ mod rollback_tests {
         let error = release_namespace_blocking(&missing, "net", Some(std::process::id() as i32)).unwrap_err();
         assert!(error.to_string().contains("missing namespace handle"));
         release_namespace_blocking(&missing, "net", Some(i32::MAX)).unwrap();
+    }
+
+    #[test]
+    fn kubelet_cidr_must_match_every_configured_allocation_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.network.cni_config_dir = tmp.path().into();
+        let net = PodNet::new(Arc::new(config));
+        let cidr = "10.23.0.0/24";
+        let test = |ipam: serde_json::Value| {
+            let chain = serde_json::json!({"name":"test","plugins":[{"type":"bridge","ipam":ipam},{"type":"tuning"}]});
+            std::fs::write(tmp.path().join("chain.conflist"), chain.to_string()).unwrap();
+            net.matches_pod_cidr(cidr).unwrap()
+        };
+        assert!(test(serde_json::json!({"type":"host-local","subnet":cidr})));
+        assert!(test(serde_json::json!({"type":"host-local","ranges":[[{"subnet":cidr}]]})));
+        assert!(!test(serde_json::json!({"type":"host-local","subnet":"10.24.0.0/24","ranges":[[{"subnet":cidr}]]})));
+        assert!(!test(serde_json::json!({"type":"dhcp"})));
     }
 
     #[tokio::test]

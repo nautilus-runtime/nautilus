@@ -181,7 +181,10 @@ async fn test_state_persistence() {
         let state_manager = StateManager::new(db_path.clone()).unwrap();
         
         let pod_state = nautilus::core::PodState {
+            attempt: 0,
             vm_attempt: None,
+            vm_probe: false,
+            cgroup_parent: String::new(),
             id: "persistent-pod".to_string(),
             name: "test-pod".to_string(),
             namespace: "default".to_string(),

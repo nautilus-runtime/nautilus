@@ -1,6 +1,6 @@
 # Nautilus 架构设计文档
 
-> 更新时间:2026-08-29,对应当前实现(critest 96/0 全绿,MVP 阶段完成)。
+> 2026-11-24 更新了 Pod VM 路径。OCI 和 WASI 的历史测试数据及度量以各自的验证日期为准。
 > 测试基线见 [CRITEST_RESULTS.md](CRITEST_RESULTS.md),规划见 [DEVELOPMENT_ROADMAP.md](DEVELOPMENT_ROADMAP.md)。
 
 ## 1. 项目定位
@@ -8,8 +8,7 @@
 Nautilus 是 Rust 实现的 Kubernetes CRI 兼容容器运行时,差异化方向是
 **多沙箱统一运行时**:单二进制(~10MB 级、空闲 PSS 实测 10 MiB)同时纳管
 runc 容器与 WASM 工作负载，生命周期策略用 Wasm 进程内热插拔。
-Pod 级 microVM 采用 Cloud Hypervisor 与自研 guest agent。实验性生命周期由系统级 systemd 托管 VMM，nautilusd 重启后按 guest 启动身份接管。
-节点探针、实验入口及 CRI handler 的接入进度见 [VM 运行时设计](VM_RUNTIME.md)。
+启用 `vm` 的节点为每个 PodSandbox attempt 启动独立的 Cloud Hypervisor 与 virtiofsd。系统级 systemd 持有两个服务，自研 guest agent 通过 runc 管理该 Pod 的 OCI 容器。nautilusd 重启后核对服务、socket 和 guest 启动身份，再恢复管理。[VM 运行时设计](VM_RUNTIME.md) · [RuntimeClass 节点配置](VM_RUNTIMECLASS.md)
 
 | 问题 | 回答 |
 |---|---|
@@ -44,6 +43,16 @@ Pod 级 microVM 采用 Cloud Hypervisor 与自研 guest agent。实验性生命�
    └──────────────────────────────────────────────────────────┘
 ```
 
+Pod VM 的组件分布在宿主与 guest 两侧。CRI 仍通过同一 Unix socket 进入 nautilusd。
+
+```text
+nautilusd ── systemd ── Cloud Hypervisor ── Pod guest
+    │                                         ├── Nautilus guest agent ── runc
+    ├── 认证的 vsock ───────────────────────────┘
+    └── 每 Pod 的 virtiofsd ─── rootfs 和该 Pod 请求的卷
+宿主 CNI ── Pod netns / TAP ── guest NIC
+```
+
 ### 技术栈(实际依赖)
 
 | 领域 | 选型 | 说明 |
@@ -53,7 +62,7 @@ Pod 级 microVM 采用 Cloud Hypervisor 与自研 guest agent。实验性生命�
 | OCI 容器引擎 | **youki libcontainer 0.8.0** | 默认进程内运行，支持外部 runc 驱动。exec 继承 OCI 安全设置的差异见[依赖说明](../vendor/libcontainer/NAUTILUS.md)。 |
 | WASM | wasmtime 26 + wasmtime-wasi 26 | 沙箱执行 + 策略引擎复用 |
 | 镜像分发 | oci-distribution 0.11(rustls) | 原生拉取,零 docker CLI 依赖 |
-| 流式协议 | spdystream-rs 0.1 | SPDY/3.1 remotecommand v4 + portforward |
+| 流式协议 | spdystream-rs 0.1.2 | remotecommand v4 与 port-forward。VM 路径在 guest 内连接原 init、调整 PTY 窗口和拨号 TCP。 |
 | 状态存储 | sled 0.34 | PodState/ContainerState 持久化 |
 | OCI 类型 | oci-spec 0.10 | spec 生成 |
 | 安全 | nix / libc / libseccomp | ns、mount、cap、seccomp |
@@ -92,7 +101,8 @@ src/
 │   ├── unpack.rs         # layer 解包(whiteout/opaque、路径穿越防护)
 │   └── image.rs          # 镜像记录(tags/repo digests 归并、引用定位)
 ├── policy/mod.rs         # Wasm 策略引擎(hooks、fuel、timeout、热加载)
-└── proto/                # CRI protobuf 生成代码(k8s master,43 RPC)
+├── vm/                   # Pod VM 服务归属、资源、guest 协议和流式传输
+└── proto/                # 从仓库的 Kubernetes CRI v1 proto 生成绑定
 ```
 
 ## 4. 关键抽象与流程

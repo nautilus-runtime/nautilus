@@ -15,6 +15,9 @@ pub struct ContainerState {
     pub attempt: u32,
     pub name: String,
     pub image: String,
+    /// Config digest of the manifest that supplied the prepared OCI rootfs.
+    #[serde(default)]
+    pub image_id: String,
     pub status: ContainerStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -53,7 +56,8 @@ pub struct ContainerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmContainer {
-    #[serde(default)]
+    // Older Pod VM records kept the config digest here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_id: String,
     pub preparing: bool,
     #[serde(default)]
@@ -69,8 +73,10 @@ pub struct VmPodAttempt {
     pub ready_network: Option<crate::network::vm::VmNetwork>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PodState {
+    #[serde(default)]
+    pub attempt: u32,
     pub id: String,
     pub namespace: String,
     pub name: String,
@@ -84,6 +90,12 @@ pub struct PodState {
     /// Present for fully managed CRI VM attempts, including pending cleanup.
     #[serde(default)]
     pub vm_attempt: Option<VmPodAttempt>,
+    /// Internal startup probe; kubelet must never enumerate this sandbox.
+    #[serde(default)]
+    pub vm_probe: bool,
+    /// Exact CRI cgroup parent assigned by kubelet.
+    #[serde(default)]
+    pub cgroup_parent: String,
     /// Published Pod netns bind-mount path.
     #[serde(default)]
     pub network_namespace: Option<String>,
@@ -144,8 +156,9 @@ pub enum ContainerStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PodStatus {
+    #[default]
     Pending,
     Running,
     Succeeded,
@@ -280,7 +293,7 @@ impl StateManager {
                     continue;
                 }
             };
-            if pod.runtime_handler == "vm" && pod.status != PodStatus::Succeeded {
+            if pod.runtime_handler == "vm" && (pod.vm_probe || pod.status != PodStatus::Succeeded) {
                 if key.strip_prefix(b"pod:") == Some(pod.id.as_bytes()) {
                     attempts.push(pod);
                 } else {

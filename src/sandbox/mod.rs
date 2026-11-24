@@ -51,6 +51,10 @@ pub struct ResourceLimits {
     pub memory_limit_in_bytes: i64,
     #[serde(default)]
     pub oom_score_adj: i32,
+    #[serde(default)]
+    pub guest_unified: HashMap<String, String>,
+    #[serde(default)]
+    pub guest_no_hugepages: Vec<String>,
 }
 
 /// Per-container security knobs from CRI LinuxContainerSecurityContext.
@@ -106,6 +110,7 @@ pub struct WorkloadSpec {
     /// Image reference. For runc: an OCI image ref pullable by the configured CLI.
     /// For wasm: `file://` path (or absolute path) to a `.wasm`/`.wat` module.
     pub image_ref: String,
+    pub cgroup_parent: String,
     /// Process arguments requested by the CRI caller.
     /// Merge semantics (docker/k8s compatible), applied by the backend:
     ///   entrypoint non-empty → [entrypoint…, args…]
@@ -204,6 +209,13 @@ pub trait SandboxBackend: Send + Sync {
     /// Prepare resources at CRI-create time: fetch/unpack images, build the OCI
     /// bundle, compile the wasm module... Must fail fast on unusable inputs.
     async fn prepare(&self, spec: &WorkloadSpec) -> Result<()>;
+
+    /// Prepare once and return the image identity used by this container. An
+    /// OCI backend obtains this from the same manifest that supplied its rootfs.
+    async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
+        self.prepare(spec).await?;
+        Ok(spec.image_ref.clone())
+    }
 
     /// Start the workload.
     async fn start(&self, spec: &WorkloadSpec) -> Result<StartOutcome>;

@@ -265,7 +265,10 @@ async fn test_e2e_state_persistence() {
         let state_manager = StateManager::new(db_path.clone()).unwrap();
         
         let pod_state = nautilus::core::PodState {
+            attempt: 0,
             vm_attempt: None,
+            vm_probe: false,
+            cgroup_parent: String::new(),
             id: pod_id.clone(),
             name: "persistent-test-pod".to_string(),
             namespace: "default".to_string(),
@@ -298,6 +301,7 @@ async fn test_e2e_state_persistence() {
             pod_id: pod_id.clone(),
             attempt: 0,
             image: "alpine:latest".to_string(),
+            image_id: String::new(),
             env: HashMap::new(),
             status: nautilus::core::ContainerStatus::Running,
             created_at: chrono::Utc::now(),
@@ -445,19 +449,14 @@ async fn setup_test_environment() -> TestEnvironment {
         container_manager.clone(),
     ));
     
-    let image_manager = Arc::new(ImageManager::new(config.clone()));
     let network_manager = Arc::new(NetworkManager::new(config.clone()));
-    
-    let runtime_service = Arc::new(NautilusRuntimeService::new(
-        config.clone(),
-        state_manager.clone(),
+    let image_service = Arc::new(NautilusImageService::new(config.clone(), state_manager.clone()));
+    image_service.initialize().await.unwrap();
+    let image_manager = image_service.image_manager();
+    let runtime_service = Arc::new(NautilusRuntimeService::with_images(
+        config.clone(), state_manager.clone(), image_manager.clone(),
     ));
-    
-    let image_service = Arc::new(NautilusImageService::new(
-        config.clone(),
-        state_manager.clone(),
-    ));
-    
+
     TestEnvironment {
         temp_dir,
         _config: config,

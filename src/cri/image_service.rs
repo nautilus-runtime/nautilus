@@ -29,6 +29,10 @@ impl NautilusImageService {
         }
     }
 
+    pub fn image_manager(&self) -> Arc<ImageManager> {
+        self.image_manager.clone()
+    }
+
     pub async fn initialize(&self) -> crate::core::Result<()> {
         self.image_manager.initialize().await
     }
@@ -304,19 +308,8 @@ impl ImageService for NautilusImageService {
             Status::invalid_argument("Image spec is required")
         })?;
         
-        // CRI idempotence: removing an unknown image is a no-op success.
-        if self
-            .image_manager
-            .get_image_status(&image_spec.image)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to query image: {}", e)))?
-            .is_some()
-        {
-            self.image_manager.remove_image(&image_spec.image, false).await
-                .map_err(|e| Status::internal(format!("Failed to remove image: {}", e)))?;
-        } else {
-            log::warn!("RemoveImage: no record matches {:?} (no-op)", image_spec.image);
-        }
+        self.image_manager.remove_image(&image_spec.image, false).await
+            .map_err(|e| Status::internal(format!("Failed to remove image: {e}")))?;
 
         Ok(Response::new(RemoveImageResponse {}))
     }
@@ -331,7 +324,7 @@ impl ImageService for NautilusImageService {
         let filesystem_usage = FilesystemUsage {
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             fs_id: Some(FilesystemIdentifier {
-                mountpoint: "/var/lib/nautilus/images".to_string(),
+                mountpoint: self._config.storage.image_dir.to_string_lossy().into_owned(),
             }),
             used_bytes: Some(UInt64Value { value: used_bytes }),
             inodes_used: Some(UInt64Value { value: 0 }),

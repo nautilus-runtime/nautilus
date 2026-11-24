@@ -122,12 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Runtime managers (pod/container/sandbox) are wired inside
     // NautilusRuntimeService::new, keyed by sandbox registry routing.
-    let runtime_service = NautilusRuntimeService::new(
+    let image_service = NautilusImageService::new(config_arc.clone(), state_manager.clone());
+    let runtime_service = NautilusRuntimeService::with_images(
         config_arc.clone(),
         state_manager.clone(),
+        image_service.image_manager(),
     );
     runtime_service.recover_vm_pods().await?;
-    let image_service = NautilusImageService::new(config_arc.clone(), state_manager.clone());
     
     // Initialize network manager
     let network_manager = NetworkManager::new(config_arc.clone());
@@ -137,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize image service
     image_service.initialize().await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to initialize image service: {}", e)))?;
+
+    runtime_service.start_vm_readiness_probe();
 
     // Setup socket
     let path = Path::new(&socket_path);

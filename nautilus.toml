@@ -18,7 +18,7 @@ driver = "libcontainer"                     # libcontainer=进程内(默认);exe
 systemd_cgroup = true                       # 使用 systemd cgroup 管理
 
 [runtime.sandboxes]
-vm_workloads_enabled = false                # 实验性显式 CRI vm 入口
+vm_workloads_enabled = false                # 启动 VM 探针，通过后向 kubelet 公布 vm handler
 # 多沙箱路由配置:CRI runtime_handler -> 隔离后端
 # 内置 handler:"runc"(OCI 容器)、"wasi"/"wasm"(进程内 wasmtime)
 default_handler = ""                    # 空 runtime_handler 请求使用的默认后端

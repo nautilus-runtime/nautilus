@@ -1,5 +1,6 @@
 //! Durable ownership of experimental per-Pod Cloud Hypervisor services.
 
+mod api_lock;
 mod share;
 mod volume;
 
@@ -92,6 +93,8 @@ struct Owner {
     directory: Option<FileIdentity>,
     #[serde(default)]
     sockets: [Option<FileIdentity>; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_lock: Option<api_lock::Receipt>,
     invocation: Option<String>,
     boot: Option<String>,
     removing: bool,
@@ -310,6 +313,7 @@ impl PodVmStore {
             store: FileIdentity::check(&lease.root)?,
             directory: None,
             sockets: [None, None],
+            api_lock: None,
             invocation: None,
             boot: None,
             removing: false,
@@ -436,6 +440,7 @@ impl PodVmStore {
             };
             if !owner.removing && owner.boot.is_some() {
                 if let Some(guest) = lease.online(&owner).await? {
+                    lease.adopt_live_api_lock(&mut owner).await?;
                     if owner.invocation.is_none() || owner.sockets.contains(&None) {
                         return lease.commit_guest(&mut owner, guest).map(Some);
                     }
@@ -687,8 +692,7 @@ impl Lease {
         )
         .map_err(io::Error::from)?;
         File::open(&self.root)?.sync_all()?;
-        let token = self.launch_token(owner);
-        File::create_new(&token)?.sync_all()?;
+        self.publish_api_lock(owner)?;
         File::open(&self.directory)?.sync_all()?;
         if let Some(executable) = &assets.virtiofsd {
             self.start_share(owner, executable, resources.slice.as_deref())
@@ -889,10 +893,12 @@ impl Lease {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        self.adopt_live_api_lock(owner).await?;
         self.stop_service(owner, Service::Vmm).await?;
         if owner.share.is_some() {
             self.stop_service(owner, Service::Virtiofsd).await?;
         }
+        self.release_api_lock(owner)?;
         self.cleanup_files(owner).await
     }
 
@@ -1008,6 +1014,7 @@ mod tests {
             store: FileIdentity::check(&lease.root).unwrap(),
             directory: Some(FileIdentity::check(&lease.directory).unwrap()),
             sockets: [None, None],
+            api_lock: None,
             invocation: Some(Uuid::new_v4().simple().to_string()),
             boot: None,
             removing: false,
@@ -1179,6 +1186,69 @@ mod tests {
         );
         assert!(parse(&Uuid::new_v4().simple().to_string(), &lease.directory).is_err());
         assert!(parse(owner.invocation.as_deref().unwrap(), &lease.root).is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_vmm_lock_cleanup_checks_live_locks_and_replacements() {
+        let (_work, _store, lease, mut owner) = fixture().await;
+        lease.publish_api_lock(&mut owner).unwrap();
+        fs::remove_file(lease.launch_token(&owner)).unwrap();
+        let path = lease.directory.join("api.sock.lock");
+        let original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut range: libc::flock = unsafe { std::mem::zeroed() };
+        range.l_type = libc::F_WRLCK as _;
+        assert_eq!(
+            unsafe { libc::fcntl(original.as_raw_fd(), libc::F_OFD_SETLK, &range) },
+            0
+        );
+        assert!(lease.release_api_lock(&mut owner).is_err());
+        drop(original);
+        let saved = lease.directory.join("retained");
+        fs::rename(&path, &saved).unwrap();
+        fs::write(&path, owner.nonce.as_bytes()).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(lease.release_api_lock(&mut owner).is_err());
+        assert!(path.exists());
+        fs::remove_file(&path).unwrap();
+        fs::rename(saved, &path).unwrap();
+        lease.release_api_lock(&mut owner).unwrap();
+        lease.release_api_lock(&mut owner).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_v55_lock_is_retained_across_attempt_cleanup() {
+        let (_work, _store, lease, mut owner) = fixture().await;
+        let path = lease.directory.join("api.sock.lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let id = FileIdentity::from_meta(&file.metadata().unwrap());
+        drop(file);
+        lease.release_api_lock(&mut owner).unwrap();
+        assert!(!path.exists());
+        let mut reloaded = lease.load(ID).unwrap().unwrap();
+        lease.release_api_lock(&mut reloaded).unwrap();
+        finish_cleanup(&lease, &reloaded).await;
+        let archived = fs::read_dir(lease.root.join(".api-lock-recovery"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(FileIdentity::from_meta(&archived.metadata().unwrap()), id);
+        assert!(archived
+            .file_name()
+            .to_str()
+            .unwrap()
+            .contains(&owner.nonce));
+        assert!(!lease.marker.exists());
     }
 
     #[tokio::test]

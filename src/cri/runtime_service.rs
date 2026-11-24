@@ -70,7 +70,8 @@ fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), (toni
     let mut security = linux.security_context.clone().unwrap_or_default();
     let ns = security.namespace_options.take().unwrap_or_default();
     if ns.network != NamespaceMode::Pod as i32 || ns.ipc != NamespaceMode::Pod as i32
-        || ns.pid != NamespaceMode::Container as i32 || !ns.target_id.is_empty() || ns.userns_options.is_some() {
+        || ns.pid != NamespaceMode::Container as i32 || !ns.target_id.is_empty() || ns.userns_options.as_ref().is_some_and(|user|
+            user.mode != NamespaceMode::Node as i32 || !user.uids.is_empty() || !user.gids.is_empty()) {
         return Err((tonic::Code::Unimplemented, "VM requires Pod networking and IPC, private container PID and no user namespace request"));
     }
     // The first sandbox process is the guest's root agent. Node profile
@@ -89,9 +90,17 @@ fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), (toni
     Ok(())
 }
 
+#[derive(Default)]
+struct VmReadiness {
+    ready: std::sync::atomic::AtomicBool,
+    recheck: tokio::sync::Notify,
+}
+
 pub struct NautilusRuntimeService {
     _config: Arc<Config>,
     _state_manager: Arc<StateManager>,
+    vm_ready: Arc<VmReadiness>,
+    images: Arc<crate::storage::ImageManager>,
     pod_manager: Arc<PodManager>,
     container_manager: Arc<ContainerManager>,
     /// Routes CRI runtime_handler values to sandbox backends.
@@ -137,8 +146,9 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &
         return Err((tonic::Code::InvalidArgument, "invalid guest environment"));
     }
     if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
-        if r.oom_score_adj != 0 || r.memory_swap_limit_in_bytes != 0 || !r.hugepage_limits.is_empty()
-            || !r.unified.is_empty() || !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() {
+        if !(-1000..=1000).contains(&r.oom_score_adj) || r.memory_swap_limit_in_bytes != 0 || r.hugepage_limits.iter().any(|page| page.limit != 0 || !matches!(page.page_size.as_str(), "2MB" | "1GB"))
+            || r.unified.iter().any(|(k,v)| !matches!((k.as_str(),v.as_str()), ("memory.oom.group","1") | ("memory.swap.max" | "memory.low" | "memory.min","0")))
+            || !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() {
             return Err(unsupported("VM guest supports container CPU shares, period, quota and memory limit"));
         }
     }
@@ -149,8 +159,7 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &
         || !ns.target_id.is_empty() || ns.userns_options.as_ref().is_some_and(|u| !u.uids.is_empty() || !u.gids.is_empty() || u.mode != NamespaceMode::Node as i32) {
         return Err(unsupported("VM containers require private PID, shared Pod network and IPC, and unmapped IDs"));
     }
-    if sc.privileged || !sc.masked_paths.is_empty() || !sc.readonly_paths.is_empty()
-        || sc.selinux_options.is_some() || sc.capabilities.as_ref().is_some_and(|c| !c.add_ambient_capabilities.is_empty() || !c.add_capabilities.is_empty())
+    if sc.privileged || sc.selinux_options.is_some() || sc.capabilities.as_ref().is_some_and(|c| !c.add_ambient_capabilities.is_empty() || !c.add_capabilities.is_empty())
         || !matches!(sc.supplemental_groups_policy, 0 | 1) {
         return Err(unsupported("VM guest cannot apply the requested security configuration"));
     }
@@ -166,6 +175,10 @@ impl NautilusRuntimeService {
         config: Arc<Config>,
         state_manager: Arc<StateManager>,
     ) -> Self {
+        Self::with_images(config.clone(), state_manager, Arc::new(crate::storage::ImageManager::new(config)))
+    }
+
+    pub fn with_images(config: Arc<Config>, state_manager: Arc<StateManager>, images: Arc<crate::storage::ImageManager>) -> Self {
         // Multi-sandbox routing is the backbone: every pod/container op goes
         // through a backend resolved by its runtime_handler.
         let sandbox_registry = Arc::new(
@@ -187,6 +200,8 @@ impl NautilusRuntimeService {
         Self {
             _config: config.clone(),
             _state_manager: state_manager,
+            images,
+            vm_ready: Default::default(),
             pod_manager,
             container_manager,
             sandbox_registry,
@@ -200,6 +215,32 @@ impl NautilusRuntimeService {
     pub async fn recover_vm_pods(&self) -> crate::core::Result<()> {
         self.pod_manager.recover_vm_pods().await?;
         self.container_manager.recover_guest_containers().await
+    }
+
+    pub fn start_vm_readiness_probe(&self) {
+        if !self._config.runtime.sandboxes.vm_workloads_enabled || !self._config.runtime.runc.systemd_cgroup {
+            return;
+        }
+        let manager = self.pod_manager.clone();
+        let health = self.vm_ready.clone();
+        tokio::spawn(async move {
+            let mut delay = 5;
+            loop {
+                match manager.probe_workloads().await {
+                    Ok(()) => {
+                        health.ready.store(true, std::sync::atomic::Ordering::Release);
+                        delay = 5;
+                        health.recheck.notified().await;
+                    }
+                    Err(error) => {
+                        health.ready.store(false, std::sync::atomic::Ordering::Release);
+                        tracing::warn!(%error, delay, "VM handler readiness probe failed");
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        delay = (delay * 2).min(60);
+                    }
+                }
+            }
+        });
     }
 
     async fn release_pod_resources(
@@ -331,6 +372,10 @@ impl NautilusRuntimeService {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("pod {} not found", pod_id)))?;
 
+        if pod.runtime_handler == "vm" {
+            return Err(Status::unimplemented("guest Pod metrics unavailable"));
+        }
+
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let mut containers = Vec::new();
         let mut cpu_total = 0u64;
@@ -358,10 +403,10 @@ impl NautilusRuntimeService {
                     name: pod.name.clone(),
                     uid: pod.uid.clone(),
                     namespace: pod.namespace.clone(),
-                    attempt: 0,
+                    attempt: pod.attempt,
                 }),
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: pod.labels,
+                annotations: pod.annotations,
             }),
             linux: Some(rt::LinuxPodSandboxStats {
                 cpu: Some(rt::CpuUsage {
@@ -416,6 +461,9 @@ impl RuntimeService for NautilusRuntimeService {
 
         let managed_vm = req.runtime_handler == "vm" && self._config.runtime.sandboxes.vm_workloads_enabled;
         if managed_vm {
+            if !self._config.runtime.runc.systemd_cgroup {
+                return Err(Status::failed_precondition("VM workloads require the systemd cgroup driver"));
+            }
             validate_vm_pod(&config, &self._config).map_err(|(code,msg)| Status::new(code,msg))?;
         } else {
             self.sandbox_registry.resolve(&req.runtime_handler).map_err(Status::from)?;
@@ -489,41 +537,27 @@ impl RuntimeService for NautilusRuntimeService {
         let pod_host_pid = pod_ns.is_some_and(|n| n.pid() as i32 == node_mode);
         let pod_host_ipc = pod_ns.is_some_and(|n| n.ipc() as i32 == node_mode);
 
-        let pod_id = self.pod_manager.create_pod(
-            &metadata.namespace,
-            &metadata.name,
-            &metadata.uid,
-            &handler,
-            config.labels,
-            config.annotations,
-            config.log_directory.as_str(),
-            config.hostname.as_str(),
-            &config
-                .dns_config
-                .as_ref()
-                .map(|d| d.servers.clone())
-                .unwrap_or_default(),
-            &config
-                .dns_config
-                .as_ref()
-                .map(|d| d.searches.clone())
-                .unwrap_or_default(),
-            &config
-                .dns_config
-                .as_ref()
-                .map(|d| d.options.clone())
-                .unwrap_or_default(),
-            config
-                .linux
-                .as_ref()
-                .and_then(|l| l.security_context.as_ref())
-                .map(|sc| sc.privileged)
-                .unwrap_or(false),
-            pod_host_network,
-            pod_host_pid,
-            pod_host_ipc,
-            None,
-        ).await.map_err(|e| Status::internal(format!("Failed to create pod: {}", e)))?;
+        let dns = config.dns_config.as_ref();
+        let pod_id = self.pod_manager.reserve_pod(crate::core::state::PodState {
+            attempt: metadata.attempt,
+            namespace: metadata.namespace,
+            name: metadata.name,
+            uid: metadata.uid,
+            runtime_handler: handler.clone(),
+            labels: config.labels,
+            annotations: config.annotations,
+            log_directory: config.log_directory,
+            hostname: config.hostname,
+            dns_servers: dns.map(|d| d.servers.clone()).unwrap_or_default(),
+            dns_searches: dns.map(|d| d.searches.clone()).unwrap_or_default(),
+            dns_options: dns.map(|d| d.options.clone()).unwrap_or_default(),
+            privileged: config.linux.as_ref().and_then(|l| l.security_context.as_ref()).is_some_and(|sc| sc.privileged),
+            host_network: pod_host_network,
+            host_pid: pod_host_pid,
+            host_ipc: pod_host_ipc,
+            cgroup_parent: config.linux.as_ref().map(|l| l.cgroup_parent.clone()).unwrap_or_default(),
+            ..Default::default()
+        }).await.map_err(|e| Status::internal(format!("Failed to create pod: {}", e)))?;
 
         let _guard = self.pod_manager.operation_guard(&pod_id).await;
         // A concurrent removal can observe the initial Pending record first.
@@ -534,6 +568,7 @@ impl RuntimeService for NautilusRuntimeService {
             let id = pod_id.clone();
             let manager = self.pod_manager.clone();
             let dns = config.dns_config;
+            let health = self.vm_ready.clone();
             let (reply, receive) = tokio::sync::oneshot::channel();
             // A canceled RPC must not abandon an in-flight CNI plugin. Keep
             // the guard through completion and unwind an unclaimed result.
@@ -546,6 +581,11 @@ impl RuntimeService for NautilusRuntimeService {
                         tracing::warn!(pod_id=%id, %e, "unclaimed VM retained for cleanup");
                     }
                     return;
+                }
+                // A Pod may request more resources than this node can supply.
+                // Recheck with the fixed probe before withdrawing the handler.
+                if result.is_err() && health.ready.load(std::sync::atomic::Ordering::Acquire) {
+                    health.recheck.notify_one();
                 }
                 let cleanup = manager.rollback_vm_locked(&id).await;
                 let error = match (result, cleanup) {
@@ -704,7 +744,7 @@ impl RuntimeService for NautilusRuntimeService {
                     name: pod.name,
                     uid: pod.uid,
                     namespace: pod.namespace,
-                    attempt: pod.vm_attempt.as_ref().map_or(0, |a| a.attempt),
+                    attempt: pod.vm_attempt.as_ref().map_or(pod.attempt, |a| a.attempt),
                 }),
                 state: state as i32,
                 created_at: pod.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -753,7 +793,7 @@ impl RuntimeService for NautilusRuntimeService {
             Some(runtime::v1::PodSandbox {
                 id: p.id,
                 metadata: Some(PodSandboxMetadata { name: p.name, uid: p.uid, namespace: p.namespace,
-                    attempt: p.vm_attempt.as_ref().map_or(0, |a| a.attempt) }),
+                    attempt: p.vm_attempt.as_ref().map_or(p.attempt, |a| a.attempt) }),
                 state: sandbox_state(&p.status) as i32,
                 created_at: p.created_at.timestamp_nanos_opt().unwrap_or(0),
                 labels: p.labels, annotations: p.annotations, runtime_handler: p.runtime_handler,
@@ -829,6 +869,8 @@ impl RuntimeService for NautilusRuntimeService {
                 cpuset_mems: r.cpuset_mems.clone(),
                 memory_limit_in_bytes: r.memory_limit_in_bytes,
                 oom_score_adj: r.oom_score_adj as i32,
+                guest_unified: if pod.runtime_handler == "vm" { r.unified.clone() } else { Default::default() },
+                guest_no_hugepages: if pod.runtime_handler == "vm" { r.hugepage_limits.iter().map(|p| p.page_size.clone()).collect() } else { Vec::new() },
             });
 
         // CRI security context → per-container overrides.
@@ -1038,8 +1080,9 @@ impl RuntimeService for NautilusRuntimeService {
             }
         }
 
+        let image_ref = self.images.workload_reference(&image.image).await.map_err(Status::from)?;
         let container_id = self.container_manager.create_with_process_options(crate::runtime::container::CreateWorkload {
-            pod_id:&req.pod_sandbox_id, name:&metadata.name, image:&image.image, sandbox_kind:&pod.runtime_handler,
+            pod_id:&req.pod_sandbox_id, name:&metadata.name, image:&image_ref, sandbox_kind:&pod.runtime_handler,
             command: config.command, args: config.args, log_path: &config.log_path,
             volumes: config
                 .mounts
@@ -1195,6 +1238,7 @@ impl RuntimeService for NautilusRuntimeService {
                 ContainerStatus::Unknown => runtime::v1::ContainerState::ContainerUnknown,
             };
             
+            let image_id = self.images.container_image_id(&container).await;
             filtered_containers.push(Container {
                 id: container.id,
                 pod_sandbox_id: container.pod_id,
@@ -1209,7 +1253,7 @@ impl RuntimeService for NautilusRuntimeService {
                     user_specified_image: String::new(),
                     image_ref: String::new(),
                 }),
-                image_id: container.vm.map_or_else(|| container.image.clone(), |vm| vm.image_id),
+                image_id,
                 image_ref: container.image.clone(),
                 state: container_status as i32,
                 created_at: container.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -1241,6 +1285,7 @@ impl RuntimeService for NautilusRuntimeService {
             ContainerStatus::Unknown => runtime::v1::ContainerState::ContainerUnknown,
         };
 
+        let image_id = self.images.container_image_id(&c).await;
         Ok(Response::new(ContainerStatusResponse {
             status: Some(runtime::v1::ContainerStatus {
                 id: c.id.clone(),
@@ -1284,7 +1329,7 @@ impl RuntimeService for NautilusRuntimeService {
                     .collect(),
                 log_path: c.log_path.unwrap_or_default(),
                 resources: None,
-                image_id: c.vm.map_or(c.id, |vm| vm.image_id),
+                image_id,
                 user: None,
                 stop_signal: 0, // SIGTERM (proto enum 0); not configurable yet
             }),
@@ -1518,9 +1563,14 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn update_runtime_config(
         &self,
-        _request: Request<UpdateRuntimeConfigRequest>,
+        request: Request<UpdateRuntimeConfigRequest>,
     ) -> Result<Response<UpdateRuntimeConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented yet"))
+        if let Some(network) = request.into_inner().runtime_config.and_then(|config| config.network_config) {
+            if !network.pod_cidr.is_empty() && !self.pod_net.matches_pod_cidr(&network.pod_cidr).map_err(Status::from)? {
+                return Err(Status::failed_precondition("kubelet PodCIDR differs from the configured CNI allocation"));
+            }
+        }
+        Ok(Response::new(UpdateRuntimeConfigResponse {}))
     }
 
     async fn status(
@@ -1534,22 +1584,22 @@ impl RuntimeService for NautilusRuntimeService {
             reason: "".to_string(),
             message: "".to_string(),
         };
+        let mut names = self.sandbox_registry.list_handlers();
+        names.insert(0, String::new());
+        if self.vm_ready.ready.load(std::sync::atomic::Ordering::Acquire) {
+            names.push("vm".into());
+        }
+        let handlers = names.into_iter().map(|name| rt::RuntimeHandler {
+            name,
+            features: Some(rt::RuntimeHandlerFeatures::default()),
+        }).collect();
         Ok(Response::new(StatusResponse {
             // kubelet/crictl require BOTH conditions to consider the runtime
             // sane.
             status: Some(rt::RuntimeStatus {
                 conditions: vec![cond("RuntimeReady"), cond("NetworkReady")],
             }),
-            runtime_handlers: vec![
-                rt::RuntimeHandler { name: "runc".to_string(), features: None },
-                rt::RuntimeHandler {
-                    name: "wasm".to_string(),
-                    features: Some(rt::RuntimeHandlerFeatures {
-                        recursive_read_only_mounts: false,
-                        user_namespaces: false,
-                    }),
-                },
-            ],
+            runtime_handlers: handlers,
             features: None,
             info: Default::default(),
         }))
@@ -1616,11 +1666,9 @@ impl RuntimeService for NautilusRuntimeService {
         _request: Request<RuntimeConfigRequest>,
     ) -> Result<Response<RuntimeConfigResponse>, Status> {
         use crate::proto::runtime::v1 as rt;
-        // cgroupfs is what our libcontainer driver writes; systemd units are
-        // not managed by nautilus itself.
         Ok(Response::new(RuntimeConfigResponse {
             linux: Some(rt::LinuxRuntimeConfiguration {
-                cgroup_driver: rt::CgroupDriver::Cgroupfs as i32,
+                cgroup_driver: if self._config.runtime.runc.systemd_cgroup { rt::CgroupDriver::Systemd } else { rt::CgroupDriver::Cgroupfs } as i32,
             }),
         }))
     }
@@ -1741,6 +1789,8 @@ mod implicit_cleanup_tests {
             sandbox_registry: registry,
             pod_net: Arc::new(PodNet::new(config.clone())),
             policy: Arc::new(crate::policy::PolicyEngine::new(&config)),
+            images: Arc::new(crate::storage::ImageManager::new(config.clone())),
+            vm_ready: Default::default(),
             _config: config,
             _state_manager: state,
         };

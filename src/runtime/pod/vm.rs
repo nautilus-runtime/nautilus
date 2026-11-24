@@ -7,6 +7,37 @@ use crate::proto::runtime::v1::DnsConfig;
 use crate::vm::{owner::PodVmStore, resources::VmResources};
 
 impl PodManager {
+    pub(crate) async fn probe_workloads(&self) -> Result<()> {
+        // A delayed DEL or conflicting owner can outlive a failed probe. Its
+        // journal must be cleared before another attempt allocates resources.
+        for pod in self
+            .state_manager
+            .vm_pods_for_recovery()
+            .await?
+            .into_iter()
+            .filter(|pod| pod.vm_probe)
+        {
+            let _guard = self.operation_guard(&pod.id).await;
+            self.rollback_vm_locked(&pod.id).await?;
+        }
+        let id = self
+            .reserve_pod(PodState {
+                runtime_handler: "vm".into(),
+                hostname: "nautilus-probe".into(),
+                vm_probe: true,
+                ..Default::default()
+            })
+            .await?;
+        let _guard = self.operation_guard(&id).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.create_vm_network_locked(&id, 0, None, &VmResources::default()),
+        )
+        .await;
+        self.rollback_vm_locked(&id).await?;
+        result.map_err(|_| Error::Runtime("VM startup probe timed out".into()))?
+    }
+
     async fn save_vm_pod(&self, pod: &PodState) -> Result<()> {
         self.state_manager.save_pod_state(pod).await?;
         self.pods.write().await.insert(pod.id.clone(), pod.clone());

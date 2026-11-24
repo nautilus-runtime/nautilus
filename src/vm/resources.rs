@@ -15,6 +15,7 @@ pub struct VmResources {
     weight: Option<u64>,
     cpu: Option<(u64, u64)>,
     memory_max: Option<u64>,
+    oom_group: bool,
 }
 
 impl Default for VmResources {
@@ -26,6 +27,7 @@ impl Default for VmResources {
             weight: None,
             cpu: None,
             memory_max: None,
+            oom_group: false,
         }
     }
 }
@@ -50,7 +52,9 @@ fn validate(r: &LinuxContainerResources) -> io::Result<()> {
     if !r.cpuset_cpus.is_empty()
         || !r.cpuset_mems.is_empty()
         || !r.hugepage_limits.is_empty()
-        || !r.unified.is_empty()
+        || r.unified
+            .iter()
+            .any(|(k, v)| k != "memory.oom.group" || v != "1")
         || r.oom_score_adj != 0
         || r.memory_swap_limit_in_bytes != 0
     {
@@ -63,7 +67,7 @@ fn validate(r: &LinuxContainerResources) -> io::Result<()> {
 
 // Accept a systemd slice name or its exact cgroupfs path. Moving the service
 // into a similarly named slice would charge the wrong Kubernetes Pod.
-fn parent_slice(parent: &str) -> io::Result<Option<String>> {
+pub(crate) fn parent_slice(parent: &str) -> io::Result<Option<String>> {
     if parent == "/" || parent == "-.slice" {
         return Ok(Some("-.slice".into()));
     }
@@ -123,6 +127,8 @@ impl VmResources {
         validate(overhead)?;
         let mut plan = Self {
             slice: parent_slice(&config.cgroup_parent)?,
+            oom_group: work.unified.contains_key("memory.oom.group")
+                || overhead.unified.contains_key("memory.oom.group"),
             ..Self::default()
         };
 
@@ -199,6 +205,9 @@ impl VmResources {
 
     pub(crate) fn systemd_properties(&self) -> Vec<String> {
         let mut properties = Vec::new();
+        if self.oom_group {
+            properties.push("OOMPolicy=kill".into());
+        }
         if let Some(weight) = self.weight {
             properties.push(format!("CPUWeight={weight}"));
         }
