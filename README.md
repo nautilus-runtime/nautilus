@@ -86,6 +86,8 @@ cargo test --locked --target "$(uname -m)-unknown-linux-gnu"
 
 The published CRI baseline for `critest` v1.31.1 is 96 passed, 0 failed and 17 skipped. See the [conformance results](docs/CRITEST_RESULTS.md), [architecture guide](docs/ARCHITECTURE.md) and [roadmap](docs/DEVELOPMENT_ROADMAP.md) for details.
 
+The [containerd comparison](docs/PERFORMANCE.md) measures OCI pod sandbox creation, container creation, startup and workload readiness. It includes the test procedure and per-workload timings.
+
 Contributions are welcome. To report a bug, include the output of `nautilus version`, the runtime handler and a minimal command that reproduces the behavior. [Open an issue](https://github.com/nautilus-runtime/nautilus/issues).
 
 ## License

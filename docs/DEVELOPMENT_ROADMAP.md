@@ -1,6 +1,6 @@
 # Nautilus 开发路线图
 
-> 更新时间:2026-08-29。**MVP 阶段已完成**(原 2025-10 的 8-10 周阶段计划与
+> MVP 状态记录于 2026-08-29，性能基线更新于 2026-11-24。**MVP 阶段已完成**(原 2025-10 的 8-10 周阶段计划与
 > 任务分解文档已随阶段结束清理)。现状以本文档与
 > [架构文档](ARCHITECTURE.md)、
 > [critest 测试结果](CRITEST_RESULTS.md)为准。
@@ -12,8 +12,8 @@
 | CRI 一致性 | **critest v1.31.1 96/0 全绿**(两连跑确认) | crictl 命令可用 |
 | 单元/集成测试 | cargo test 6 套件 28/28 绿 + e2e 5(e2e 偶发 wait4 挂起待查) | 套件绿色 |
 | 空闲内存 | **PSS 10 MiB**(RSS 11 MiB / 12 线程,release 实测) | < 100MB ✅ 大幅超额 |
-| 容器启动时间 | 未建立基准 | < 100ms (P95) ⏳ |
-| 并发操作 | 未建立基准 | 1000+ ⏳ |
+| 容器启动时间 | 预热 BusyBox，串行 CreateContainer + StartContainer P95 为 103.0 ms，containerd 为 67.7 ms。见[测试口径和数据](PERFORMANCE.md) | < 100 ms (P95)，本轮未达到 |
+| 并发操作 | 已测 4 路并发，Nautilus 的创建加启动 P95 为 138.1 ms | 1000+，容量上限待测 |
 | 生产加固 | socket 0660、SIGTERM 优雅退出、registry auth、脚手架删除、警告清零 | — ✅ |
 | 多沙箱 | runc(libcontainer)+ wasmtime 双后端路由、RuntimeClass 路由验证通过 | — ✅ |
 | Wasm 策略引擎 | hooks 热加载 + fuel/timeout 限额,demo 验证通过 | — ✅ |
@@ -39,8 +39,8 @@
 
 ### 近期(稳定性与度量)
 
-1. **性能基准建立**:容器启动时间(P95)、并发容器操作数——路线图量化指标
-   中仅剩这两项未实测(`scripts/measure_memory.sh` 已有,需补时间/并发脚本)
+1. **性能回归与容量测量**：已发布[与 containerd 的首轮对比和原始样本](PERFORMANCE.md)。
+   后续跨时段复测，拆解 CreateContainer 开销，并补充冷镜像、多层镜像、CNI 和阶梯并发测试。
 2. **e2e wait4 挂起排查**:`e2e_lifecycle_test` 两次复现阻塞在 wait4
    (疑与 CPU 饥饿同源),干净环境观察定位
 3. **debug 日志与流式输出隔离**:libcontainer 内部 DEBUG 行泄入 exec 流
