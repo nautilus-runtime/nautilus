@@ -6,6 +6,7 @@ pub mod sandbox;
 pub mod storage;
 pub mod network;
 pub mod proto;
+pub mod vm;
 
 // Re-export commonly used types
 pub use core::{Config, Error, Result, StateManager};
