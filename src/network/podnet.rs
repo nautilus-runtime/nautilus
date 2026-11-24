@@ -20,7 +20,7 @@ pub struct PodNetInfo {
 }
 
 pub struct PodNet {
-    config: Arc<Config>,
+    pub(super) config: Arc<Config>,
 }
 
 impl PodNet {
@@ -120,11 +120,20 @@ impl PodNet {
         netns_path: &str,
         prev_ip: Option<&str>,
     ) -> Result<serde_json::Value> {
-        let (net_name, cni_version, mut chain) = self.load_or_generate_chain()?;
-        let bin_dir = PathBuf::from(&self.config.network.cni_bin_dir);
-        let mut prev: Option<serde_json::Value> =
-            prev_ip.map(|ip| serde_json::json!({ "ips": [ { "address": ip } ] }));
+        let chain = self.load_chain(false)?;
+        let prev = prev_ip.map(|ip| serde_json::json!({ "ips": [ { "address": ip } ] }));
+        Self::run_chain(&self.config.network.cni_bin_dir, chain, command, pod_id, netns_path, prev, None).await
+    }
 
+    pub(super) async fn run_chain(
+        bin_dir: &Path,
+        (net_name, cni_version, mut chain): (String, String, Vec<serde_json::Value>),
+        command: &str,
+        pod_id: &str,
+        netns_path: &str,
+        mut prev: Option<serde_json::Value>,
+        lease: Option<&std::fs::File>,
+    ) -> Result<serde_json::Value> {
         let mut attempted = Vec::new();
         let mut delete_error = None;
         if command == "DEL" {
@@ -158,7 +167,7 @@ impl PodNet {
                 netns_path,
                 ifname,
                 &bin_dir.to_string_lossy(),
-                &conf,
+                &conf, lease,
             ).await;
             if command == "DEL" {
                 if let Err(error) = result {
@@ -178,7 +187,7 @@ impl PodNet {
                     for (plugin, interface, config) in attempted.into_iter().rev() {
                         if let Err(cleanup) = invoke_plugin(
                             &bin_dir.join(&plugin), &plugin, "DEL", pod_id, netns_path,
-                            interface, &bin_dir.to_string_lossy(), &config,
+                            interface, &bin_dir.to_string_lossy(), &config, lease,
                         ).await {
                             tracing::warn!(%pod_id, %plugin, %cleanup, "CNI rollback failed");
                         }
@@ -193,7 +202,7 @@ impl PodNet {
         }
     }
 
-    fn load_or_generate_chain(&self) -> Result<(String, String, Vec<serde_json::Value>)> {
+    pub(super) fn load_chain(&self, require_config: bool) -> Result<(String, String, Vec<serde_json::Value>)> {
         use std::fs;
 
         let dir = PathBuf::from(&self.config.network.cni_config_dir);
@@ -212,25 +221,25 @@ impl PodNet {
         files.sort();
 
         for f in files {
-            if let Ok(text) = fs::read_to_string(&f) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let name = v
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("nautilus")
-                        .to_string();
-                    let version = v
-                        .get("cniVersion")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("1.0.0")
-                        .to_string();
-                    if let Some(plugins) = v.get("plugins").and_then(|p| p.as_array()) {
-                        return Ok((name, version, plugins.clone()));
-                    }
-                    // Plain single-plugin conf: treat as a one-element chain.
-                    return Ok((name, version, vec![v]));
-                }
-            }
+            let config = fs::read_to_string(&f).map_err(Error::from)
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).map_err(Error::from));
+            let v = match config {
+                Ok(v) => v,
+                Err(e) if require_config => return Err(e),
+                Err(_) => continue,
+            };
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("nautilus").to_owned();
+            let version = v.get("cniVersion").and_then(|n| n.as_str()).unwrap_or("1.0.0").to_owned();
+            let plugins = if let Some(plugins) = v.get("plugins").and_then(|p| p.as_array()) {
+                plugins.clone()
+            } else {
+                vec![v]
+            };
+            return Ok((name, version, plugins));
+        }
+
+        if require_config {
+            return Err(Error::Network(format!("no usable VM CNI configuration in {}", dir.display())));
         }
 
         // No usable configuration: generate the default loopback+bridge list.
@@ -569,6 +578,7 @@ async fn invoke_plugin(
     ifname: &str,
     cni_path: &str,
     conf: &serde_json::Value,
+    lease: Option<&std::fs::File>,
 ) -> Result<serde_json::Value> {
     use tokio::io::AsyncWriteExt;
 
@@ -582,6 +592,9 @@ async fn invoke_plugin(
         .map_err(|e| Error::Network(format!("serialize plugin config: {e}")))?;
 
     let mut cmd = tokio::process::Command::new(bin);
+    if let Some(lease) = lease {
+        super::vm::keep_operation_lease(&mut cmd, lease);
+    }
     cmd.env("CNI_COMMAND", command)
         .env("CNI_CONTAINERID", pod_id)
         .env("CNI_NETNS", netns_path)

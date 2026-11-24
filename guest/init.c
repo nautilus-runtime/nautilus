@@ -57,6 +57,8 @@ static bool read_line(const char *path, char *buffer, size_t capacity)
     return false;
 }
 
+#include "network.h"
+
 static bool make_identity(char *response, size_t size)
 {
     char cmdline[4096], boot[UUID_LEN + 2];
@@ -78,7 +80,8 @@ static bool make_identity(char *response, size_t size)
             nonce = arg + sizeof(nonce_key) - 1;
         }
     }
-    if (!sandbox || !nonce || !canonical_uuid(sandbox) || !canonical_uuid(nonce))
+    if (!sandbox || !nonce || !canonical_uuid(sandbox) || !canonical_uuid(nonce) ||
+        !configure_pod_network())
         return false;
     int length = snprintf(response, size, "IDENTITY 1 %s %s %s\n", sandbox, nonce, boot);
     return length > 0 && (size_t)length < size;
@@ -92,9 +95,22 @@ static void identify(int peer, const char *response)
         return;
     const char query[] = "IDENTIFY 1\n";
     char request[sizeof(query) - 1];
-    if (recv(peer, request, sizeof(request), MSG_WAITALL) != (ssize_t)sizeof(request) ||
-        memcmp(request, query, sizeof(request)) != 0)
+    if (recv(peer, request, sizeof(request), MSG_WAITALL) != (ssize_t)sizeof(request))
         return;
+    char network[1700];
+    if (memcmp(request, "NETWORK? 1\n", sizeof(request)) == 0 && applied_network[0]) {
+        /* Identity ends with the canonical boot UUID and a newline. */
+        const char *boot = strrchr(response, ' ');
+        if (!boot || strlen(boot + 1) != UUID_LEN + 1)
+            return;
+        int n = snprintf(network, sizeof(network), "NETWORK 1 %.*s nautilus.net=%s\n",
+                         UUID_LEN, boot + 1, applied_network);
+        if (n <= 0 || (size_t)n >= sizeof(network))
+            return;
+        response = network;
+    } else if (memcmp(request, query, sizeof(request)) != 0) {
+        return;
+    }
     size_t left = strlen(response);
     while (left > 0) {
         ssize_t n = send(peer, response, left, MSG_NOSIGNAL);

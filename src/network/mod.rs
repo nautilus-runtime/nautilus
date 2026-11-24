@@ -9,3 +9,5 @@ pub use cni::{CniConfig, CniPlugin};
 pub use bridge::BridgeNetwork;
 pub use podnet::{PodNet, PodNetInfo};
 pub mod publish;
+
+pub mod vm;
