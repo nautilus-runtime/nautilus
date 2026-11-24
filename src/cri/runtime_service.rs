@@ -90,10 +90,16 @@ fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), (toni
     Ok(())
 }
 
+#[derive(Default)]
+struct VmReadiness {
+    ready: std::sync::atomic::AtomicBool,
+    recheck: tokio::sync::Notify,
+}
+
 pub struct NautilusRuntimeService {
     _config: Arc<Config>,
     _state_manager: Arc<StateManager>,
-    vm_ready: Arc<std::sync::atomic::AtomicBool>,
+    vm_ready: Arc<VmReadiness>,
     images: Arc<crate::storage::ImageManager>,
     pod_manager: Arc<PodManager>,
     container_manager: Arc<ContainerManager>,
@@ -212,16 +218,29 @@ impl NautilusRuntimeService {
     }
 
     pub fn start_vm_readiness_probe(&self) {
-        if self._config.runtime.sandboxes.vm_workloads_enabled && self._config.runtime.runc.systemd_cgroup {
-            let manager = self.pod_manager.clone();
-            let ready = self.vm_ready.clone();
-            tokio::spawn(async move {
-                match manager.probe_workloads().await {
-                    Ok(()) => ready.store(true, std::sync::atomic::Ordering::Release),
-                    Err(error) => tracing::warn!(%error, "VM handler readiness probe failed"),
-                }
-            });
+        if !self._config.runtime.sandboxes.vm_workloads_enabled || !self._config.runtime.runc.systemd_cgroup {
+            return;
         }
+        let manager = self.pod_manager.clone();
+        let health = self.vm_ready.clone();
+        tokio::spawn(async move {
+            let mut delay = 5;
+            loop {
+                match manager.probe_workloads().await {
+                    Ok(()) => {
+                        health.ready.store(true, std::sync::atomic::Ordering::Release);
+                        delay = 5;
+                        health.recheck.notified().await;
+                    }
+                    Err(error) => {
+                        health.ready.store(false, std::sync::atomic::Ordering::Release);
+                        tracing::warn!(%error, delay, "VM handler readiness probe failed");
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        delay = (delay * 2).min(60);
+                    }
+                }
+            }
+        });
     }
 
     async fn release_pod_resources(
@@ -549,6 +568,7 @@ impl RuntimeService for NautilusRuntimeService {
             let id = pod_id.clone();
             let manager = self.pod_manager.clone();
             let dns = config.dns_config;
+            let health = self.vm_ready.clone();
             let (reply, receive) = tokio::sync::oneshot::channel();
             // A canceled RPC must not abandon an in-flight CNI plugin. Keep
             // the guard through completion and unwind an unclaimed result.
@@ -561,6 +581,11 @@ impl RuntimeService for NautilusRuntimeService {
                         tracing::warn!(pod_id=%id, %e, "unclaimed VM retained for cleanup");
                     }
                     return;
+                }
+                // A Pod may request more resources than this node can supply.
+                // Recheck with the fixed probe before withdrawing the handler.
+                if result.is_err() && health.ready.load(std::sync::atomic::Ordering::Acquire) {
+                    health.recheck.notify_one();
                 }
                 let cleanup = manager.rollback_vm_locked(&id).await;
                 let error = match (result, cleanup) {
@@ -1561,7 +1586,7 @@ impl RuntimeService for NautilusRuntimeService {
         };
         let mut names = self.sandbox_registry.list_handlers();
         names.insert(0, String::new());
-        if self.vm_ready.load(std::sync::atomic::Ordering::Acquire) {
+        if self.vm_ready.ready.load(std::sync::atomic::Ordering::Acquire) {
             names.push("vm".into());
         }
         let handlers = names.into_iter().map(|name| rt::RuntimeHandler {

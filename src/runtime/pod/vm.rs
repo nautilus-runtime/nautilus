@@ -8,6 +8,18 @@ use crate::vm::{owner::PodVmStore, resources::VmResources};
 
 impl PodManager {
     pub(crate) async fn probe_workloads(&self) -> Result<()> {
+        // A delayed DEL or conflicting owner can outlive a failed probe. Its
+        // journal must be cleared before another attempt allocates resources.
+        for pod in self
+            .state_manager
+            .vm_pods_for_recovery()
+            .await?
+            .into_iter()
+            .filter(|pod| pod.vm_probe)
+        {
+            let _guard = self.operation_guard(&pod.id).await;
+            self.rollback_vm_locked(&pod.id).await?;
+        }
         let id = self
             .reserve_pod(PodState {
                 runtime_handler: "vm".into(),
