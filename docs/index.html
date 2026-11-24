@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101c25">
+  <meta name="description" content="Run OCI containers and WASI commands with Nautilus, an open-source Linux container runtime written in Rust for Kubernetes CRI v1.">
+  <title>Nautilus · OCI and WebAssembly runtime</title>
+  <link rel="icon" href="assets/favicon.ico">
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="wrap">
+    <a href="./" aria-label="Nautilus home"><img class="wordmark" src="assets/nautilus-wordmark.png" width="1086" height="362" alt="Nautilus"></a>
+    <nav aria-label="Primary">
+      <a href="#workloads">Workloads</a>
+      <a href="#docs">Docs</a>
+      <a href="https://github.com/nautilus-runtime/nautilus">GitHub</a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="intro">
+        <p class="eyebrow">Linux runtime / Kubernetes CRI v1</p>
+        <h1 id="hero-title">Run containers<br>and <em>WebAssembly.</em></h1>
+        <p class="lead">Nautilus runs OCI images and WASI commands on Linux. Its Rust daemon serves both the Nautilus CLI and kubelet over one Unix socket.</p>
+        <a class="button" href="https://github.com/nautilus-runtime/nautilus#install-from-source">Install Nautilus</a>
+      </div>
+      <div class="art">
+        <img src="assets/nautilus-mascot-small.png" width="800" height="800" alt="Nautilus mascot with a spiral shell made of iridescent shipping containers">
+      </div>
+    </section>
+    <section class="workloads" id="workloads" aria-labelledby="workload-title">
+      <div class="wrap">
+        <h2 id="workload-title">Run your first workload</h2>
+        <div class="examples">
+          <article>
+            <h3>OCI containers</h3>
+            <p>Pull BusyBox from the registry, print a greeting, then remove the container and its sandbox. Nautilus caches the image for the next run.</p>
+            <pre><code>sudo nautilus run --rm busybox:1.36 echo hello</code></pre>
+          </article>
+          <article>
+            <h3>WebAssembly commands</h3>
+            <p>Place a WASI Preview 1 module exporting <code>_start</code> in your current directory. The <code>wasi</code> handler runs it in Wasmtime and sends output to the daemon log.</p>
+            <pre><code>sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"</code></pre>
+          </article>
+        </div>
+      </div>
+    </section>
+    <section class="docs wrap" id="docs" aria-labelledby="docs-title">
+      <h2 id="docs-title">Project documentation</h2>
+      <ul>
+        <li><a href="https://github.com/nautilus-runtime/nautilus#quick-start">Quick start</a><span>Build from source and configure the daemon.</span></li>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/ARCHITECTURE.md">Architecture</a><span>Follow a CRI request through the runtime.</span></li>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/CRITEST_RESULTS.md">CRI test results</a><span>Review the published conformance results and skipped cases.</span></li>
+      </ul>
+    </section>
+  </main>
+  <footer class="wrap"><span>Nautilus</span><a href="https://github.com/nautilus-runtime/nautilus/blob/main/LICENSE">Apache License 2.0</a></footer>
+</body>
+</html>
