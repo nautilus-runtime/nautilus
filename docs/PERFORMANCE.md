@@ -101,9 +101,10 @@ The driver uses a persistent CRI v1 gRPC channel to each Unix socket and a monot
 | `start_ms` | Container ID returned | StartContainer returns successfully |
 | `create_start_ms` | Sandbox ID returned | StartContainer returns successfully |
 | `ready_ms` | Submit RunPodSandbox | Client observes the workload marker after StartContainer returns |
+| `pull_ready_ms` (first use) | Submit PullImage | Client observes the same workload marker |
 | `wave_ms` | Dispatch a batch to one runtime | All its workloads pass checks and complete cleanup |
 
-Use `create_start_ms` to compare startup within an existing sandbox. Compute it for each sample before taking percentiles. `ready_ms` includes sandbox creation and is an upper bound on first user code. The client polls at 1 ms after Start returns. Image pulls, client connection setup, kubelet scheduling and network configuration are outside these timing boundaries. Batch throughput includes teardown and can be computed as total measured workloads divided by the sum of distinct **per-wave** durations. Each row in a wave repeats the same duration.
+Use `create_start_ms` to compare startup within an existing sandbox. Compute it for each sample before taking percentiles. `ready_ms` includes sandbox creation and is an upper bound on first user code. The client polls at 1 ms after Start returns. Warm runs use preloaded images. Only the first-use driver times PullImage. Client connection setup, kubelet scheduling and network configuration are outside the reported intervals. Batch throughput includes teardown and can be computed as total measured workloads divided by the sum of distinct **per-wave** durations. Each row in a wave repeats the same duration.
 
 ## Test design
 
@@ -140,6 +141,24 @@ done
 ```
 
 Preserve the CSVs before removing the temporary directory. The driver removes its labelled pods and containers. The operator owns the test daemons, their preloaded images and temporary storage.
+
+### Comparing a change in when images are unpacked
+
+Start a baseline Nautilus, a candidate Nautilus and containerd on three dedicated sockets. Give each a separate writable store. Preload the same platform manifest on all three, run one untimed workload on each, and preload containerd's sandbox image. The cached-layer comparison below supports single-layer images with containerd's OverlayFS snapshotter. Keep a registry available to containerd for manifest resolution.
+
+```sh
+sudo env PYTHONPATH="$bench/proto" "$bench/venv/bin/python" scripts/benchmark_first_create.py \
+  --before "$BEFORE_SOCK" --after "$AFTER_SOCK" --containerd "$CONTAINERD_SOCK" \
+  --before-snapshot-dir "$BEFORE_CONTAINER_DIR/.snapshots-v1" \
+  --snapshot-dir "$AFTER_CONTAINER_DIR/.snapshots-v1" --workdir "$bench/probes" \
+  --image "$image" --pairs 36 --output "$bench/cached-first-use.csv"
+```
+
+The driver cycles through all six runtime orders. Before each timed pull it removes the workload's image record and checks that its unpacked snapshot is absent. On containerd it temporarily pins the manifest and verifies that the manifest, config and compressed layer are available after eviction. It prepares the workload request before starting the timer, then calls PullImage, RunPodSandbox, CreateContainer and StartContainer consecutively. The client stops the total timer when it observes the readiness marker. Status checks and teardown follow.
+
+To include the transfer, preload the same digest under a fully qualified reference served by one HTTPS registry. Use an image with a layer unique to the workload in these disposable stores. Add `--transfer-image-dirs "$BEFORE_IMAGE_DIR" "$AFTER_IMAGE_DIR"` and select a new output file. In this mode the driver deletes the workload's cached manifest and layer from each named Nautilus store and waits for containerd to collect the content and snapshot. Registry access logs can confirm one successful layer download per measured workload.
+
+For warm workloads, add `--baseline "$BEFORE_SOCK"` to the `benchmark_cri.py` command above and pass the candidate as `--nautilus`. The CSV identifies the three builds as `before`, `after` and `containerd`. Compare the same concurrency and workload stage across builds, and keep the slot samples together when analyzing a parallel wave.
 
 ## Additional validation dimensions
 
