@@ -24,13 +24,48 @@ enum Driver {
     Exec,
 }
 
-// libcontainer opens /proc/<pid> and then reads stat. Reaping in between
-// returns a Procfs error instead of the usual Stopped result.
+fn systemd_scope(id: &str) -> PathBuf {
+    Path::new("/sys/fs/cgroup/system.slice").join(format!("youki-{id}.scope"))
+}
+
+// The init can exit between libcontainer's liveness check and its next
+// operation. Confirm disappearance without signalling a PID or consuming
+// the status owned by the workload exit watcher.
 fn init_disappeared(container: &Container, error: &LibcontainerError) -> Result<bool> {
-    if let (LibcontainerError::Procfs(_), Some(pid)) = (error, container.pid()) {
-        return Ok(!Path::new(&format!("/proc/{}/stat", pid.as_raw())).try_exists()?);
+    use libcgroups::common::{AnyManagerError, WrappedIoError};
+    use libcgroups::systemd::manager::SystemdManagerError;
+
+    let Some(pid) = container.pid() else {
+        return Ok(false);
+    };
+    let stat = PathBuf::from(format!("/proc/{}/stat", pid.as_raw()));
+    if matches!(error, LibcontainerError::Procfs(_)) {
+        return Ok(!stat.try_exists()?);
     }
-    Ok(false)
+    let LibcontainerError::CgroupManager(AnyManagerError::Systemd(SystemdManagerError::WrappedIo(
+        WrappedIoError::Read { path, err },
+    ))) = error
+    else {
+        return Ok(false);
+    };
+    if err.kind() != std::io::ErrorKind::NotFound
+        || *path != systemd_scope(container.id())
+        || path.try_exists()?
+    {
+        return Ok(false);
+    }
+    match std::fs::read(stat) {
+        Ok(bytes) => {
+            // comm may contain spaces or ')'. The state follows the final ')'.
+            let state = bytes
+                .rsplit(|c| *c == b')')
+                .next()
+                .and_then(|tail| tail.get(1));
+            Ok(matches!(state, Some(b'Z' | b'X')))
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(true),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn load_lifecycle_container(root: PathBuf) -> Result<Option<Container>> {
@@ -213,10 +248,7 @@ impl RuncBackend {
         // removes the scope right after death, so the reaper cannot read it
         // post-mortem without racing).
         let oom_id = spec.id.clone();
-        let scope_mem_events = std::path::PathBuf::from(format!(
-            "/sys/fs/cgroup/system.slice/youki-{}.scope/memory.events",
-            spec.id
-        ));
+        let scope_mem_events = systemd_scope(&spec.id).join("memory.events");
         if let Some(base) = system_slice_oom_kill() {
             oom_baselines().lock().unwrap().insert(spec.id.clone(), base);
         }
@@ -1523,6 +1555,67 @@ mod stop_tests {
         assert!(load_lifecycle_container(tmp.path().join("removed")).unwrap().is_none());
         std::fs::write(tmp.path().join("state.json"), b"bad json").unwrap();
         assert!(load_lifecycle_container(tmp.path().into()).is_err());
+    }
+
+    #[test]
+    fn missing_scope_only_completes_stop_after_its_init_exits() {
+        use libcgroups::common::WrappedIoError;
+        use libcgroups::systemd::manager::SystemdManagerError;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let scope = systemd_scope(&id);
+        let read_error = |path: &Path, errno| {
+            LibcontainerError::CgroupManager(
+                SystemdManagerError::WrappedIo(WrappedIoError::Read {
+                    path: path.to_owned(),
+                    err: std::io::Error::from_raw_os_error(errno),
+                })
+                .into(),
+            )
+        };
+        let state = |pid| {
+            Container::new(&id, OciStatus::Running, Some(pid), tmp.path(), tmp.path()).unwrap()
+        };
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 37"])
+            .spawn()
+            .unwrap();
+        let init = state(child.id() as i32);
+        let missing = read_error(&scope, libc::ENOENT);
+        // Leave the terminating child waitable, as it is while the daemon's
+        // workload watcher is still responsible for recording its exit code.
+        let mut info = unsafe { std::mem::zeroed() };
+        while unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        } < 0
+        {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        assert!(init_disappeared(&init, &missing).unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(37));
+        assert!(init_disappeared(&init, &missing).unwrap());
+        assert!(!init_disappeared(&state(std::process::id() as i32), &missing).unwrap());
+        assert!(!init_disappeared(&init, &read_error(&scope, libc::EACCES)).unwrap());
+        assert!(!init_disappeared(&init, &read_error(&scope.join("child"), libc::ENOENT)).unwrap());
+        assert!(!init_disappeared(
+            &init,
+            &read_error(&tmp.path().join("youki-peer.scope"), libc::ENOENT)
+        )
+        .unwrap());
+        assert!(!init_disappeared(
+            &init,
+            &read_error(&tmp.path().join(scope.file_name().unwrap()), libc::ENOENT)
+        )
+        .unwrap());
     }
 
     #[tokio::test]
