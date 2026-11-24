@@ -24,8 +24,45 @@ enum Driver {
     Exec,
 }
 
-fn systemd_scope(id: &str) -> PathBuf {
-    Path::new("/sys/fs/cgroup/system.slice").join(format!("youki-{id}.scope"))
+// The saved libcontainer config owns this triplet for the lifetime of the
+// container. Validate the complete slice hierarchy reported by libcgroups.
+fn owns_systemd_scope(container: &Container, scope: &Path) -> bool {
+    let Ok(config) = container.spec() else {
+        return false;
+    };
+    let Some(triplet) = config.cgroup_path.to_str() else {
+        return false;
+    };
+    let Some((slice, unit)) = triplet.split_once(':') else {
+        return false;
+    };
+    let Some((prefix, id)) = unit.split_once(':') else {
+        return false;
+    };
+    if id != container.id() {
+        return false;
+    }
+    let expected_slice = match (slice, prefix) {
+        ("", "youki") => "system.slice",
+        (slice, "nautilus") if !slice.is_empty() => slice,
+        _ => return false,
+    };
+    let expected_unit = format!("{prefix}-{id}.scope");
+    if scope.file_name() != Some(expected_unit.as_ref()) {
+        return false;
+    }
+    let Some(parent) = scope
+        .parent()
+        .and_then(|p| p.strip_prefix("/sys/fs/cgroup").ok())
+    else {
+        return false;
+    };
+    let hierarchy = Path::new("/").join(parent);
+    hierarchy
+        .to_str()
+        .and_then(|name| crate::vm::resources::parent_slice(name).ok().flatten())
+        .as_deref()
+        == Some(expected_slice)
 }
 
 // The init can exit between libcontainer's liveness check and its next
@@ -49,7 +86,7 @@ fn init_disappeared(container: &Container, error: &LibcontainerError) -> Result<
         return Ok(false);
     };
     if err.kind() != std::io::ErrorKind::NotFound
-        || *path != systemd_scope(container.id())
+        || !owns_systemd_scope(container, path)
         || path.try_exists()?
     {
         return Ok(false);
@@ -1593,7 +1630,12 @@ mod stop_tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let scope = systemd_scope(&id);
+        let scope = Path::new("/sys/fs/cgroup/system.slice").join(format!("youki-{id}.scope"));
+        std::fs::write(
+            tmp.path().join("youki_config.json"),
+            serde_json::json!({"cgroup_path":format!(":youki:{id}")}).to_string(),
+        )
+        .unwrap();
         let read_error = |path: &Path, errno| {
             LibcontainerError::CgroupManager(
                 SystemdManagerError::WrappedIo(WrappedIoError::Read {
@@ -1645,6 +1687,42 @@ mod stop_tests {
             &read_error(&tmp.path().join(scope.file_name().unwrap()), libc::ENOENT)
         )
         .unwrap());
+    }
+
+    #[test]
+    fn missing_scope_must_match_the_saved_kubelet_slice_and_container_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let container =
+            Container::new("init", OciStatus::Running, Some(1), dir.path(), dir.path()).unwrap();
+        let config = dir.path().join("youki_config.json");
+        let slice = "kubepods-burstable-pod123.slice";
+        let scope = Path::new("/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice")
+            .join(slice)
+            .join("nautilus-init.scope");
+        std::fs::write(
+            &config,
+            serde_json::json!({"cgroup_path":format!("{slice}:nautilus:init")}).to_string(),
+        )
+        .unwrap();
+        assert!(owns_systemd_scope(&container, &scope));
+        assert!(!owns_systemd_scope(
+            &container,
+            Path::new("/sys/fs/cgroup/kubepods-burstable-pod123.slice/nautilus-init.scope")
+        ));
+        assert!(!owns_systemd_scope(
+            &container,
+            &scope.with_file_name("nautilus-other.scope")
+        ));
+        assert!(!owns_systemd_scope(
+            &container,
+            &scope.join("nautilus-init.scope")
+        ));
+        std::fs::write(
+            &config,
+            serde_json::json!({"cgroup_path":format!("{slice}:nautilus:other")}).to_string(),
+        )
+        .unwrap();
+        assert!(!owns_systemd_scope(&container, &scope));
     }
 
     #[tokio::test]
