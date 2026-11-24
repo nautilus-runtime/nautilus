@@ -37,6 +37,9 @@ pub struct ContainerState {
     /// Environment variables requested via CRI (merged over image config env).
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Arguments for a WASI command, restored when it starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wasi_args: Vec<String>,
     pub labels: HashMap<String, String>,
     pub annotations: HashMap<String, String>,
     /// Host-path volumes from CRI ContainerConfig.mounts.

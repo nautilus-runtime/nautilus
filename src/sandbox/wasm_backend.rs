@@ -3,8 +3,7 @@
 //! No rootfs, no process tree: the pod workload is a `.wasm` (or `.wat`) module
 //! executed on an embedded engine inside the nautilus process itself — this is
 //! what makes the Rust implementation genuinely different from shelling out.
-//! Output currently inherits the daemon's stdio; per-container capture follows
-//! once logging is centralized.
+//! WASI stdout and stderr share the workload log file.
 
 use crate::core::{Config, Error, Result};
 use crate::sandbox::{SandboxBackend, SandboxKind, StartOutcome, WorkloadSpec};
@@ -13,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::{OutputFile, WasiCtxBuilder};
 
 pub struct WasmBackend {
     #[allow(dead_code)]
@@ -22,9 +21,7 @@ pub struct WasmBackend {
 }
 
 fn module_path(image_ref: &str) -> Result<PathBuf> {
-    let raw = image_ref
-        .strip_prefix("file://")
-        .unwrap_or(image_ref);
+    let raw = image_ref.strip_prefix("file://").unwrap_or(image_ref);
     if raw.starts_with("http://") || raw.starts_with("https://") {
         return Err(Error::Image(
             "remote wasm modules are not supported yet; use file:// paths".into(),
@@ -47,14 +44,15 @@ impl WasmBackend {
         path: PathBuf,
         args: Vec<String>,
         env: Vec<(String, String)>,
+        log: std::fs::File,
     ) -> Result<i32> {
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
         preview1::add_to_linker_sync(&mut linker, |t| t)
             .map_err(|e| Error::Runtime(format!("wasi linker setup failed: {e}")))?;
 
         let mut builder = WasiCtxBuilder::new();
-        builder.inherit_stdout();
-        builder.inherit_stderr();
+        builder.stdout(OutputFile::new(log.try_clone()?));
+        builder.stderr(OutputFile::new(log));
         // argv[0] convention: the module path itself.
         let mut argv = vec![path.display().to_string()];
         argv.extend(args);
@@ -128,12 +126,25 @@ impl SandboxBackend for WasmBackend {
         let path = module_path(&spec.image_ref)?;
         let engine = self.engine.clone();
         let args = spec.args.clone();
-        let env: Vec<(String, String)> = spec.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let env: Vec<(String, String)> = spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
-        let exit_code =
-            tokio::task::spawn_blocking(move || Self::run_module_blocking(engine, path, args, env))
-                .await
-                .map_err(|e| Error::Runtime(format!("wasm worker join failed: {e}")))??;
+        tokio::fs::create_dir_all(&spec.output_dir).await?;
+        let log = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(spec.output_dir.join(&spec.log_relpath))
+            .await?
+            .into_std()
+            .await;
+        let exit_code = tokio::task::spawn_blocking(move || {
+            Self::run_module_blocking(engine, path, args, env, log)
+        })
+        .await
+        .map_err(|e| Error::Runtime(format!("wasm worker join failed: {e}")))??;
 
         tracing::info!(container_id = %spec.id, exit_code, "wasm workload finished");
         Ok(StartOutcome::Finished { exit_code })
