@@ -13,6 +13,8 @@ Nautilus is a Linux container runtime written in Rust. It implements the Kuberne
 
 OCI containers support CNI pod networking, host port mappings, resource limits, logs and exec. You can also load a Wasm policy to allow or deny pod creation, container creation or container start. The [example policy](examples/policy-deny-label) rejects workloads carrying the `nautilus.policy/deny` label.
 
+On a Linux KVM node, `nautilus vm probe` boots a temporary Cloud Hypervisor guest and checks its vsock handshake. See the [probe instructions and Pod VM implementation plan](docs/VM_RUNTIME.md).
+
 ## Quick start
 
 ### Install from source

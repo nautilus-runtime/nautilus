@@ -21,6 +21,7 @@ use nautilus::proto::runtime::v1::{
     ContainerFilter, PodSandboxConfig, PodSandboxMetadata, PodSandboxStatusRequest, VersionRequest,
 };
 use hyper_util::rt::TokioIo;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -44,7 +45,34 @@ struct Cli {
     socket: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: CliCommand,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Inspect local VM runtime capabilities
+    Vm {
+        #[command(subcommand)]
+        command: VmCommand,
+    },
+    #[command(flatten)]
+    Cri(Box<Commands>),
+}
+
+#[derive(Subcommand)]
+enum VmCommand {
+    /// Boot a temporary Cloud Hypervisor guest and check its vsock agent
+    Probe {
+        /// Path to the Cloud Hypervisor executable
+        #[arg(long)]
+        vmm: PathBuf,
+        /// Path to the guest kernel
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Path to the probe agent's initramfs
+        #[arg(long)]
+        initramfs: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -198,13 +226,24 @@ async fn connect(socket: &str) -> Result<(RClient, IClient), String> {
 }
 
 async fn dispatch(cli: Cli) -> Result<u8, String> {
+    let command = match cli.command {
+        CliCommand::Vm { command } => {
+            let VmCommand::Probe { vmm, kernel, initramfs } = command;
+            nautilus::vm::probe(&vmm, &kernel, &initramfs)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("Cloud Hypervisor guest replied PONG 1 on vsock port 4081");
+            return Ok(0);
+        }
+        CliCommand::Cri(command) => *command,
+    };
     let socket = cli
         .socket
         .or_else(|| std::env::var("NAUTILUS_SOCKET").ok())
         .unwrap_or_else(|| DEFAULT_SOCKET.to_string());
     let (mut r, mut i) = connect(&socket).await?;
 
-    match cli.command {
+    match command {
         Commands::Exec { target, command } => return cmd_exec(&mut r, target, command).await,
         Commands::Run {
             name,

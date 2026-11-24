@@ -61,8 +61,7 @@
 
 ### 远期(设计预留)
 
-- **microVM 后端(libkrun)**:需要带 KVM 的宿主机(现有验证机不满足);
-  `Sandbox` trait 已预留,RuntimeClass 路由即插即用
+- **Pod 级 microVM 后端**：首个 VMM 为 Cloud Hypervisor。已开始实现节点探针，按 Pod 持有 VM、自研 guest agent、OCI 容器、网络和 kubelet 验收分步交付。见 [VM 设计与任务依赖](VM_RUNTIME.md)。
 - **机密计算(CoCo)**:依赖 microVM 后端先行
 - **企业级**:安全审计、兼容性认证、长稳(7x24)测试
 
