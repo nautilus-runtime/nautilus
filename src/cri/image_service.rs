@@ -1,12 +1,11 @@
+use super::list_stream::{batches, ListStream};
 use crate::proto::runtime::v1::image_service_server::ImageService;
 use crate::proto::runtime::v1::*;
 use crate::core::{Config, StateManager};
 use crate::storage::ImageManager;
 use oci_distribution::secrets::RegistryAuth;
 use tonic::{Request, Response, Status};
-use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::Stream;
 
 #[derive(Debug)]
 pub struct NautilusImageService {
@@ -336,13 +335,18 @@ impl ImageService for NautilusImageService {
         }))
     }
 
-    type StreamImagesStream =
-        Pin<Box<dyn Stream<Item = Result<StreamImagesResponse, Status>> + Send + 'static>>;
+    type StreamImagesStream = ListStream<StreamImagesResponse>;
 
     async fn stream_images(
         &self,
-        _request: Request<StreamImagesRequest>,
+        request: Request<StreamImagesRequest>,
     ) -> Result<Response<Self::StreamImagesStream>, Status> {
-        Err(Status::unimplemented("streaming watch API not implemented yet"))
+        let reply = self
+            .list_images(request.map(|r| ListImagesRequest { filter: r.filter }))
+            .await?
+            .into_inner();
+        Ok(Response::new(batches(reply.images, |images| {
+            StreamImagesResponse { images }
+        })))
     }
 }
