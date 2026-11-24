@@ -140,7 +140,7 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &
         return Err((tonic::Code::InvalidArgument, "invalid guest environment"));
     }
     if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
-        if r.oom_score_adj != 0 || r.memory_swap_limit_in_bytes != 0 || !r.hugepage_limits.is_empty()
+        if !(-1000..=1000).contains(&r.oom_score_adj) || r.memory_swap_limit_in_bytes != 0 || !r.hugepage_limits.is_empty()
             || !r.unified.is_empty() || !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() {
             return Err(unsupported("VM guest supports container CPU shares, period, quota and memory limit"));
         }
@@ -152,8 +152,7 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &
         || !ns.target_id.is_empty() || ns.userns_options.as_ref().is_some_and(|u| !u.uids.is_empty() || !u.gids.is_empty() || u.mode != NamespaceMode::Node as i32) {
         return Err(unsupported("VM containers require private PID, shared Pod network and IPC, and unmapped IDs"));
     }
-    if sc.privileged || !sc.masked_paths.is_empty() || !sc.readonly_paths.is_empty()
-        || sc.selinux_options.is_some() || sc.capabilities.as_ref().is_some_and(|c| !c.add_ambient_capabilities.is_empty() || !c.add_capabilities.is_empty())
+    if sc.privileged || sc.selinux_options.is_some() || sc.capabilities.as_ref().is_some_and(|c| !c.add_ambient_capabilities.is_empty() || !c.add_capabilities.is_empty())
         || !matches!(sc.supplemental_groups_policy, 0 | 1) {
         return Err(unsupported("VM guest cannot apply the requested security configuration"));
     }
@@ -1546,9 +1545,14 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn update_runtime_config(
         &self,
-        _request: Request<UpdateRuntimeConfigRequest>,
+        request: Request<UpdateRuntimeConfigRequest>,
     ) -> Result<Response<UpdateRuntimeConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented yet"))
+        if let Some(network) = request.into_inner().runtime_config.and_then(|config| config.network_config) {
+            if !network.pod_cidr.is_empty() && !self.pod_net.matches_pod_cidr(&network.pod_cidr).map_err(Status::from)? {
+                return Err(Status::failed_precondition("kubelet PodCIDR differs from the configured CNI allocation"));
+            }
+        }
+        Ok(Response::new(UpdateRuntimeConfigResponse {}))
     }
 
     async fn status(

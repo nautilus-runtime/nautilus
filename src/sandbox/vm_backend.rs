@@ -73,8 +73,6 @@ impl VmBackend {
                 || s.host_ipc
                 || s.share_pod_pid
                 || !s.add_capabilities.is_empty()
-                || !s.masked_paths.is_empty()
-                || !s.readonly_paths.is_empty()
                 || !s.apparmor_profile.is_empty()
                 || !matches!(s.seccomp_profile_path.as_str(), "" | "unconfined")
             {
@@ -82,9 +80,9 @@ impl VmBackend {
             }
         }
         if let Some(r) = &spec.resources {
-            if !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() || r.oom_score_adj != 0 {
+            if !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() || !(-1000..=1000).contains(&r.oom_score_adj) {
                 return Err(unsupported(
-                    "container cpusets and OOM adjustment are unavailable",
+                    "unsupported container cpuset or OOM adjustment",
                 ));
             }
         }
@@ -170,7 +168,7 @@ impl VmBackend {
                 "options":["bind", if volume.readonly {"ro"} else {"rw"}]}),
             );
         }
-        let spec_json = json!({
+        let mut spec_json = json!({
             "ociVersion":"1.1.0", "mounts":mounts,
             "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
             "annotations":{"io.nautilus.stdin":spec.open_stdin.to_string(),"io.nautilus.stdinOnce":spec.stdin_once.to_string()},
@@ -178,6 +176,19 @@ impl VmBackend {
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},
             "linux":{"namespaces":[{"type":"mount"},{"type":"pid"}],"resources":resources}
         });
+        if let Some(security) = security {
+            if !security.masked_paths.is_empty() {
+                spec_json["linux"]["maskedPaths"] = json!(security.masked_paths);
+            }
+            if !security.readonly_paths.is_empty() {
+                spec_json["linux"]["readonlyPaths"] = json!(security.readonly_paths);
+            }
+        }
+        if let Some(resources) = &spec.resources {
+            if resources.oom_score_adj != 0 {
+                spec_json["process"]["oomScoreAdj"] = json!(resources.oom_score_adj);
+            }
+        }
         tokio::fs::write(staged.join("config.json"), serde_json::to_vec(&spec_json)?).await?;
         self.store
             .publish_bundle(&self.pod, &spec.id, &staged)

@@ -18,15 +18,16 @@ type user struct {
 	Groups []uint32 `json:"additionalGids,omitempty"`
 }
 type process struct {
-	OpenStdin bool                `json:"-"`
-	StdinOnce bool                `json:"-"`
-	Terminal  bool                `json:"terminal"`
-	User      *user               `json:"user"`
-	Args      []string            `json:"args"`
-	Env       []string            `json:"env"`
-	Cwd       string              `json:"cwd"`
-	Caps      map[string][]string `json:"capabilities"`
-	NNP       bool                `json:"noNewPrivileges"`
+	OpenStdin   bool                `json:"-"`
+	StdinOnce   bool                `json:"-"`
+	OOMScoreAdj *int                `json:"oomScoreAdj,omitempty"`
+	Terminal    bool                `json:"terminal"`
+	User        *user               `json:"user"`
+	Args        []string            `json:"args"`
+	Env         []string            `json:"env"`
+	Cwd         string              `json:"cwd"`
+	Caps        map[string][]string `json:"capabilities"`
+	NNP         bool                `json:"noNewPrivileges"`
 }
 type root struct {
 	Path     string `json:"path"`
@@ -54,8 +55,10 @@ type resources struct {
 	Memory *memory `json:"memory,omitempty"`
 }
 type linuxSpec struct {
-	Namespaces []namespace `json:"namespaces"`
-	Resources  *resources  `json:"resources,omitempty"`
+	MaskedPaths   []string    `json:"maskedPaths,omitempty"`
+	ReadonlyPaths []string    `json:"readonlyPaths,omitempty"`
+	Namespaces    []namespace `json:"namespaces"`
+	Resources     *resources  `json:"resources,omitempty"`
 }
 type spec struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
@@ -174,6 +177,16 @@ func prepare(id, private string) (process, error) {
 	if s.Process.StdinOnce && !s.Process.OpenStdin {
 		return s.Process, errors.New("stdinOnce requires stdin")
 	}
+	if adj := s.Process.OOMScoreAdj; adj != nil && (*adj < -1000 || *adj > 1000) {
+		return s.Process, errors.New("invalid OOM score adjustment")
+	}
+	for _, paths := range [][]string{s.Linux.MaskedPaths, s.Linux.ReadonlyPaths} {
+		for _, path := range paths {
+			if !absolute(path) || path == "/" {
+				return s.Process, errors.New("masked and readonly paths must be absolute container paths")
+			}
+		}
+	}
 	for _, v := range s.Process.Env {
 		name, _, ok := strings.Cut(v, "=")
 		if !ok || name == "" || strings.ContainsRune(v, 0) {
@@ -243,8 +256,8 @@ func prepare(id, private string) (process, error) {
 	s.Mounts = mounts
 	// Runtime-owned fields never come from the exported OCI input.
 	linux := map[string]any{"namespaces": s.Linux.Namespaces, "cgroupsPath": "/nautilus/" + id,
-		"maskedPaths":   []string{"/proc/cmdline", "/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/sysrq-trigger"},
-		"readonlyPaths": []string{"/proc/sys", "/proc/bus", "/proc/fs", "/proc/irq", "/proc/asound"}}
+		"maskedPaths":   append([]string{"/proc/cmdline", "/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/sysrq-trigger"}, s.Linux.MaskedPaths...),
+		"readonlyPaths": append([]string{"/proc/sys", "/proc/bus", "/proc/fs", "/proc/irq", "/proc/asound"}, s.Linux.ReadonlyPaths...)}
 	r := map[string]any{"devices": []map[string]any{{"allow": false, "access": "rwm"}}}
 	if s.Linux.Resources != nil {
 		if c := s.Linux.Resources.CPU; c != nil {

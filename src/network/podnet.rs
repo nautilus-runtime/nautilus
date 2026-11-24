@@ -202,6 +202,23 @@ impl PodNet {
         }
     }
 
+    /// A static host-local network can acknowledge a kubelet PodCIDR when its
+    /// configured allocation subnet already matches. Never rewrite live IPAM.
+    pub(crate) fn matches_pod_cidr(&self, cidr: &str) -> Result<bool> {
+        let (_, _, plugins) = self.load_chain(false)?;
+        Ok(plugins.iter().any(|plugin| {
+            let ipam = &plugin["ipam"];
+            if ipam["type"] != "host-local" {
+                return false;
+            }
+            if let Some(ranges) = ipam["ranges"].as_array() {
+                return !ranges.is_empty() && ranges.iter().all(|set| set.as_array().is_some_and(|group|
+                    !group.is_empty() && group.iter().all(|range| range["subnet"] == cidr)));
+            }
+            ipam["subnet"] == cidr
+        }))
+    }
+
     pub(super) fn load_chain(&self, require_config: bool) -> Result<(String, String, Vec<serde_json::Value>)> {
         use std::fs;
 
