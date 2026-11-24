@@ -384,10 +384,10 @@ impl NautilusRuntimeService {
                     name: pod.name.clone(),
                     uid: pod.uid.clone(),
                     namespace: pod.namespace.clone(),
-                    attempt: 0,
+                    attempt: pod.attempt,
                 }),
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: pod.labels,
+                annotations: pod.annotations,
             }),
             linux: Some(rt::LinuxPodSandboxStats {
                 cpu: Some(rt::CpuUsage {
@@ -520,6 +520,7 @@ impl RuntimeService for NautilusRuntimeService {
 
         let dns = config.dns_config.as_ref();
         let pod_id = self.pod_manager.reserve_pod(crate::core::state::PodState {
+            attempt: metadata.attempt,
             namespace: metadata.namespace,
             name: metadata.name,
             uid: metadata.uid,
@@ -718,7 +719,7 @@ impl RuntimeService for NautilusRuntimeService {
                     name: pod.name,
                     uid: pod.uid,
                     namespace: pod.namespace,
-                    attempt: pod.vm_attempt.as_ref().map_or(0, |a| a.attempt),
+                    attempt: pod.vm_attempt.as_ref().map_or(pod.attempt, |a| a.attempt),
                 }),
                 state: state as i32,
                 created_at: pod.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -767,7 +768,7 @@ impl RuntimeService for NautilusRuntimeService {
             Some(runtime::v1::PodSandbox {
                 id: p.id,
                 metadata: Some(PodSandboxMetadata { name: p.name, uid: p.uid, namespace: p.namespace,
-                    attempt: p.vm_attempt.as_ref().map_or(0, |a| a.attempt) }),
+                    attempt: p.vm_attempt.as_ref().map_or(p.attempt, |a| a.attempt) }),
                 state: sandbox_state(&p.status) as i32,
                 created_at: p.created_at.timestamp_nanos_opt().unwrap_or(0),
                 labels: p.labels, annotations: p.annotations, runtime_handler: p.runtime_handler,

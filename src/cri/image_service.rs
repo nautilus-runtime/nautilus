@@ -308,19 +308,8 @@ impl ImageService for NautilusImageService {
             Status::invalid_argument("Image spec is required")
         })?;
         
-        // CRI idempotence: removing an unknown image is a no-op success.
-        if self
-            .image_manager
-            .get_image_status(&image_spec.image)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to query image: {}", e)))?
-            .is_some()
-        {
-            self.image_manager.remove_image(&image_spec.image, false).await
-                .map_err(|e| Status::internal(format!("Failed to remove image: {}", e)))?;
-        } else {
-            log::warn!("RemoveImage: no record matches {:?} (no-op)", image_spec.image);
-        }
+        self.image_manager.remove_image(&image_spec.image, false).await
+            .map_err(|e| Status::internal(format!("Failed to remove image: {e}")))?;
 
         Ok(Response::new(RemoveImageResponse {}))
     }

@@ -75,6 +75,8 @@ pub struct VmPodAttempt {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PodState {
+    #[serde(default)]
+    pub attempt: u32,
     pub id: String,
     pub namespace: String,
     pub name: String,

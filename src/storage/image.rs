@@ -492,10 +492,10 @@ impl ImageManager {
 
         let mut images = self.images.write().await;
 
-        // Locate the record via the same matcher get_image_status uses.
-        let target_key = locate_image(&images, image_ref)
-            .map(|k| k.to_string())
-            .ok_or_else(|| Error::Image(format!("Image not found: {}", image_ref)))?;
+        // Decide absence while holding the same locks as the removal itself.
+        let Some(target_key) = locate_image(&images, image_ref).map(str::to_owned) else {
+            return Ok(());
+        };
 
         let mut info = images.get(&target_key).cloned().unwrap();
 
@@ -533,9 +533,9 @@ impl ImageManager {
         let f = self
             .image_store_path
             .join(format!("{}.json", safe_image_name(&target_key)));
-        if f.exists() {
-            fs::remove_file(f).await
-                .map_err(|e| Error::Image(format!("Failed to remove image file: {}", e)))?;
+        match fs::remove_file(f).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
         }
         images.remove(&target_key);
         log::info!("Successfully removed image: {}", target_key);
@@ -759,6 +759,22 @@ mod tests {
         assert_eq!(restarted.workload_reference(&first).await.unwrap(), old_digest);
         assert!(restarted.workload_reference(&format!("sha256:{}", "0".repeat(64))).await.is_err());
     }
+    #[tokio::test]
+    async fn concurrent_removals_succeed_after_the_first_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.image_dir = dir.path().join("images");
+        config.storage.container_dir = dir.path().join("containers");
+        let store = ImageManager::new(Arc::new(config));
+        store.initialize().await.unwrap();
+        let tag = "example.test/project:temporary";
+        store.record_pull(tag, facts('a')).await.unwrap();
+        let (first, second) = tokio::join!(store.remove_image(tag, false), store.remove_image(tag, false));
+        first.unwrap();
+        second.unwrap();
+        assert!(store.get_image_status(tag).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn legacy_image_id_resolves_only_to_its_cached_manifest() {
         use oci_distribution::{config::ConfigFile, manifest::OciImageManifest};
