@@ -550,6 +550,26 @@ async fn scenario(
             exec(cli, &b, "test ! -e count").await?;
         }
     }
+    let never_started = create(cli, &id, &pod, workload("created", image, "exit 93")).await?;
+    let created = state(cli, &never_started).await?;
+    ensure!(created.state() == ContainerState::ContainerCreated && created.created_at > 0);
+    cli.stop_pod_sandbox(StopPodSandboxRequest {
+        pod_sandbox_id: id.clone(),
+    })
+    .await?;
+    let stopped = state(cli, &never_started).await?;
+    ensure!(
+        stopped.state() == ContainerState::ContainerExited
+            && stopped.created_at == created.created_at
+            && stopped.started_at == 0
+            && stopped.finished_at >= stopped.created_at
+            && stopped.exit_code == 137,
+        "unexpected stopped state for an unstarted guest init: {stopped:?}"
+    );
+    cli.remove_container(RemoveContainerRequest {
+        container_id: never_started,
+    })
+    .await?;
     ensure!(boot_id(cli, &other).await? == boot_b);
     Ok(())
 }
