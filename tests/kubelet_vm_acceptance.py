@@ -162,7 +162,7 @@ def main():
             except ValueError:
                 pass
         units = run(["systemctl", "list-units", "--state=running", "--no-legend", "--plain",
-                     "nautilus-vm-*.service", "nautilus-fs-*.service"])
+                     "nautilus-vm-*.service", "nautilus-virtiofs-*.service"])
         return paths, {line.split()[0] for line in units.splitlines()}
 
     wait(advertised)
