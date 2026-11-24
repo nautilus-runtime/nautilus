@@ -143,6 +143,28 @@ func (p *processIO) inputFor(o *streamOptions, closeStdin bool) streamInput {
 	return in
 }
 
+func (q request) validStream() bool {
+	o := q.Stream
+	if o == nil || q.Timeout != nil || q.Offset != nil || q.Limit != nil {
+		return false
+	}
+	switch q.Op {
+	case "portForward":
+		return q.Argv == nil && q.Container == q.Sandbox && o.Port != 0 && !(o.Stdin || o.Stdout || o.Stderr || o.TTY)
+	case "execStream":
+		if !validArgv(q.Argv) {
+			return false
+		}
+	case "attach":
+		if q.Argv != nil {
+			return false
+		}
+	default:
+		return false
+	}
+	return o.Port == 0 && (o.Stdin || o.Stdout || o.Stderr) && !(o.TTY && o.Stderr)
+}
+
 func (s *server) stream(f *os.File, q request) {
 	acknowledged := false
 	reply := func(r response) error {
@@ -162,10 +184,7 @@ func (s *server) stream(f *os.File, q request) {
 		return nil
 	}
 	o := q.Stream
-	if o == nil || q.Timeout != nil || q.Offset != nil || q.Limit != nil ||
-		q.Op == "execStream" && !validArgv(q.Argv) || q.Op != "execStream" && q.Argv != nil ||
-		q.Op == "portForward" && (o.Port == 0 || q.Container != s.Sandbox || o.Stdin || o.Stdout || o.Stderr || o.TTY) ||
-		q.Op != "portForward" && (o.Port != 0 || !o.Stdin && !o.Stdout && !o.Stderr || o.TTY && o.Stderr) {
+	if !q.validStream() {
 		reply(fail("invalid", "invalid stream options"))
 		return
 	}

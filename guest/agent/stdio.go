@@ -70,10 +70,31 @@ func (p *processIO) resize(width, height uint16) error {
 	if p.terminal == nil {
 		return errors.New("process has no terminal")
 	}
-	return unix.IoctlSetWinsize(int(p.terminal.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Col: width, Row: height})
+	return controlFD(p.terminal, func(fd uintptr) error {
+		return unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, &unix.Winsize{Col: width, Row: height})
+	})
+}
+
+// File.Fd changes pollable descriptors back to blocking mode. Keep the PTY
+// nonblocking so backpressure and cancellation can honor I/O deadlines.
+func controlFD(f *os.File, fn func(uintptr) error) error {
+	raw, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var result error
+	if err = raw.Control(func(fd uintptr) { result = fn(fd) }); err != nil {
+		return err
+	}
+	return result
 }
 func dupFile(f *os.File, name string) (*os.File, error) {
-	fd, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	var fd int
+	err := controlFD(f, func(source uintptr) error {
+		var err error
+		fd, err = unix.FcntlInt(source, unix.F_DUPFD_CLOEXEC, 0)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}

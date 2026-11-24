@@ -101,6 +101,33 @@ def run(connect, frame, read_exact, identity, uid, bundle, ok, first):
         assert ok("status", cid)["state"] == "running"
         ok("remove", cid)
 
+    # stdinOnce closes the original init's pipe on the first input session EOF.
+    cid = uid()
+    d = bundle(cid, "cat >/dev/null; echo input-closed; exit 28")
+    config = json.loads((d / "config.json").read_text())
+    config["annotations"] = {
+        "io.nautilus.stdin": "true",
+        "io.nautilus.stdinOnce": "true",
+    }
+    (d / "config.json").write_text(json.dumps(config))
+    ok("create", cid)
+    ok("start", cid)
+    with open_stream("attach", cid, {"stdin": True, "stdout": True}) as sock:
+        send(sock, 0, b"pending input")
+        send(sock, 5)
+        until(sock, b"input-closed")
+        assert recv(sock) == (6, struct.pack(">i", 28))
+    assert ok("status", cid)["exitCode"] == 28
+    ok("remove", cid)
+
+    # Malformed or unauthorized records terminate only the individual session.
+    open_stream("portForward", first, {"port": 18080}, success=False).close()
+    open_stream("attach", first, {"stdin": True}, success=False).close()
+    with open_stream(
+        "execStream", first, {"stdout": True}, ["/bin/sleep", "10"]
+    ) as sock:
+        sock.sendall(struct.pack(">BI", 0, 65537))
+        assert recv(sock)[0] == 3
     cid = uid()
     bundle(
         cid,
