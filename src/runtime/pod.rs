@@ -128,7 +128,7 @@ impl PodManager {
             let store = self.vm_store();
             let start = match &self.config.runtime.sandboxes.vm {
                 Some(images) => store
-                    .start(pod_id, &images.vmm, &images.kernel, &images.initramfs)
+                    .start_configured(pod_id, images)
                     .await
                     .map_err(Error::from),
                 None => Err(Error::Config("Pod VM images are not configured".into())),

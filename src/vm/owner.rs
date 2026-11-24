@@ -1,6 +1,9 @@
 //! Durable ownership of experimental per-Pod Cloud Hypervisor services.
 
+mod share;
+
 use super::guest::canonical_uuid;
+use crate::core::config::VmConfig;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -56,6 +59,24 @@ impl FileIdentity {
     }
 }
 
+/// Only the Pod's export is visible to the guest. The manifest and both
+/// services' sockets are siblings under the host-private control directory.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Share {
+    export: Option<FileIdentity>,
+    containers: Option<FileIdentity>,
+    invocation: Option<String>,
+    socket: Option<FileIdentity>,
+    pid_file: Option<FileIdentity>,
+}
+
+#[derive(Clone, Copy)]
+enum Service {
+    Vmm,
+    Virtiofsd,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Owner {
     id: String,
@@ -67,15 +88,25 @@ struct Owner {
     invocation: Option<String>,
     boot: Option<String>,
     removing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    share: Option<Share>,
 }
 
 impl Owner {
-    fn unit(&self) -> String {
-        format!("nautilus-vm-{}-{}.service", self.id, self.nonce)
+    fn unit(&self, service: Service) -> String {
+        let prefix = match service {
+            Service::Vmm => "vm",
+            Service::Virtiofsd => "virtiofs",
+        };
+        format!("nautilus-{prefix}-{}-{}.service", self.id, self.nonce)
     }
 
-    fn description(&self) -> String {
-        format!("Nautilus VM {} {}", self.id, self.nonce)
+    fn description(&self, service: Service) -> String {
+        let name = match service {
+            Service::Vmm => "VM",
+            Service::Virtiofsd => "virtiofsd",
+        };
+        format!("Nautilus {name} {} {}", self.id, self.nonce)
     }
 }
 
@@ -211,6 +242,19 @@ impl PodVmStore {
         kernel: &Path,
         initramfs: &Path,
     ) -> io::Result<String> {
+        self.start_configured(
+            id,
+            &VmConfig {
+                vmm: vmm.into(),
+                kernel: kernel.into(),
+                initramfs: initramfs.into(),
+                virtiofsd: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn start_configured(&self, id: &str, config: &VmConfig) -> io::Result<String> {
         let lease = self
             .lease(id, Operation::Start)
             .await?
@@ -223,9 +267,14 @@ impl PodVmStore {
                 io::Error::other("VM attempt has exited or is incomplete; remove before retrying")
             });
         }
-        let vmm = vmm.canonicalize()?;
-        let kernel = kernel.canonicalize()?;
-        let initramfs = initramfs.canonicalize()?;
+        let vmm = config.vmm.canonicalize()?;
+        let kernel = config.kernel.canonicalize()?;
+        let initramfs = config.initramfs.canonicalize()?;
+        let virtiofsd = config
+            .virtiofsd
+            .as_ref()
+            .map(fs::canonicalize)
+            .transpose()?;
         let mut owner = Owner {
             id: id.into(),
             nonce: Uuid::new_v4().to_string(),
@@ -235,9 +284,12 @@ impl PodVmStore {
             invocation: None,
             boot: None,
             removing: false,
+            share: virtiofsd.as_ref().map(|_| Share::default()),
         };
         // Confirm the system manager can be reached before recording intent.
-        if lease.unit(&owner).await?.is_some() {
+        if lease.unit(&owner, Service::Vmm).await?.is_some()
+            || (owner.share.is_some() && lease.unit(&owner, Service::Virtiofsd).await?.is_some())
+        {
             return Err(invalid("VM unit already exists before launch"));
         }
         lease.save(&owner)?;
@@ -254,7 +306,10 @@ impl PodVmStore {
                 }
             }
         });
-        let result = match lease.launch(&mut owner, &vmm, &kernel, &initramfs).await {
+        let result = match lease
+            .launch(&mut owner, &vmm, &kernel, &initramfs, virtiofsd.as_deref())
+            .await
+        {
             Err(cause) => match lease.remove(&mut owner).await {
                 Ok(()) => Err(cause),
                 Err(cleanup) => Err(io::Error::new(
@@ -433,7 +488,7 @@ impl Lease {
         ))
     }
 
-    async fn unit(&self, owner: &Owner) -> io::Result<Option<Unit>> {
+    async fn unit(&self, owner: &Owner, service: Service) -> io::Result<Option<Unit>> {
         let mut cmd = Command::new("systemctl");
         cmd.args([
             "--system",
@@ -443,13 +498,18 @@ impl Lease {
             "--all",
             "-p",
             "LoadState,ActiveState,Transient,Description,WorkingDirectory,InvocationID,MainPID",
-            &owner.unit(),
+            &owner.unit(service),
         ]);
         let output = Self::command(cmd).await?;
-        self.parse_unit(owner, &output)
+        self.parse_unit(owner, service, &output)
     }
 
-    fn parse_unit(&self, owner: &Owner, output: &Output) -> io::Result<Option<Unit>> {
+    fn parse_unit(
+        &self,
+        owner: &Owner,
+        service: Service,
+        output: &Output,
+    ) -> io::Result<Option<Unit>> {
         let fields = String::from_utf8_lossy(&output.stdout);
         let prop = |key: &str| {
             fields
@@ -467,17 +527,18 @@ impl Lease {
         }
         if prop("LoadState") != Some("loaded")
             || prop("Transient") != Some("yes")
-            || prop("Description") != Some(owner.description().as_str())
+            || prop("Description") != Some(owner.description(service).as_str())
             || prop("WorkingDirectory").map(Path::new) != Some(self.directory.as_path())
         {
             return Err(invalid("systemd unit identity does not match VM owner"));
         }
         let invocation = prop("InvocationID").unwrap_or_default();
         if Uuid::parse_str(invocation).is_err()
-            || owner
-                .invocation
-                .as_deref()
-                .is_some_and(|expected| expected != invocation)
+            || match service {
+                Service::Vmm => owner.invocation.as_deref(),
+                Service::Virtiofsd => owner.share.as_ref().and_then(|s| s.invocation.as_deref()),
+            }
+            .is_some_and(|expected| expected != invocation)
         {
             return Err(invalid(
                 "systemd invocation identity does not match VM owner",
@@ -494,12 +555,39 @@ impl Lease {
         }))
     }
 
+    fn service_command(&self, owner: &Owner, service: Service) -> Command {
+        let mut cmd = Command::new("systemd-run");
+        cmd.args([
+            "--system",
+            "--quiet",
+            "--no-ask-password",
+            "--collect",
+            "--service-type=exec",
+            "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=2s",
+            "--property=UMask=0077",
+            "--unit",
+            &owner.unit(service),
+            "--description",
+            &owner.description(service),
+            "--working-directory",
+        ])
+        .arg(&self.directory)
+        .arg("--property")
+        .arg(format!(
+            "ConditionPathExists={}",
+            self.launch_token(owner).display()
+        ));
+        cmd
+    }
+
     async fn launch(
         &self,
         owner: &mut Owner,
         vmm: &Path,
         kernel: &Path,
         initramfs: &Path,
+        virtiofsd: Option<&Path>,
     ) -> io::Result<String> {
         // Journal the directory inode before publishing it at the canonical path.
         let staging = self.root.join(format!(".{}.work", owner.nonce));
@@ -518,56 +606,48 @@ impl Lease {
         let token = self.launch_token(owner);
         File::create_new(&token)?.sync_all()?;
         File::open(&self.directory)?.sync_all()?;
-        let mut cmd = Command::new("systemd-run");
-        cmd.args([
-            "--system",
-            "--quiet",
-            "--no-ask-password",
-            "--collect",
-            "--service-type=exec",
-            "--property=KillMode=control-group",
-            "--property=TimeoutStopSec=2s",
-            "--property=UMask=0077",
-            "--unit",
-            &owner.unit(),
-            "--description",
-            &owner.description(),
-            "--working-directory",
-        ])
-        .arg(&self.directory)
-        .arg("--property")
-        .arg(format!("ConditionPathExists={}", token.display()))
-        .arg("--")
-        .arg(vmm)
-        .arg("--kernel")
-        .arg(kernel)
-        .arg("--initramfs")
-        .arg(initramfs)
-        .args([
-            "--cpus",
-            "boot=1",
-            "--memory",
-            "size=384M",
-            "--console",
-            "off",
-            "--serial",
-            "off",
-            "--api-socket",
-            "api.sock",
-            "--vsock",
-            "cid=3,socket=vsock.sock",
-            "--cmdline",
-        ])
-        .arg(format!(
-            "rdinit=/init panic=1 nautilus.sandbox_id={} nautilus.nonce={}",
-            owner.id, owner.nonce
-        ));
+        if let Some(executable) = virtiofsd {
+            self.start_share(owner, executable).await?;
+        }
+        let mut cmd = self.service_command(owner, Service::Vmm);
+        cmd.arg("--")
+            .arg(vmm)
+            .arg("--kernel")
+            .arg(kernel)
+            .arg("--initramfs")
+            .arg(initramfs)
+            .args([
+                "--cpus",
+                "boot=1",
+                "--memory",
+                if virtiofsd.is_some() {
+                    "size=384M,shared=on"
+                } else {
+                    "size=384M"
+                },
+                "--console",
+                "off",
+                "--serial",
+                "off",
+                "--api-socket",
+                "api.sock",
+                "--vsock",
+                "cid=3,socket=vsock.sock",
+                "--cmdline",
+            ])
+            .arg(format!(
+                "rdinit=/init panic=1 nautilus.sandbox_id={} nautilus.nonce={}",
+                owner.id, owner.nonce
+            ));
+        if virtiofsd.is_some() {
+            cmd.args(["--fs", "tag=podfs,socket=fs.sock"]);
+        }
         let output = self.submit(cmd).await?;
         if !output.status.success() {
             return Err(Self::command_error("start transient VM service", &output));
         }
         let unit = self
-            .unit(owner)
+            .unit(owner, Service::Vmm)
             .await?
             .ok_or_else(|| io::Error::other("VMM exited during start"))?;
         owner.invocation = Some(unit.invocation);
@@ -616,7 +696,17 @@ impl Lease {
     }
 
     async fn online(&self, owner: &Owner) -> io::Result<Option<OnlineGuest>> {
-        let Some(unit) = self.unit(owner).await? else {
+        if let Some(share) = &owner.share {
+            let Some(unit) = self.unit(owner, Service::Virtiofsd).await? else {
+                return Ok(None);
+            };
+            if unit.state != "active" {
+                return Ok(None);
+            }
+            self.check_share_endpoints(share)?;
+            self.bundles(owner)?;
+        }
+        let Some(unit) = self.unit(owner, Service::Vmm).await? else {
             return Ok(None);
         };
         match unit.state.as_str() {
@@ -654,7 +744,7 @@ impl Lease {
             return Err(invalid("guest boot identity changed"));
         }
         let confirmed = self
-            .unit(owner)
+            .unit(owner, Service::Vmm)
             .await?
             .ok_or_else(|| io::Error::other("VMM exited during guest identification"))?;
         if confirmed.state != "active"
@@ -693,22 +783,68 @@ impl Lease {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        if self.unit(owner).await?.is_some() {
+        self.stop_service(owner, Service::Vmm).await?;
+        if owner.share.is_some() {
+            self.stop_service(owner, Service::Virtiofsd).await?;
+        }
+        self.cleanup_files(owner).await
+    }
+
+    async fn stop_service(&self, owner: &Owner, service: Service) -> io::Result<()> {
+        if self.unit(owner, service).await?.is_some() {
             let mut cmd = Command::new("systemctl");
             cmd.args([
                 "--system",
                 "--no-pager",
                 "--no-ask-password",
                 "stop",
-                &owner.unit(),
+                &owner.unit(service),
             ]);
             let output = self.submit(cmd).await?;
-            let remaining = self.unit(owner).await?;
+            let remaining = self.unit(owner, service).await?;
             if remaining.as_ref().is_some_and(|u| u.state != "inactive") {
                 return Err(Self::command_error("VM service stop unconfirmed", &output));
             }
         }
-        self.cleanup_files(owner).await
+        Ok(())
+    }
+
+    async fn unlink_socket(
+        socket: &Path,
+        name: &str,
+        expected: Option<FileIdentity>,
+    ) -> io::Result<()> {
+        let meta = match fs::symlink_metadata(socket) {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+        if !meta.file_type().is_socket()
+            || expected.is_some_and(|saved| saved != FileIdentity::from_meta(&meta))
+        {
+            return Err(invalid(format!(
+                "refusing to unlink a replaced VM endpoint: {name}"
+            )));
+        }
+        // The service may have died before its endpoints were recorded.
+        // A listening socket after its unit is gone belongs to someone else.
+        match timeout(UNIT_BUDGET, UnixStream::connect(socket)).await {
+            Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => fs::remove_file(socket)?,
+            Ok(Err(e)) if e.kind() == ErrorKind::NotFound => {}
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(_)) => {
+                return Err(io::Error::new(
+                    ErrorKind::WouldBlock,
+                    format!("VM endpoint is still listening: {name}"),
+                ))
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!("timed out checking VM endpoint: {name}"),
+                ))
+            }
+        }
+        Ok(())
     }
 
     async fn cleanup_files(&self, owner: &Owner) -> io::Result<()> {
@@ -718,39 +854,10 @@ impl Lease {
             Ok((_dir, socket_dir)) => {
                 for (index, name) in SOCKETS.iter().enumerate() {
                     let socket = socket_dir.join(name);
-                    let meta = match fs::symlink_metadata(&socket) {
-                        Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                        result => result?,
-                    };
-                    if !meta.file_type().is_socket()
-                        || owner.sockets[index]
-                            .is_some_and(|saved| saved != FileIdentity::from_meta(&meta))
-                    {
-                        return Err(invalid(format!(
-                            "refusing to unlink a replaced VM endpoint: {name}"
-                        )));
-                    }
-                    // The service may have died before its endpoints were recorded.
-                    // A listening socket after its unit is gone belongs to someone else.
-                    match timeout(UNIT_BUDGET, UnixStream::connect(&socket)).await {
-                        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
-                            fs::remove_file(&socket)?
-                        }
-                        Ok(Err(e)) if e.kind() == ErrorKind::NotFound => {}
-                        Ok(Err(e)) => return Err(e),
-                        Ok(Ok(_)) => {
-                            return Err(io::Error::new(
-                                ErrorKind::WouldBlock,
-                                format!("VM endpoint is still listening: {name}"),
-                            ))
-                        }
-                        Err(_) => {
-                            return Err(io::Error::new(
-                                ErrorKind::TimedOut,
-                                format!("timed out checking VM endpoint: {name}"),
-                            ))
-                        }
-                    }
+                    Self::unlink_socket(&socket, name, owner.sockets[index]).await?;
+                }
+                if let Some(share) = &owner.share {
+                    self.cleanup_share(&socket_dir, share).await?;
                 }
                 fs::remove_dir(&self.directory)?;
             }
@@ -798,6 +905,7 @@ mod tests {
             invocation: Some(Uuid::new_v4().simple().to_string()),
             boot: None,
             removing: false,
+            share: None,
         };
         lease.save(&owner).unwrap();
         (work, store, lease, owner)
@@ -945,9 +1053,10 @@ mod tests {
     async fn unit_replacement_is_rejected_even_when_pid_is_reused() {
         let (_work, _store, lease, owner) = fixture().await;
         let parse = |invocation: &str, directory: &Path| {
-            let fields = format!("LoadState=loaded\nActiveState=active\nMainPID=217\nTransient=yes\nDescription={}\nWorkingDirectory={}\nInvocationID={invocation}\n", owner.description(), directory.display());
+            let fields = format!("LoadState=loaded\nActiveState=active\nMainPID=217\nTransient=yes\nDescription={}\nWorkingDirectory={}\nInvocationID={invocation}\n", owner.description(Service::Vmm), directory.display());
             lease.parse_unit(
                 &owner,
+                Service::Vmm,
                 &Output {
                     status: std::process::ExitStatus::from_raw(0),
                     stdout: fields.into_bytes(),

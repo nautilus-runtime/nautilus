@@ -351,7 +351,7 @@ pub(crate) fn with_view<T: Send>(
 }
 
 // Refuse recursive deletion if an unexpected host mount is inside the bundle.
-fn check_unmounted(bundle: &Path) -> Result<()> {
+pub(crate) fn check_unmounted(bundle: &Path) -> Result<()> {
     let base = bundle
         .to_string_lossy()
         .replace('\\', "\\134")

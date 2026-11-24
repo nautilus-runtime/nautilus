@@ -28,6 +28,7 @@ wasm_enabled = true                         # 注册 wasmtime WASM 后端
 # vmm = "/opt/cloud-hypervisor/bin/cloud-hypervisor"
 # kernel = "/opt/nautilus/guest/vmlinuz"
 # initramfs = "/opt/nautilus/guest/agent.cpio.gz"
+# virtiofsd = "/usr/libexec/virtiofsd"
 
 [storage]
 registry_mirror = ""
