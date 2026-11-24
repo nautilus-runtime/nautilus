@@ -12,10 +12,83 @@ use std::os::fd::AsFd;
 pub(super) struct Binding {
     container: String,
     id: String,
-    is_dir: bool,
     mount: u64,
     source: FileIdentity,
-    placeholder: Option<FileIdentity>,
+    placeholder: FileIdentity,
+}
+
+pub(super) const STAGE: &str = ".volume-stage";
+
+fn remove_slot(dir: &File, name: &str, expected: Option<FileIdentity>) -> io::Result<()> {
+    let slot = match open_slot(dir, name) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    let meta = slot.metadata()?;
+    if mount_id(dir)? != mount_id(&slot)?
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || expected.is_some_and(|id| id != FileIdentity::from_meta(&meta))
+        || (!meta.is_dir() && (!meta.is_file() || meta.nlink() != 1 || meta.len() != 0))
+    {
+        return Err(invalid("refusing to remove a replaced volume placeholder"));
+    }
+    let path = pinned(dir).join(name);
+    if meta.is_dir() {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+// Only runtime-created empty placeholders live here. The guest cannot access
+// this directory. An interrupted allocation can leave an unpublished placeholder
+// before its receipt exists. Such a file may be reclaimed without consulting or
+// touching the same name in the public catalog.
+fn reap_stage(stage: &File, keep: &[Binding]) -> io::Result<()> {
+    for entry in fs::read_dir(pinned(stage))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .filter(|s| canonical_uuid(s))
+            .ok_or_else(|| invalid("unexpected entry in private volume staging"))?;
+        if !keep.iter().any(|b| b.id == name) {
+            remove_slot(stage, name, None)?;
+        }
+    }
+    stage.sync_all()
+}
+
+pub(super) fn cleanup_stage(control: &Path, expected: Option<FileIdentity>) -> io::Result<()> {
+    let path = control.join(STAGE);
+    if expected.is_some() {
+        match pin_directory(&path, expected) {
+            Ok(stage) => reap_stage(&stage, &[])?,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    match fs::remove_dir(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+impl Binding {
+    fn unpublished(&self, stage: &File) -> io::Result<bool> {
+        match open_slot(stage, &self.id) {
+            Ok(file)
+                if FileIdentity::from_meta(&file.metadata()?) == self.placeholder
+                    && mount_id(&file)? == mount_id(stage)? =>
+            {
+                Ok(true)
+            }
+            Ok(_) => Err(invalid("private volume placeholder changed")),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 fn mount_id(file: &File) -> io::Result<u64> {
@@ -212,8 +285,13 @@ impl Lease {
         let Some(share) = &owner.share else {
             return Ok(());
         };
-        if !share.bindings.iter().any(|b| b.container == container) {
+        if share.volume_stage.is_none() {
             return Ok(());
+        } // Older Pods.
+        let (_directory, control) = self.open_socket_directory(owner)?;
+        let stage = pin_directory(&control.join(STAGE), share.volume_stage)?;
+        if !share.bindings.iter().any(|b| b.container == container) {
+            return reap_stage(&stage, &share.bindings);
         }
         let worker = self.volume_worker(owner).await?;
         let host = self.host_catalog(owner)?;
@@ -221,28 +299,16 @@ impl Lease {
             if !canonical_uuid(&b.id) {
                 return Err(invalid("invalid volume receipt"));
             }
+            if b.unpublished(&stage)? {
+                // RENAME_NOREPLACE has never succeeded. The public name may
+                // already belong to someone else. Keep the staging witness
+                // until the receipt removal is durable.
+                continue;
+            }
             if let Some(w) = &worker {
                 w.detach(b)?;
             }
-            let slot = match open_slot(&host, &b.id) {
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                other => other?,
-            };
-            let meta = slot.metadata()?;
-            if mount_id(&host)? != mount_id(&slot)?
-                || b.placeholder
-                    .is_some_and(|v| v != FileIdentity::from_meta(&meta))
-                || (b.is_dir && !meta.is_dir())
-                || (!b.is_dir && (!meta.is_file() || meta.nlink() != 1 || meta.len() != 0))
-            {
-                return Err(invalid("refusing to remove a replaced volume placeholder"));
-            }
-            let path = pinned(&host).join(&b.id);
-            if b.is_dir {
-                fs::remove_dir(path)?;
-            } else {
-                fs::remove_file(path)?;
-            }
+            remove_slot(&host, &b.id, Some(b.placeholder))?;
         }
         host.sync_all()?;
         owner
@@ -251,7 +317,8 @@ impl Lease {
             .unwrap()
             .bindings
             .retain(|b| b.container != container);
-        self.save(owner)
+        self.save(owner)?;
+        reap_stage(&stage, &owner.share.as_ref().unwrap().bindings)
     }
 }
 
@@ -291,38 +358,40 @@ impl PodVmStore {
         }
         let tree = detached(&source, readonly, meta.is_dir())?;
         let id = Uuid::new_v4().to_string();
-        let binding = Binding {
-            container: container.into(),
-            id: id.clone(),
-            is_dir: meta.is_dir(),
-            source: FileIdentity::from_meta(&meta),
-            mount: mount_id(&tree)?,
-            placeholder: None,
-        };
-        owner.share.as_mut().unwrap().bindings.push(binding);
-        lease.save(&owner)?;
-        let slot = pinned(&host).join(&id);
+        let (_directory, control) = lease.open_socket_directory(&owner)?;
+        let share = owner.share.as_mut().unwrap();
+        let stage = pin_directory(&control.join(STAGE), share.volume_stage)?;
+        reap_stage(&stage, &share.bindings)?;
+        let staged = pinned(&stage).join(&id);
         if meta.is_dir() {
-            DirBuilder::new().mode(0o700).create(&slot)?;
+            DirBuilder::new().mode(0o700).create(&staged)?;
         } else {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&slot)?
+                .open(&staged)?
                 .sync_all()?;
         }
-        host.sync_all()?;
-        let placeholder = FileIdentity::from_meta(&fs::symlink_metadata(&slot)?);
-        owner
-            .share
-            .as_mut()
-            .unwrap()
-            .bindings
-            .last_mut()
-            .unwrap()
-            .placeholder = Some(placeholder);
+        stage.sync_all()?;
+        let placeholder = FileIdentity::from_meta(&fs::symlink_metadata(&staged)?);
+        share.bindings.push(Binding {
+            container: container.into(),
+            id: id.clone(),
+            source: FileIdentity::from_meta(&meta),
+            mount: mount_id(&tree)?,
+            placeholder,
+        });
         lease.save(&owner)?;
+        nix::fcntl::renameat2(
+            Some(stage.as_raw_fd()),
+            Path::new(&id),
+            Some(host.as_raw_fd()),
+            Path::new(&id),
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        )?;
+        host.sync_all()?;
+        stage.sync_all()?;
         let target = open_slot(&worker.catalog, &id)?;
         if FileIdentity::from_meta(&target.metadata()?) != placeholder
             || mount_id(&target)? != mount_id(&worker.catalog)?

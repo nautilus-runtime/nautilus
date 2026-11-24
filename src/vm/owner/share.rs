@@ -53,10 +53,13 @@ impl Lease {
         let containers = export.join("containers");
         DirBuilder::new().mode(0o700).create(&export)?;
         DirBuilder::new().mode(0o700).create(&containers)?;
+        let stage = self.directory.join(volume::STAGE);
+        DirBuilder::new().mode(0o700).create(&stage)?;
         let volumes = export.join("volumes");
         DirBuilder::new().mode(0o700).create(&volumes)?;
         let share = owner.share.as_mut().expect("share requested");
         share.volumes = Some(FileIdentity::check(&volumes)?);
+        share.volume_stage = Some(FileIdentity::check(&stage)?);
         share.export = Some(FileIdentity::check(&export)?);
         share.containers = Some(FileIdentity::check(&containers)?);
         File::open(&export)?.sync_all()?;
@@ -132,6 +135,10 @@ impl Lease {
         }
         let export = dir.join(EXPORT);
         let retired = dir.join(".retired-podfs");
+        if share.volume_stage.is_some() || share.export.is_none() {
+            volume::cleanup_stage(dir, share.volume_stage)?;
+        }
+
         match fs::symlink_metadata(&export) {
             Ok(meta) if meta.is_dir() && Some(FileIdentity::from_meta(&meta)) == share.export => {
                 let pinned_export = pin_directory(&export, share.export)?;

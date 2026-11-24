@@ -70,6 +70,7 @@ struct Share {
     export: Option<FileIdentity>,
     containers: Option<FileIdentity>,
     volumes: Option<FileIdentity>,
+    volume_stage: Option<FileIdentity>,
     volume_catalog_mount: Option<u64>,
     bindings: Vec<volume::Binding>,
     invocation: Option<String>,

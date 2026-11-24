@@ -319,6 +319,39 @@ async fn exec(cli: &mut Runtime, id: &str, program: &str) -> Result<Vec<u8>> {
     Ok(r.stdout)
 }
 
+// Simulate daemon death directly after its placeholder receipt became durable
+// but before renameat2. A public file of exactly the expected type and size is
+// still someone else's. Cleanup must release only the private staged inode.
+fn interrupted_volume(root: &Path, pod: &str, container: &str) -> Result<(PathBuf, PathBuf, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let store = root.join("state/vms");
+    let slot = Uuid::new_v4().to_string();
+    let stage = store.join(pod).join(".volume-stage").join(&slot);
+    let public = store.join(pod).join("podfs/volumes").join(&slot);
+    use std::os::unix::fs::OpenOptionsExt;
+    let create_empty = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    create_empty(&stage)?.sync_all()?;
+    let foreign = create_empty(&public)?;
+    let metadata = fs::metadata(&stage)?;
+    let identity = json!({"device":metadata.dev(), "inode":metadata.ino()});
+    let record = store.join(format!("{pod}.json"));
+    let mut owner: serde_json::Value = serde_json::from_slice(&fs::read(&record)?)?;
+    owner["share"]["bindings"]
+        .as_array_mut()
+        .context("volume receipts")?
+        .push(json!({
+            "id":slot, "container":container, "mount":0, "source":identity, "placeholder":identity
+        }));
+    fs::write(record, serde_json::to_vec(&owner)?)?;
+    Ok((stage, public, foreign.metadata()?.ino()))
+}
+
 // These host mounts are confined to the disposable fixture. Drop them before
 // TempDir cleanup, including on failure.
 struct FixtureMount(PathBuf);
@@ -644,6 +677,7 @@ async fn scenario(
     exec(cli, &b, "test ! -e count").await?;
 
     daemon_process.kill().await?;
+    let (staging, foreign, foreign_ino) = interrupted_volume(root, &id, &a)?;
     let (new_daemon, new_client) = daemon(root).await?;
     *daemon_process = new_daemon;
     *cli = new_client;
@@ -732,6 +766,9 @@ async fn scenario(
             .await?;
         }
         if c == &a {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(!staging.exists() && fs::metadata(&foreign)?.ino() == foreign_ino);
+            fs::remove_file(&foreign)?;
             ensure!(export.read_dir()?.count() == 1 && fs::read(&hosts)? == b"updated hosts");
             ensure!(exec(cli, &b, "/bin/busybox cat /shared-hosts").await? == b"updated hosts");
             exec(cli, &b, "test ! -e count").await?;
