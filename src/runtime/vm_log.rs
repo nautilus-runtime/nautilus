@@ -1,12 +1,12 @@
 //! Copy CRI records from the authenticated guest log into kubelet's host file.
 
 use serde::{Deserialize, Serialize};
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const CHUNK: i64 = 64 * 1024;
@@ -117,7 +117,10 @@ impl Target {
     }
 
     fn open(&self, parent: &File, create_new: bool) -> io::Result<File> {
-        let path = at(parent).join(self.path.file_name().unwrap());
+        Self::open_private(&at(parent).join(self.path.file_name().unwrap()), create_new)
+    }
+
+    fn open_private(path: &Path, create_new: bool) -> io::Result<File> {
         let f = if create_new {
             OpenOptions::new()
                 .read(true)
@@ -154,6 +157,21 @@ impl Target {
         Ok(())
     }
 
+    fn rotated(dir: &File, saved: Identity) -> io::Result<Option<File>> {
+        for entry in fs::read_dir(at(dir))? {
+            let entry = entry?;
+            if entry.ino() == saved.ino {
+                match Self::open_private(&entry.path(), false) {
+                    Ok(f) if Identity::of(&f)? == saved => return Ok(Some(f)),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn prepare(&self) -> io::Result<Cursor> {
         let dir = self.parent(true)?;
         let file = self.open(&dir, true)?;
@@ -166,6 +184,37 @@ impl Target {
         })
     }
 
+    /// Release an empty file claimed by an unsuccessful CreateContainer. A
+    /// successful container's log belongs to kubelet after container removal.
+    pub fn discard_unstarted(&self, cursor: &Cursor) -> io::Result<()> {
+        if cursor.offset != 0 || cursor.base != 0 || !cursor.tail.is_empty() {
+            return Err(invalid("refusing to discard a VM log with committed data"));
+        }
+        let dir = match self.parent(false) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+        if Identity::of(&dir)? != cursor.parent {
+            return Err(invalid("VM log parent identity changed"));
+        }
+        let file = match self.open(&dir, false) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+        let path = at(&dir).join(self.path.file_name().unwrap());
+        let meta = fs::symlink_metadata(&path)?;
+        if Identity::of(&file)? != cursor.file
+            || !meta.is_file()
+            || meta.nlink() != 1
+            || (meta.dev(), meta.ino()) != (cursor.file.dev, cursor.file.ino)
+            || meta.len() != 0
+        {
+            return Err(invalid("refusing to discard changed VM log"));
+        }
+        fs::remove_file(path)?;
+        dir.sync_all()
+    }
+
     /// Kubelet explicitly requested rotation. Bind a fresh empty host file at
     /// the last committed guest offset. Persist this result before copying.
     pub fn reopen(&self, cursor: &Cursor) -> io::Result<Cursor> {
@@ -173,18 +222,26 @@ impl Target {
         if Identity::of(&dir)? != cursor.parent {
             return Err(invalid("VM log parent identity changed"));
         }
-        let file = match self.open(&dir, false) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => self.open(&dir, true)?,
-            result => result?,
+        let current = match self.open(&dir, false) {
+            Ok(f) if Identity::of(&f)? == cursor.file => {
+                cursor.verify(&f)?;
+                return Ok(cursor.clone());
+            }
+            Ok(f) if f.metadata()?.len() == 0 => Some(f),
+            Ok(_) => return Err(invalid("replacement VM log already contains data")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(previous) = Self::rotated(&dir, cursor.file)? {
+            if previous.metadata()?.len() != cursor.verify(&previous)? {
+                return Err(invalid("replay the uncommitted guest log before rotating"));
+            }
+        }
+        let file = match current {
+            Some(file) => file,
+            None => self.open(&dir, true)?,
         };
         let identity = Identity::of(&file)?;
-        if identity == cursor.file {
-            cursor.verify(&file)?;
-            return Ok(cursor.clone());
-        }
-        if file.metadata()?.len() != 0 {
-            return Err(invalid("replacement VM log already contains data"));
-        }
         file.sync_all()?;
         dir.sync_all()?;
         Ok(Cursor {
@@ -207,10 +264,16 @@ impl Target {
         F: Future<Output = crate::core::Result<(Vec<u8>, i64)>>,
     {
         let dir = self.parent(false)?;
-        let file = self.open(&dir, false)?;
-        if Identity::of(&dir)? != cursor.parent || Identity::of(&file)? != cursor.file {
-            return Err(invalid("VM log target changed; reopen required").into());
+        if Identity::of(&dir)? != cursor.parent {
+            return Err(invalid("VM log parent identity changed").into());
         }
+        let file = match self.open(&dir, false) {
+            Ok(f) if Identity::of(&f)? == cursor.file => Some(f),
+            Ok(_) => Self::rotated(&dir, cursor.file)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::rotated(&dir, cursor.file)?,
+            Err(e) => return Err(e.into()),
+        }
+        .ok_or_else(|| invalid("VM log target changed; reopen required"))?;
         let position = cursor.verify(&file)?;
         let (bytes, next) = read(cursor.offset, CHUNK).await?;
         if bytes.len() > CHUNK as usize
@@ -348,5 +411,48 @@ mod tests {
         assert!(t.sync_chunk(&initial, read).await.is_err());
         std::fs::hard_link(t.path(), work.path().join("extra-link")).unwrap();
         assert!(t.reopen(&initial).is_err());
+    }
+    #[tokio::test]
+    async fn rotation_after_an_uncommitted_write_requires_replaying_the_old_inode() {
+        let work = tempfile::tempdir().unwrap();
+        let target = target(work.path());
+        let initial = target.prepare().unwrap();
+        let read = |offset, _| async move {
+            assert_eq!(offset, 0);
+            Ok((b"line\n".to_vec(), 5))
+        };
+        target.sync_chunk(&initial, read).await.unwrap(); // crash before cursor persistence.
+        let rotated = target.path().with_extension("old");
+        std::fs::rename(target.path(), &rotated).unwrap();
+        assert!(target.reopen(&initial).is_err());
+        let (recovered, _) = target.sync_chunk(&initial, read).await.unwrap();
+        let active = target.reopen(&recovered).unwrap();
+        target
+            .sync_chunk(&active, |offset, _| async move {
+                assert_eq!(offset, 5);
+                Ok((Vec::new(), 5))
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(rotated).unwrap(), b"line\n");
+        assert!(std::fs::read(target.path()).unwrap().is_empty());
+    }
+    #[test]
+    fn failed_create_releases_only_the_empty_file_it_claimed() {
+        let work = tempfile::tempdir().unwrap();
+        let t = target(work.path());
+        let claimed = t.prepare().unwrap();
+        let backup = t.path().with_extension("old");
+        std::fs::rename(t.path(), &backup).unwrap();
+        let replacement = t.prepare().unwrap();
+        assert!(t.discard_unstarted(&claimed).is_err());
+        std::fs::write(t.path(), b"uncommitted").unwrap();
+        assert!(t.discard_unstarted(&replacement).is_err());
+        std::fs::remove_file(t.path()).unwrap();
+        std::fs::rename(backup, t.path()).unwrap();
+        t.discard_unstarted(&claimed).unwrap();
+        t.discard_unstarted(&claimed).unwrap();
+        assert!(!t.path().exists());
+        t.prepare().unwrap();
     }
 }
