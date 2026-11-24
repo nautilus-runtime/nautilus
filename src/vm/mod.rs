@@ -154,7 +154,10 @@ async fn wait_for_guest(socket: &Path) -> io::Result<()> {
 
 async fn connect_guest(socket: &Path, port: u32) -> io::Result<BufReader<UnixStream>> {
     let mut stream = BufReader::new(UnixStream::connect(socket).await?);
-    stream.get_mut().write_all(format!("CONNECT {port}\n").as_bytes()).await?;
+    stream
+        .get_mut()
+        .write_all(format!("CONNECT {port}\n").as_bytes())
+        .await?;
     // Cloud Hypervisor replies with its assigned host-side port.
     let mut header = String::new();
     if (&mut stream).take(16).read_line(&mut header).await? == 0 {
