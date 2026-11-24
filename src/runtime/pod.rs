@@ -189,16 +189,23 @@ impl PodManager {
 
         let mut guest_lost = false;
         for container in self.container_manager.list_containers_in_pod(pod_id).await? {
-            if container.status == crate::core::state::ContainerStatus::Running {
-                if let Err(e) = self.container_manager.stop_container(&container.id, grace_period).await {
-                    if pod_state.vm_attempt.is_none() || self.vm_store().workload_channel(pod_id).await.is_ok() {
-                        return Err(e);
-                    }
-                    // The guest agent is unreachable. The owned systemd unit
-                    // remains the authoritative way to stop all its workloads.
-                    guest_lost = true;
-                    break;
+            // Guest Start or exit can precede the host status commit. Give the
+            // live guest a chance to reap every init and drain its final log.
+            let result = match &container.vm {
+                Some(vm) if vm.preparing => self.container_manager.remove_container(&container.id).await,
+                Some(vm) if !vm.logs_complete => self.container_manager.stop_container(&container.id, grace_period).await,
+                None if container.status == crate::core::state::ContainerStatus::Running =>
+                    self.container_manager.stop_container(&container.id, grace_period).await,
+                _ => continue,
+            };
+            if let Err(e) = result {
+                if pod_state.vm_attempt.is_none() || self.vm_store().workload_channel(pod_id).await.is_ok() {
+                    return Err(e);
                 }
+                // The guest agent is unreachable. The owned systemd unit
+                // remains the authoritative way to stop all its workloads.
+                guest_lost = true;
+                break;
             }
         }
         if pod_state.runtime_handler == "vm" {

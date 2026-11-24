@@ -113,7 +113,6 @@ impl PodManager {
         attempt: &VmPodAttempt,
     ) -> Result<()> {
         let _guard = self.operation_guard(&pod.id).await;
-        let net = PodNet::new(self.config.clone());
         if let Some(nic) = &attempt.ready_network {
             match store.recover(&pod.id).await {
                 Ok(Some(_)) => {
@@ -143,16 +142,7 @@ impl PodManager {
         }
         // Clean pending attempts or an exited owned VM. A failure is local
         // to this Pod; retain both journals so kubelet can retry Stop/Remove.
-        let mut pod = pod.clone();
-        self.mark_vm_stopping(&mut pod).await?;
-        let cleanup = async {
-            store.remove(&pod.id).await?;
-            self.container_manager.guest_pod_lost(&pod.id).await?;
-            net.teardown_vm(&pod.id).await?;
-            self.clear_pod_network(&pod.id).await
-        }
-        .await;
-        if let Err(e) = cleanup {
+        if let Err(e) = self.stop_pod_locked(&pod.id, None).await {
             tracing::warn!(pod_id=%pod.id,%e,"VM cleanup retained for retry");
         }
         Ok(())
