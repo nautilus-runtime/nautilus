@@ -23,6 +23,12 @@ systemd_cgroup = true                       # 使用 systemd cgroup 管理
 default_handler = ""                    # 空 runtime_handler 请求使用的默认后端
 wasm_enabled = true                         # 注册 wasmtime WASM 后端
 
+# 实验性 Pod VM 生命周期测试的镜像。常规 CRI 创建 VM 待容器及网络就绪后开放。
+# [runtime.sandboxes.vm]
+# vmm = "/opt/cloud-hypervisor/bin/cloud-hypervisor"
+# kernel = "/opt/nautilus/guest/vmlinuz"
+# initramfs = "/opt/nautilus/guest/agent.cpio.gz"
+
 [storage]
 registry_mirror = ""
 # 存储配置

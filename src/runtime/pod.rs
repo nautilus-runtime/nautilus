@@ -1,12 +1,13 @@
 use crate::core::{Config, Error, Result, StateManager};
 use crate::core::state::{PodState, PodStatus};
 use crate::runtime::ContainerManager;
+use futures::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub struct PodManager {
-    _config: Arc<Config>,
+    config: Arc<Config>,
     state_manager: Arc<StateManager>,
     container_manager: Arc<ContainerManager>,
     pods: Arc<RwLock<HashMap<String, PodState>>>,
@@ -20,7 +21,7 @@ impl PodManager {
         container_manager: Arc<ContainerManager>,
     ) -> Self {
         Self {
-            _config: config,
+            config,
             state_manager,
             container_manager,
             pods: Arc::new(RwLock::new(HashMap::new())),
@@ -107,6 +108,12 @@ impl PodManager {
 
     /// Start a pod (setup network namespace and prepare for containers)
     pub async fn start_pod(&self, pod_id: &str) -> Result<()> {
+        let _guard = self.operation_guard(pod_id).await;
+        self.start_pod_locked(pod_id).await
+    }
+
+    /// The CRI caller keeps the same guard across network allocation and publication.
+    pub(crate) async fn start_pod_locked(&self, pod_id: &str) -> Result<()> {
         let mut pod_state = self.get_pod_state(pod_id).await?
             .ok_or_else(|| Error::Pod(format!("Pod {} not found", pod_id)))?;
 
@@ -115,6 +122,21 @@ impl PodManager {
                 "Pod {} is not in pending state, current status: {:?}",
                 pod_id, pod_state.status
             )));
+        }
+
+        if pod_state.runtime_handler == "vm" {
+            let images = self
+                .config
+                .runtime
+                .sandboxes
+                .vm
+                .as_ref()
+                .ok_or_else(|| Error::Config("Pod VM images are not configured".into()))?;
+            self.vm_store()
+                .start(pod_id, &images.vmm, &images.kernel, &images.initramfs)
+                .await?;
+            // Guest reachability alone does not satisfy RunPodSandbox readiness.
+            return Ok(());
         }
 
         // Network namespace setup lives in the CRI layer: PodNet (podnet.rs)
@@ -135,10 +157,19 @@ impl PodManager {
 
     /// Stop a pod and all its containers
     pub async fn stop_pod(&self, pod_id: &str, grace_period: Option<u64>) -> Result<()> {
+        let _guard = self.operation_guard(pod_id).await;
+        self.stop_pod_locked(pod_id, grace_period).await
+    }
+
+    pub(crate) async fn stop_pod_locked(
+        &self,
+        pod_id: &str,
+        grace_period: Option<u64>,
+    ) -> Result<()> {
         let mut pod_state = self.get_pod_state(pod_id).await?
             .ok_or_else(|| Error::Pod(format!("Pod {} not found", pod_id)))?;
 
-        if pod_state.status != PodStatus::Running {
+        if pod_state.status != PodStatus::Running && pod_state.runtime_handler != "vm" {
             return Err(Error::Pod(format!(
                 "Pod {} is not running, current status: {:?}",
                 pod_id, pod_state.status
@@ -149,6 +180,9 @@ impl PodManager {
             if container.status == crate::core::state::ContainerStatus::Running {
                 self.container_manager.stop_container(&container.id, grace_period).await?;
             }
+        }
+        if pod_state.runtime_handler == "vm" {
+            self.vm_store().remove(pod_id).await?;
         }
         pod_state.status = PodStatus::Succeeded;
 
@@ -165,6 +199,11 @@ impl PodManager {
 
     /// Remove a pod and all its containers
     pub async fn remove_pod(&self, pod_id: &str) -> Result<()> {
+        let _guard = self.operation_guard(pod_id).await;
+        self.remove_pod_locked(pod_id).await
+    }
+
+    pub(crate) async fn remove_pod_locked(&self, pod_id: &str) -> Result<()> {
         let pod_state = self.get_pod_state(pod_id).await?
             .ok_or_else(|| Error::Pod(format!("Pod {} not found", pod_id)))?;
 
@@ -176,6 +215,9 @@ impl PodManager {
 
         for container in self.container_manager.list_containers_in_pod(pod_id).await? {
             self.container_manager.remove_container(&container.id).await?;
+        }
+        if pod_state.runtime_handler == "vm" {
+            self.vm_store().remove(pod_id).await?;
         }
 
         // Remove from state manager
@@ -253,6 +295,44 @@ impl PodManager {
     /// List all pods
     pub async fn list_pods(&self) -> Result<Vec<PodState>> {
         self.state_manager.list_pods().await
+    }
+
+    pub(crate) fn vm_store(&self) -> crate::vm::owner::PodVmStore {
+        crate::vm::owner::PodVmStore::new(self.config.runtime.state_dir.join("vms"))
+    }
+
+    /// Reconcile the recorded VM attempts before accepting CRI requests.
+    pub async fn recover_vm_pods(&self) -> Result<()> {
+        let store = self.vm_store();
+        let pods = self.list_pods().await?;
+        let attempts = pods
+            .into_iter()
+            .filter(|p| p.runtime_handler == "vm" && p.status != PodStatus::Succeeded);
+        // Independent VMs can be queried concurrently. Bound the number of
+        // simultaneous system manager requests during a large node restart.
+        let mut recovery = stream::iter(attempts)
+            .map(|pod| {
+                let store = &store;
+                async move {
+                    let status = match store.recover(&pod.id).await {
+                        Ok(Some(_)) => PodStatus::Pending,
+                        Ok(None) => PodStatus::Failed,
+                        Err(error) => {
+                            tracing::warn!(pod_id=%pod.id, %error, "Cannot verify Pod VM ownership");
+                            PodStatus::Unknown
+                        }
+                    };
+                    if status != pod.status {
+                        self.update_pod_status(&pod.id, status).await?;
+                    }
+                    Ok::<_, Error>(())
+                }
+            })
+            .buffer_unordered(8);
+        while let Some(result) = recovery.next().await {
+            result?;
+        }
+        Ok(())
     }
 
     /// Get pod status

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-fn canonical_uuid(value: &str) -> bool {
+pub(super) fn canonical_uuid(value: &str) -> bool {
     Uuid::try_parse(value).is_ok_and(|id| !id.is_nil() && id.hyphenated().to_string() == value)
 }
 

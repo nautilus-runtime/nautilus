@@ -126,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_arc.clone(),
         state_manager.clone(),
     );
+    runtime_service.recover_vm_pods().await?;
     let image_service = NautilusImageService::new(config_arc.clone(), state_manager.clone());
     
     // Initialize network manager

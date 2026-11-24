@@ -173,6 +173,16 @@ pub struct SandboxesConfig {
     /// Register the in-process wasmtime backend under handlers "wasi"/"wasm".
     #[serde(default = "default_true")]
     pub wasm_enabled: bool,
+    /// Operator-supplied images for the experimental Pod VM lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<VmConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmConfig {
+    pub vmm: PathBuf,
+    pub kernel: PathBuf,
+    pub initramfs: PathBuf,
 }
 
 impl Default for SandboxesConfig {
@@ -180,6 +190,7 @@ impl Default for SandboxesConfig {
         Self {
             default_handler: String::new(),
             wasm_enabled: true,
+            vm: None,
         }
     }
 }
