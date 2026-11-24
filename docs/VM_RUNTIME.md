@@ -1,6 +1,6 @@
 # Pod 级虚机运行时
 
-设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。交互式 Exec、Attach 和 PortForward 连接到目标 guest。kubelet 的 RuntimeClass 发现和宿主卷接入跟踪于 #16。[CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
+设计跟踪于 [#1](https://github.com/nautilus-runtime/nautilus/issues/1)。目标是在 Kubernetes 中为工作负载选择 `RuntimeClass.handler: vm`，让一次 PodSandbox attempt 拥有一台 Linux VM。同一沙箱内的容器在该 guest 中运行，重复 exec 和工具调用沿用原容器的工作区。显式启用实验 VM 的节点支持通过 CRI 创建 Pod、运行 guest OCI 容器、执行 ExecSync 及恢复日志和网络。交互式 Exec、Attach 和 PortForward 连接到目标 guest。启用并通过探测的节点会向 kubelet 发布 `vm` handler，受信任的宿主文件和目录可挂载到对应的 guest 容器。[节点启用与真实 kubelet 验收](VM_RUNTIMECLASS.md) [CRI v1 契约与本地差异](CRI_VM_CONTRACT.md)
 
 ## 所有权与协议
 
@@ -77,7 +77,7 @@ cargo test --locked --test vm_pod_lifecycle_test -- --ignored --nocapture
 
 ### Pod 的初始资源
 
-`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。目前接受 systemd slice 名或对应层级路径，cgroupfs 布局的父路径会在分配前返回错误。kubelet 的 cgroup 驱动发现与节点配置在 #16 验收。资源热更新返回 CRI `Unimplemented`。
+`linux.resources` 中的 CPU quota 和 period 决定 guest 的 vCPU 数量，向上取整。VMM 服务的 `cpu.max` 同时计入 `linux.overhead` 的带宽。CPU shares 映射为 cgroup v2 的 `cpu.weight`。内存限制向下对齐到 2 MiB 作为 guest RAM，VMM 服务的 `memory.max` 为请求字节数加上 Pod 开销。未指定 CPU 和内存限制时，guest 默认使用 1 个 vCPU、384 MiB RAM，服务继承所在 slice 的限制。目前接受 systemd slice 名或对应层级路径，cgroupfs 布局的父路径会在分配前返回错误。`RuntimeConfig` 返回与原生 OCI 后端一致的 cgroup 驱动。VM handler 使用 systemd 驱动运行。资源热更新返回 CRI `Unimplemented`。
 
 使用 `bash guest/pack-initramfs.sh tests/fixtures/vm_resources_init.c /tmp/resources.cpio.gz` 构建资源测试 guest。将 `NAUTILUS_VM_RESOURCE_TEST_INITRAMFS` 指向该镜像后执行 `cargo test --locked --test vm_resources_test -- --ignored`，同时设置 VMM 和内核路径。guest 会核对在线 CPU 和可用物理内存，宿主测试会检查 VMM 配置及所在 cgroup。Linux 5.15.0-191、systemd 249、Cloud Hypervisor v54.1 上，1.5 CPU、448 MiB 内存加 0.1 CPU、64 MiB 开销，实测得到 2 个 vCPU、448 MiB guest RAM、`cpu.max=160000 100000` 和 `memory.max=536870912`。
 

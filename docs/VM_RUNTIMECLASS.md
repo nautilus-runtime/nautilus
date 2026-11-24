@@ -22,7 +22,9 @@ initramfs = "/opt/nautilus/guest/workload.cpio.gz"
 virtiofsd = "/usr/libexec/virtiofsd"
 ```
 
-让 kubelet 的 CRI 端点指向该节点的 nautilusd，例如 `unix:///run/nautilus/nautilus.sock`。按节点现有部署方式重新加载 daemon 配置。启动后，nautilusd 会创建并回收测试 VM，核对 guest 身份、网络和工作负载 agent。成功后，kubelet 会将 `vm` 写入 Node 的 `status.runtimeHandlers`。把下面的 `NODE` 设为实际节点名，确认输出包含独立一行 `vm` 后再标记它可调度 VM。
+如果控制面分配了 Node PodCIDR，将 bridge 的 host-local IPAM `subnet` 或 `ranges` 配置成同一个网段。`UpdateRuntimeConfig` 会核对该范围。节点上已有地址租约时，调整网段需按该节点的 CNI 配置迁移。
+
+让 kubelet 的 CRI 端点指向该节点的 nautilusd，例如 `unix:///run/nautilus/nautilus.sock`。按节点现有部署方式重新加载 daemon 配置。启动后，nautilusd 会创建并回收测试 VM，核对 guest 身份、网络和工作负载 agent。成功后，kubelet 会将 `vm` 写入 Node 的 `status.runtimeHandlers`。探测失败后，daemon 按 5 至 60 秒的退避间隔重试，恢复 CNI 或 guest 资产后会自动重新发布。后续 VM 创建失败会触发同一项固定配置的探测，由探测结果更新整个节点的可用状态。把下面的 `NODE` 设为实际节点名，确认输出包含独立一行 `vm` 后再标记它可调度 VM。
 
 ```sh
 NODE=my-kvm-node
@@ -69,6 +71,16 @@ kubectl delete pod nautilus-vm-smoke --wait
 ```
 
 日志和 exec 返回相同的 boot ID。另一个 VM Pod 有独立的 guest 和 Pod IP。示例删除后，可复用 RuntimeClass 和节点标签。
+
+## 在隔离节点复验
+
+在具有本机 KVM 权限、kubectl 凭据和 Python 3.11+ 的独立测试节点，执行下面的命令。将 `--ipam-dir` 设成 host-local 的 `dataDir` 下以 CNI 网络名命名的子目录。脚本会创建独立的 namespace 和 RuntimeClass，并强制终止指定的 daemon 和其中一台测试 VM，以检验恢复及隔离。示例使用标准服务名和配置路径。[真实 kubelet 验收脚本](../tests/kubelet_vm_acceptance.py)
+
+```sh
+sudo --preserve-env=KUBECONFIG python3 tests/kubelet_vm_acceptance.py \
+  --node "$NODE" --daemon-unit nautilusd.service --config /etc/nautilus/nautilus.toml \
+  --ipam-dir /var/lib/cni/networks/nautilus
+```
 
 ## 已验证的行为与范围
 
