@@ -58,9 +58,7 @@ impl VmBackend {
     fn validate(&self, spec: &WorkloadSpec) -> Result<()> {
         let unsupported = |text: &str| Error::Experimental(format!("Pod VM: {text}"));
         if spec.open_stdin {
-            return Err(unsupported(
-                "interactive stdin is unavailable",
-            ));
+            return Err(unsupported("interactive stdin is unavailable"));
         }
         if self.config.security.seccomp
             || !self.config.security.seccomp_profile_path.is_empty()
@@ -162,11 +160,18 @@ impl VmBackend {
         let mut mounts = Vec::with_capacity(spec.volumes.len());
         for volume in &spec.volumes {
             if !matches!(volume.propagation.as_str(), "" | "rprivate") {
-                return Err(Error::Experimental("VM host volumes require private propagation".into()));
+                return Err(Error::Experimental(
+                    "VM host volumes require private propagation".into(),
+                ));
             }
-            let source = self.store.bind_volume(&self.pod, &spec.id, &volume.host_path, volume.readonly).await?;
-            mounts.push(json!({"type":"bind", "source":source, "destination":volume.container_path,
-                "options":["bind", if volume.readonly {"ro"} else {"rw"}]}));
+            let source = self
+                .store
+                .bind_volume(&self.pod, &spec.id, &volume.host_path, volume.readonly)
+                .await?;
+            mounts.push(
+                json!({"type":"bind", "source":source, "destination":volume.container_path,
+                "options":["bind", if volume.readonly {"ro"} else {"rw"}]}),
+            );
         }
         let spec_json = json!({
             "ociVersion":"1.1.0", "mounts":mounts,

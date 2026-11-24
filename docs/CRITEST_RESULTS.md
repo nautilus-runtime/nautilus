@@ -4,6 +4,12 @@
 - 测试工具为 kubernetes-sigs/cri-tools 的 `critest v1.31.1`。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-24 Pod VM 宿主卷
+
+提交 `66c4bc0` 在 pro6000 的 Linux 6.12.118 嵌套 KVM 节点上通过完整 critest v1.31.1。runtime 和 image endpoint 共用隔离 daemon 的 Unix socket，**96 通过、0 失败、17 跳过**，耗时 229.026 秒。首轮测试中节点的镜像仓库代理失去监听，84 项在镜像拉取时失败，12 项通过、17 项跳过。恢复代理后用同一 daemon 二进制、新状态目录和相同随机种子重跑，结束时通过 CRI 确认 Pod 和容器计数均为零。
+
+同一提交的 Linux Rust 测试为 96 通过、0 失败、8 项默认忽略。通过独立 CRI 验收，在 Cloud Hypervisor v54.1 与 virtiofsd 1.13.2 上验证了同一普通文件以不同读写权限挂入不同容器、宿主与 guest 的双向修改、kubelet 投影目录的原子切换、两个 Pod 的隔离以及 daemon 和文件系统服务异常退出后的回收。持久化占位身份后、发布前的中断用例也验证了同名无关文件的 inode 得以保留。该 KVM 用例耗时 12.81 秒。[挂载模型和限制](VM_RUNTIME.md)
+
 ## 2026-11-24 Pod VM 工作负载和网络
 
 在 pro6000 的 Linux 6.12.118 嵌套 KVM 节点，runtime 和 image endpoint 指向同一个隔离 daemon。对 PR #24 运行未过滤的 critest v1.31.1。提交 `302d543` 得到 96 通过、0 失败、17 跳过，耗时 244.594 秒。提交 `714ae01` 得到 **95 通过、1 失败、17 跳过**，耗时 236.036 秒。失败发生在默认 OCI 后端，HostNetwork=false 的 AfterEach 对已快速退出的容器执行 Stop 时，systemd 已回收其 youki scope。较早提交的完整套件与聚焦运行均复现过。后续提交仅调整静态错误值的写法和格式。[修复跟踪](https://github.com/nautilus-runtime/nautilus/issues/25)

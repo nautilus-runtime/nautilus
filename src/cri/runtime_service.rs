@@ -104,19 +104,36 @@ pub struct NautilusRuntimeService {
 
 fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &'static str)> {
     let unsupported = |msg| (tonic::Code::Unimplemented, msg);
-    if config.windows.is_some() || !config.devices.is_empty() || !config.cdi_devices.is_empty()
-        || config.tty || config.stdin || config.stdin_once || config.stop_signal != 0 {
+    if config.windows.is_some()
+        || !config.devices.is_empty()
+        || !config.cdi_devices.is_empty()
+        || config.tty
+        || config.stdin
+        || config.stdin_once
+        || config.stop_signal != 0
+    {
         return Err(unsupported("VM guest does not support requested devices, terminal, stdin, stop signal or Windows configuration"));
     }
     for mount in &config.mounts {
-        if mount.propagation != MountPropagation::PropagationPrivate as i32 || mount.recursive_read_only
-            || mount.selinux_relabel || !mount.uid_mappings.is_empty() || !mount.gid_mappings.is_empty()
-            || mount.image.is_some() || !mount.image_sub_path.is_empty()
-            || mount.mount_options.iter().any(|opt| !matches!(opt.as_str(), "nosuid" | "nodev" | "noexec")) {
+        if mount.propagation != MountPropagation::PropagationPrivate as i32
+            || mount.recursive_read_only
+            || mount.selinux_relabel
+            || !mount.uid_mappings.is_empty()
+            || !mount.gid_mappings.is_empty()
+            || mount.image.is_some()
+            || !mount.image_sub_path.is_empty()
+            || mount
+                .mount_options
+                .iter()
+                .any(|opt| !matches!(opt.as_str(), "nosuid" | "nodev" | "noexec"))
+        {
             return Err(unsupported("VM host volumes require private propagation, unmapped IDs and ordinary bind options"));
         }
         if !std::path::Path::new(&mount.host_path).is_absolute() {
-            return Err((tonic::Code::InvalidArgument, "VM host volume source must be absolute"));
+            return Err((
+                tonic::Code::InvalidArgument,
+                "VM host volume source must be absolute",
+            ));
         }
     }
     if config.envs.iter().any(|e| std::str::from_utf8(&e.value).is_err() || e.key.is_empty() || e.key.contains('=')) {
