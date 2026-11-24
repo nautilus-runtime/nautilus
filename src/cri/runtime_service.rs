@@ -141,7 +141,7 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &
     }
     if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
         if !(-1000..=1000).contains(&r.oom_score_adj) || r.memory_swap_limit_in_bytes != 0 || r.hugepage_limits.iter().any(|page| page.limit != 0 || !matches!(page.page_size.as_str(), "2MB" | "1GB"))
-            || r.unified.iter().any(|(k,v)| !matches!((k.as_str(),v.as_str()), ("memory.oom.group","1") | ("memory.swap.max","0")))
+            || r.unified.iter().any(|(k,v)| !matches!((k.as_str(),v.as_str()), ("memory.oom.group","1") | ("memory.swap.max" | "memory.low" | "memory.min","0")))
             || !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() {
             return Err(unsupported("VM guest supports container CPU shares, period, quota and memory limit"));
         }

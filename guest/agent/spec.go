@@ -268,7 +268,7 @@ func prepare(id, private string) (process, error) {
 	r := map[string]any{"devices": []map[string]any{{"allow": false, "access": "rwm"}}}
 	if s.Linux.Resources != nil {
 		for key, val := range s.Linux.Resources.Unified {
-			if !(key == "memory.oom.group" && val == "1" || key == "memory.swap.max" && val == "0") {
+			if !(key == "memory.oom.group" && val == "1" || (key == "memory.swap.max" || key == "memory.low" || key == "memory.min") && val == "0") {
 				return s.Process, errors.New("unsupported unified cgroup control")
 			}
 		}
