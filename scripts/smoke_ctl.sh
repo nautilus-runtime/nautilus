@@ -101,7 +101,7 @@ must ct pull docker.io/library/busybox:latest
 expect "images lists busybox" busybox ct images
 
 echo "=== run detached + surface ==="
-ID=$(ct run --name web1 -e GREETING=morning --memory 64m busybox \
+ID=$(ct run -d --name web1 -e GREETING=morning --memory 64m busybox \
         sh -c 'while true; do echo tick $GREETING; sleep 1; done')
 [ -n "$ID" ] || { echo "CTL-HARDFAIL: run returned empty id"; exit 1; }
 sleep 2
@@ -148,12 +148,12 @@ absent "prune removed exited ctr" pr1 ct ps -a
 
 echo "=== error surfaces ==="
 refute "missing object errors cleanly" ct logs no-such-thing
-must ct run --name dup busybox sleep 300
-refute "duplicate name rejected" ct run --name dup busybox true
+must ct run -d --name dup busybox sleep 300
+refute "duplicate name rejected" ct run -d --name dup busybox true
 must ct rm -f dup
 
 echo "=== publish -p ==="
-PUB=$($CTL run --name pub-ng -p 18080:80 docker.io/library/nginx:latest)
+PUB=$($CTL run -d --name pub-ng -p 18080:80 docker.io/library/nginx:latest)
 [ -n "$PUB" ] || { echo "CTL FAILURES: hardfail publish run"; exit 1; }
 sleep 3
 expect "published hostport serves" "Welcome to nginx" \

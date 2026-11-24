@@ -250,6 +250,7 @@ impl ContainerManager {
             resources,
             security,
             env,
+            wasi_args: if matches!(sandbox_kind, "wasi" | "wasm") { args.clone() } else { Vec::new() },
             labels,
             annotations,
             volumes,
@@ -298,7 +299,7 @@ impl ContainerManager {
             id: state.id.clone(),
             image_ref: state.image.clone(),
             cgroup_parent: String::new(),
-            args: Vec::new(), // P0: image defaults; CRI command/args merge lands with oci-distribution
+            args: state.wasi_args.clone(),
             entrypoint: Vec::new(),
             working_dir: String::new(),
             strict_groups: false,

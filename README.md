@@ -46,12 +46,12 @@ sudo nautilus version
 sudo nautilus run --rm busybox:1.36 echo 'Hello from Nautilus'
 ```
 
-Nautilus pulls the image on first use and prints the container ID and its output. With `--rm`, the CLI waits for the command to finish and removes both the container and the sandbox it created. The image stays cached for the next run.
+Nautilus pulls the image on first use and follows the command output. With `--rm`, the CLI waits for the command to finish and removes both the container and the sandbox it created. The image stays cached for the next run.
 
-The CLI starts containers in the background by default. This example starts a container named `demo`, reads its logs and runs a second command inside it.
+The CLI follows workload output and returns the workload exit code by default. Pass `-d` to start in the background and print the container ID.
 
 ```sh
-sudo nautilus run --name demo busybox:1.36 sh -c 'while true; do echo tick; sleep 2; done'
+sudo nautilus run -d --name demo busybox:1.36 sh -c 'while true; do echo tick; sleep 2; done'
 sudo nautilus ps
 sudo nautilus logs --tail 5 demo
 sudo nautilus exec demo uname -m
@@ -67,7 +67,17 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads the module from its local filesystem. WASI stdout and stderr go to the daemon log, which you can read with `sudo journalctl -u nautilusd`.
+The daemon reads the module from its local filesystem. WASI stdout and stderr are captured in the workload log. The WASI backend executes batch commands to completion during start.
+
+### Run a container in a Pod VM
+
+On a node with the VM handler enabled, run a Linux image inside a new VM.
+
+```sh
+sudo nautilus run --rm --runtime vm --memory 512m --cpus 1 busybox:1.36 uname -r
+```
+
+Kubernetes workloads select the same handler using [RuntimeClass](docs/VM_RUNTIMECLASS.md).
 
 ## Use CRI tools
 

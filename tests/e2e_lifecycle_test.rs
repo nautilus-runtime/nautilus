@@ -303,6 +303,7 @@ async fn test_e2e_state_persistence() {
             image: "alpine:latest".to_string(),
             image_id: String::new(),
             env: HashMap::new(),
+            wasi_args: Vec::new(),
             status: nautilus::core::ContainerStatus::Running,
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),

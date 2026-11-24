@@ -378,7 +378,9 @@ impl RuncBackend {
             .append(true)
             .open(log_file)
         {
-            let _ = writeln!(f, "{ts} {stream} F {}", String::from_utf8_lossy(line));
+            // A single append keeps records from the two logger threads together.
+            let record = format!("{ts} {stream} F {}\n", String::from_utf8_lossy(line));
+            let _ = f.write_all(record.as_bytes());
         }
     }
 
