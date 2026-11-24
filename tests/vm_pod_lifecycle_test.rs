@@ -110,6 +110,16 @@ async fn boot_pair(config: Arc<Config>, root: &Path, attempts: &mut Vec<String>)
 
 type Client = RuntimeServiceClient<Channel>;
 
+fn cri_client(root: &Path) -> Client {
+    let path = root.join("cri.sock");
+    let endpoint = Endpoint::from_static("http://nautilus").timeout(Duration::from_secs(30));
+    let channel = endpoint.connect_with_connector_lazy(service_fn(move |_: Uri| {
+        let path = path.clone();
+        async move { UnixStream::connect(path).await.map(TokioIo::new) }
+    }));
+    Client::new(channel)
+}
+
 async fn start_daemon(root: &Path) -> Result<(Child, Client)> {
     let binary = std::env::var_os("NAUTILUS_TEST_DAEMON")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_nautilusd").into());
@@ -123,13 +133,7 @@ async fn start_daemon(root: &Path) -> Result<(Child, Client)> {
         .kill_on_drop(true)
         .spawn()
         .context("launching nautilusd with a private network namespace")?;
-    let path = root.join("cri.sock");
-    let endpoint = Endpoint::from_static("http://nautilus").timeout(Duration::from_secs(30));
-    let channel = endpoint.connect_with_connector_lazy(service_fn(move |_: Uri| {
-        let path = path.clone();
-        async move { UnixStream::connect(path).await.map(TokioIo::new) }
-    }));
-    let mut cri = Client::new(channel);
+    let mut cri = cri_client(root);
     timeout(Duration::from_secs(45), async {
         loop {
             if let Some(exit) = daemon.try_wait()? {
@@ -183,6 +187,14 @@ async fn sandbox_guest(cri: &mut Client, id: &str) -> Result<Option<String>> {
         Some(false) => Ok(None),
         None => anyhow::bail!("missing guest reachability: {details}"),
     }
+}
+
+async fn stop_sandbox(cri: &mut Client, id: &str) -> Result<()> {
+    cri.stop_pod_sandbox(StopPodSandboxRequest {
+        pod_sandbox_id: id.into(),
+    })
+    .await?;
+    Ok(())
 }
 
 async fn remove_sandbox(cri: &mut Client, id: &str) -> Result<()> {
@@ -252,20 +264,15 @@ async fn check_recovery(root: &Path, a: &str, b: &str) -> Result<()> {
         "lost B after daemon restart"
     );
 
-    for _ in 0..2 {
-        cri.stop_pod_sandbox(StopPodSandboxRequest {
-            pod_sandbox_id: a.into(),
-        })
-        .await?;
-    }
+    let mut retry = cri_client(root);
+    tokio::try_join!(stop_sandbox(&mut cri, a), stop_sandbox(&mut retry, a))?;
     expect_vmm_exit(&process_a).await?;
     ensure!(
         sandbox_guest(&mut cri, a).await?.is_none(),
         "A survived StopPodSandbox"
     );
-    for _ in 0..2 {
-        remove_sandbox(&mut cri, a).await?;
-    }
+    tokio::try_join!(remove_sandbox(&mut cri, a), stop_sandbox(&mut retry, a))?;
+    remove_sandbox(&mut cri, a).await?;
     ensure!(
         !vms.join(a).exists() && !vms.join(format!("{a}.json")).exists(),
         "A resources remain"
