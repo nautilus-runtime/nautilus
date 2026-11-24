@@ -346,7 +346,8 @@ async fn scenario(
     let boot_b = boot_id(cli, &other).await?;
     ensure!(boot_a != boot_b);
     let init="echo init-out; echo init-err >&2; while test ! -e finish; do /bin/busybox sleep .1; done; exit 37";
-    let first_work = workload("first", image, init);
+    let mut first_work = workload("first", image, init);
+    first_work.metadata.as_mut().unwrap().attempt = 2;
     let mut unsupported = first_work.clone();
     unsupported
         .linux
@@ -394,6 +395,8 @@ async fn scenario(
     )
     .await
     .context("create second")?;
+    let initial = state(cli, &a).await?;
+    ensure!(initial.image_id == image_id && initial.metadata.as_ref().unwrap().attempt == 2);
     for c in [&a, &b] {
         ensure!(state(cli, c).await?.state() == ContainerState::ContainerCreated);
         cli.start_container(StartContainerRequest {
@@ -467,10 +470,19 @@ async fn scenario(
     let detached = socket.with_file_name("detached-vsock.sock");
     fs::rename(&socket, &detached)?;
     let disconnected = exec(cli, &a, "echo unexpected").await;
+    let observed = state(cli, &a).await;
+    let listing = cli.list_containers(ListContainersRequest::default()).await;
     let other_boot = boot_id(cli, &other).await;
     fs::rename(&detached, &socket)?;
     ensure!(disconnected.is_err(), "exec accepted a disconnected guest");
     ensure!(other_boot? == boot_b);
+    ensure!(observed?.state() == ContainerState::ContainerUnknown);
+    ensure!(listing?
+        .into_inner()
+        .containers
+        .iter()
+        .any(|c| c.id == a && c.state() == ContainerState::ContainerUnknown));
+    ensure!(state(cli, &b).await?.state() == ContainerState::ContainerRunning);
     exec(cli, &b, "test ! -e count").await?;
 
     daemon_process.kill().await?;

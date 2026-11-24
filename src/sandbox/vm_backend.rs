@@ -95,15 +95,7 @@ impl VmBackend {
         }
         Ok(())
     }
-}
-
-#[async_trait]
-impl SandboxBackend for VmBackend {
-    fn kind(&self) -> SandboxKind {
-        SandboxKind::Vm
-    }
-
-    async fn prepare(&self, spec: &WorkloadSpec) -> Result<()> {
+    pub async fn prepare_workload(&self, spec: &WorkloadSpec) -> Result<String> {
         self.validate(spec)?;
         // Staging stays outside the guest export and on its filesystem. The owner
         // publishes the complete tree atomically without replacing another bundle.
@@ -179,7 +171,18 @@ impl SandboxBackend for VmBackend {
             .publish_bundle(&self.pod, &spec.id, &staged)
             .await?;
         self.call(&spec.id, Operation::Create).await?;
-        Ok(())
+        Ok(image.image_id)
+    }
+}
+
+#[async_trait]
+impl SandboxBackend for VmBackend {
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Vm
+    }
+
+    async fn prepare(&self, spec: &WorkloadSpec) -> Result<()> {
+        self.prepare_workload(spec).await.map(drop)
     }
 
     async fn start(&self, spec: &WorkloadSpec) -> Result<StartOutcome> {

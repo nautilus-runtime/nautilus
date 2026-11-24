@@ -30,12 +30,7 @@ impl ContainerManager {
     ) -> Result<String> {
         let guard = self.vm_operations.lock(&state.id).await;
         state.status = ContainerStatus::Unknown;
-        if let Err(e) = self.save_guest(&state).await {
-            self.log_target(&state)
-                .await?
-                .discard_unstarted(&state.vm.as_ref().unwrap().cursor)?;
-            return Err(e);
-        }
+        self.save_guest(&state).await?;
         let manager = self.clone();
         // Finish or roll back the intent even when the gRPC caller disconnects.
         let (reply, result) = tokio::sync::oneshot::channel();
@@ -43,7 +38,12 @@ impl ContainerManager {
             let _guard = guard;
             let backend = VmBackend::new(manager._config.clone(), &state.pod_id);
             let outcome = async {
-                backend.prepare(&spec).await?;
+                // Store the anonymous file identity before making the kubelet's log name visible.
+                let claim = manager.log_target(&state).await?.claim()?;
+                state.vm.as_mut().unwrap().cursor = claim.cursor();
+                manager.save_guest(&state).await?;
+                claim.publish()?;
+                state.vm.as_mut().unwrap().image_id = backend.prepare_workload(&spec).await?;
                 let created = backend.call(&state.id, Operation::Status).await?;
                 observe(&mut state, created)?;
                 state.vm.as_mut().expect("VM creation intent").preparing = false;
@@ -154,17 +154,74 @@ impl ContainerManager {
             ));
         }
         let backend = VmBackend::new(self._config.clone(), &state.pod_id);
-        let reply = backend.call(id, op).await?;
+        let observing = matches!(&op, Operation::Status);
+        let reply = match backend.call(id, op).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                if observing
+                    && !matches!(
+                        state.status,
+                        ContainerStatus::Unknown | ContainerStatus::Stopped
+                    )
+                {
+                    state.status = ContainerStatus::Unknown;
+                    state.finish_reason = "ContainerStatusUnknown".into();
+                    self.save_guest(&state).await?;
+                }
+                return Err(e);
+            }
+        };
         let changed = observe(&mut state, reply)?;
+        if changed {
+            self.save_guest(&state).await?;
+        }
         let exited = state.status == ContainerStatus::Stopped;
-        self.sync_guest(&mut state, &backend, exited, changed).await
+        self.sync_guest(&mut state, &backend, exited, false).await
+    }
+
+    pub(crate) async fn observed_container(&self, id: &str) -> Result<Option<ContainerState>> {
+        match self.get_container_state(id).await? {
+            Some(state)
+                if state
+                    .vm
+                    .as_ref()
+                    .is_some_and(|v| !v.preparing && !v.logs_complete) =>
+            {
+                let _ = self.guest_transition(id, Operation::Status).await;
+                self.state_manager.get_container_state(id).await
+            }
+            stored => Ok(stored),
+        }
+    }
+
+    pub(crate) async fn observed_containers(&self) -> Result<Vec<ContainerState>> {
+        use futures::TryStreamExt;
+        let records = self.state_manager.list_containers().await?;
+        stream::iter(records)
+            .map(|state| async move {
+                if state
+                    .vm
+                    .as_ref()
+                    .is_some_and(|v| !v.preparing && !v.logs_complete)
+                {
+                    self.observed_container(&state.id).await
+                } else {
+                    Ok(Some(state))
+                }
+            })
+            .buffered(8)
+            .try_filter_map(|state| std::future::ready(Ok(state)))
+            .try_collect()
+            .await
     }
 
     async fn rollback_guest(&self, state: &ContainerState) -> Result<()> {
-        let backend = VmBackend::new(self._config.clone(), &state.pod_id);
-        backend.remove(&state.id).await?;
-        let target = self.log_target(state).await?;
-        target.discard_unstarted(&state.vm.as_ref().unwrap().cursor)?;
+        let cursor = &state.vm.as_ref().unwrap().cursor;
+        if cursor.is_bound() {
+            let backend = VmBackend::new(self._config.clone(), &state.pod_id);
+            backend.remove(&state.id).await?;
+            self.log_target(state).await?.discard_if_owned(cursor)?;
+        }
         self.forget_guest(&state.id).await
     }
 
@@ -200,9 +257,7 @@ impl ContainerManager {
             if state.vm.as_ref().is_some_and(|v| v.preparing) {
                 return self.rollback_guest(&state).await;
             }
-            if state.vm.as_ref().is_some_and(|v| !v.preparing)
-                && !state.vm.as_ref().unwrap().logs_complete
-            {
+            if state.vm.as_ref().is_some_and(|v| !v.logs_complete) {
                 let backend = VmBackend::new(self._config.clone(), &state.pod_id);
                 if crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"))
                     .status(&state.pod_id)
@@ -279,6 +334,7 @@ fn observe(state: &mut ContainerState, reply: Reply) -> Result<bool> {
         || state.exit_code != reply.exit_code
         || state.pid.is_some();
     state.status = status;
+    state.finish_reason.clear();
     state.created_at = created;
     state.started_at = started;
     state.finished_at = finished;

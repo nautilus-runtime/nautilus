@@ -296,6 +296,7 @@ async fn test_e2e_state_persistence() {
             id: container_id.clone(),
             name: "persistent-test-container".to_string(),
             pod_id: pod_id.clone(),
+            attempt: 0,
             image: "alpine:latest".to_string(),
             env: HashMap::new(),
             status: nautilus::core::ContainerStatus::Running,

@@ -11,6 +11,8 @@ use uuid::Uuid;
 pub struct ContainerState {
     pub id: String,
     pub pod_id: String,
+    #[serde(default)]
+    pub attempt: u32,
     pub name: String,
     pub image: String,
     pub status: ContainerStatus,
@@ -51,6 +53,8 @@ pub struct ContainerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmContainer {
+    #[serde(default)]
+    pub image_id: String,
     pub preparing: bool,
     #[serde(default)]
     pub logs_complete: bool,

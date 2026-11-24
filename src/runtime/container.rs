@@ -85,6 +85,26 @@ async fn wait_for_workload(pid: i32) -> std::io::Result<i32> {
 
 mod vm;
 
+pub(crate) struct CreateWorkload<'a> {
+    pub pod_id: &'a str,
+    pub name: &'a str,
+    pub image: &'a str,
+    pub sandbox_kind: &'a str,
+    pub command: Vec<String>,
+    pub args: Vec<String>,
+    pub log_path: &'a str,
+    pub volumes: Vec<crate::sandbox::VolumeMount>,
+    pub env: HashMap<String, String>,
+    pub resources: Option<crate::sandbox::ResourceLimits>,
+    pub security: Option<crate::sandbox::ContainerSecurity>,
+    pub labels: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
+    pub stdin: bool,
+    pub working_dir: &'a str,
+    pub strict_groups: bool,
+    pub attempt: u32,
+}
+
 #[derive(Clone)]
 pub struct ContainerManager {
     vm_operations: Arc<crate::runtime::OperationLocks>,
@@ -155,29 +175,13 @@ impl ContainerManager {
         annotations: HashMap<String, String>,
         stdin: bool,
     ) -> Result<String> {
-        self.create_with_process_options(pod_id, name, image, sandbox_kind, command, args,
-            log_path, volumes, env, resources, security, labels, annotations, stdin, "", false).await
+        self.create_with_process_options(CreateWorkload { pod_id, name, image, sandbox_kind, command, args,
+            log_path, volumes, env, resources, security, labels, annotations, stdin, working_dir: "", strict_groups: false, attempt: 0 }).await
     }
 
-    pub(crate) async fn create_with_process_options(
-        &self,
-        pod_id: &str,
-        name: &str,
-        image: &str,
-        sandbox_kind: &str,
-        command: Vec<String>,
-        args: Vec<String>,
-        log_path: &str,
-        volumes: Vec<crate::sandbox::VolumeMount>,
-        env: HashMap<String, String>,
-        resources: Option<crate::sandbox::ResourceLimits>,
-        security: Option<crate::sandbox::ContainerSecurity>,
-        labels: HashMap<String, String>,
-        annotations: HashMap<String, String>,
-        stdin: bool,
-        working_dir: &str,
-        strict_groups: bool,
-    ) -> Result<String> {
+    pub(crate) async fn create_with_process_options(&self, request: CreateWorkload<'_>) -> Result<String> {
+        let CreateWorkload { pod_id, name, image, sandbox_kind, command, args, log_path, volumes, env,
+            resources, security, labels, annotations, stdin, working_dir, strict_groups, attempt } = request;
         let container_id = StateManager::generate_container_id();
         let open_stdin = stdin;
 
@@ -200,7 +204,7 @@ impl ContainerManager {
         let (log_file, log_relpath, log_captured) = if sandbox_kind == "vm" {
             let target = crate::runtime::vm_log::Target::new(std::path::Path::new(&pod_log_dir), std::path::Path::new(log_path),
                 &self._config.storage.container_dir, &container_id)?;
-            vm = Some(crate::core::state::VmContainer { preparing: true, logs_complete: false, relative_log: log_path.into(), cursor: target.prepare()? });
+            vm = Some(crate::core::state::VmContainer { image_id: String::new(), preparing: true, logs_complete: false, relative_log: log_path.into(), cursor: Default::default() });
             (target.path().to_owned(), String::new(), false)
         } else if !pod_log_dir.is_empty() && !log_path.is_empty()
         {
@@ -229,6 +233,7 @@ impl ContainerManager {
         let container_state = ContainerState {
             id: container_id.clone(),
             pod_id: pod_id.to_string(),
+            attempt,
             name: name.to_string(),
             image: image.to_string(),
             status: ContainerStatus::Created,

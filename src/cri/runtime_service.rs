@@ -52,26 +52,26 @@ fn matches_sandbox_state(filter: Option<&PodSandboxStateValue>, status: &PodStat
     filter.is_none_or(|value| value.state == sandbox_state(status) as i32)
 }
 
-fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), Status> {
+fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), (tonic::Code, &'static str)> {
     use crate::proto::runtime::v1::{NamespaceMode, LinuxSandboxSecurityContext};
     if host.runtime.sandboxes.vm.as_ref().and_then(|vm| vm.virtiofsd.as_ref()).is_none() {
-        return Err(Status::failed_precondition("VM workloads require a guest and virtiofsd configuration"));
+        return Err((tonic::Code::FailedPrecondition, "VM workloads require a guest and virtiofsd configuration"));
     }
     if config.windows.is_some() || !config.port_mappings.is_empty() {
-        return Err(Status::unimplemented("VM supports Linux Pods without host port mappings"));
+        return Err((tonic::Code::Unimplemented, "VM supports Linux Pods without host port mappings"));
     }
     if config.hostname.len() > 64 || !config.hostname.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
-        return Err(Status::invalid_argument("invalid guest hostname"));
+        return Err((tonic::Code::InvalidArgument, "invalid guest hostname"));
     }
-    let linux = config.linux.as_ref().ok_or_else(|| Status::unimplemented("VM requires Linux Pod namespaces"))?;
+    let linux = config.linux.as_ref().ok_or_else(|| (tonic::Code::Unimplemented, "VM requires Linux Pod namespaces"))?;
     if !linux.sysctls.is_empty() {
-        return Err(Status::unimplemented("VM Pod sysctls are unsupported"));
+        return Err((tonic::Code::Unimplemented, "VM Pod sysctls are unsupported"));
     }
     let mut security = linux.security_context.clone().unwrap_or_default();
     let ns = security.namespace_options.take().unwrap_or_default();
     if ns.network != NamespaceMode::Pod as i32 || ns.ipc != NamespaceMode::Pod as i32
         || ns.pid != NamespaceMode::Container as i32 || !ns.target_id.is_empty() || ns.userns_options.is_some() {
-        return Err(Status::unimplemented("VM requires Pod networking and IPC, private container PID and no user namespace request"));
+        return Err((tonic::Code::Unimplemented, "VM requires Pod networking and IPC, private container PID and no user namespace request"));
     }
     // The first sandbox process is the guest's root agent. Node profile
     // references and sandbox credentials cannot be applied to it.
@@ -84,7 +84,7 @@ fn validate_vm_pod(config: &PodSandboxConfig, host: &Config) -> Result<(), Statu
         security.apparmor = None;
     }
     if security != LinuxSandboxSecurityContext::default() {
-        return Err(Status::unimplemented("unsupported VM sandbox security context"));
+        return Err((tonic::Code::Unimplemented, "unsupported VM sandbox security context"));
     }
     Ok(())
 }
@@ -102,14 +102,14 @@ pub struct NautilusRuntimeService {
     policy: Arc<crate::policy::PolicyEngine>,
 }
 
-fn validate_vm_container(config: &ContainerConfig) -> Result<(), Status> {
-    let unsupported = |msg| Status::unimplemented(msg);
+fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &'static str)> {
+    let unsupported = |msg| (tonic::Code::Unimplemented, msg);
     if config.windows.is_some() || !config.devices.is_empty() || !config.cdi_devices.is_empty()
         || config.tty || config.stdin || config.stdin_once || config.stop_signal != 0 || !config.mounts.is_empty() {
         return Err(unsupported("VM guest does not support requested devices, mounts, terminal, stdin, stop signal or Windows configuration"));
     }
     if config.envs.iter().any(|e| std::str::from_utf8(&e.value).is_err() || e.key.is_empty() || e.key.contains('=')) {
-        return Err(Status::invalid_argument("invalid guest environment"));
+        return Err((tonic::Code::InvalidArgument, "invalid guest environment"));
     }
     if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
         if r.oom_score_adj != 0 || r.memory_swap_limit_in_bytes != 0 || !r.hugepage_limits.is_empty()
@@ -131,7 +131,7 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), Status> {
     }
     if sc.supplemental_groups.iter().copied().chain(sc.run_as_user.iter().chain(sc.run_as_group.iter()).map(|v| v.value))
         .any(|id| u32::try_from(id).is_err()) {
-        return Err(Status::invalid_argument("guest user and group IDs must be unsigned 32-bit values"));
+        return Err((tonic::Code::InvalidArgument, "guest user and group IDs must be unsigned 32-bit values"));
     }
     Ok(())
 }
@@ -265,7 +265,7 @@ impl NautilusRuntimeService {
                 id: c.id.clone(),
                 metadata: Some(rt::ContainerMetadata {
                     name: c.name.clone(),
-                    attempt: 0,
+                    attempt: c.attempt,
                 }),
                 labels: c.labels.clone(),
                 annotations: c.annotations.clone(),
@@ -391,7 +391,7 @@ impl RuntimeService for NautilusRuntimeService {
 
         let managed_vm = req.runtime_handler == "vm" && self._config.runtime.sandboxes.vm_workloads_enabled;
         if managed_vm {
-            validate_vm_pod(&config, &self._config)?;
+            validate_vm_pod(&config, &self._config).map_err(|(code,msg)| Status::new(code,msg))?;
         } else {
             self.sandbox_registry.resolve(&req.runtime_handler).map_err(Status::from)?;
         }
@@ -786,7 +786,7 @@ impl RuntimeService for NautilusRuntimeService {
         }
 
         if pod.runtime_handler == "vm" {
-            validate_vm_container(&config)?;
+            validate_vm_container(&config).map_err(|(code,msg)| Status::new(code,msg))?;
         }
         let strict_groups = config.linux.as_ref().and_then(|l| l.security_context.as_ref())
             .is_some_and(|s| s.supplemental_groups_policy == SupplementalGroupsPolicy::Strict as i32);
@@ -1013,15 +1013,10 @@ impl RuntimeService for NautilusRuntimeService {
             }
         }
 
-        let container_id = self.container_manager.create_with_process_options(
-            &req.pod_sandbox_id,
-            &metadata.name,
-            &image.image,
-            &pod.runtime_handler,
-            config.command,
-            config.args,
-            config.log_path.as_str(),
-            config
+        let container_id = self.container_manager.create_with_process_options(crate::runtime::container::CreateWorkload {
+            pod_id:&req.pod_sandbox_id, name:&metadata.name, image:&image.image, sandbox_kind:&pod.runtime_handler,
+            command: config.command, args: config.args, log_path: &config.log_path,
+            volumes: config
                 .mounts
                 .iter()
                 .map(|m| crate::sandbox::VolumeMount {
@@ -1031,15 +1026,9 @@ impl RuntimeService for NautilusRuntimeService {
                     propagation: cri_propagation_to_oci(m.propagation),
                 })
                 .collect(),
-            env,
-            resources,
-            security,
-            config.labels,
-            config.annotations,
-            config.stdin,
-            &config.working_dir,
-            strict_groups,
-        ).await.map_err(|e| Status::internal(format!("Failed to create container: {}", e)))?;
+            env, resources, security, labels:config.labels, annotations:config.annotations, stdin:config.stdin,
+            working_dir:&config.working_dir, strict_groups, attempt:metadata.attempt,
+        }).await.map_err(Status::from)?;
         
         if let Err(error) = self.pod_manager.add_container_to_pod(&req.pod_sandbox_id, &container_id).await {
             self.container_manager.remove_container(&container_id).await.map_err(Status::from)?;
@@ -1096,7 +1085,7 @@ impl RuntimeService for NautilusRuntimeService {
         if let Some(before) = self.container_manager.get_container_state(&req.container_id).await.map_err(Status::from)? {
             let _guard = self.pod_manager.operation_guard(&before.pod_id).await;
             if self.container_manager.get_container_state(&req.container_id).await.map_err(Status::from)?
-                .is_some_and(|c| c.status == ContainerStatus::Running) {
+                .is_some_and(|c| c.status == ContainerStatus::Running || c.vm.as_ref().is_some_and(|v| !v.preparing && !v.logs_complete)) {
                 self.container_manager.stop_container(&req.container_id, timeout).await.map_err(Status::from)?;
             }
         }
@@ -1142,7 +1131,7 @@ impl RuntimeService for NautilusRuntimeService {
     ) -> Result<Response<ListContainersResponse>, Status> {
         let req = request.into_inner();
         
-        let containers = self.container_manager.list_containers().await
+        let containers = self.container_manager.observed_containers().await
             .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
         
         let mut filtered_containers = Vec::new();
@@ -1186,7 +1175,7 @@ impl RuntimeService for NautilusRuntimeService {
                 pod_sandbox_id: container.pod_id,
                 metadata: Some(ContainerMetadata {
                     name: container.name,
-                    attempt: 0,
+                    attempt: container.attempt,
                 }),
                 image: Some(ImageSpec {
                     image: container.image.clone(),
@@ -1195,7 +1184,7 @@ impl RuntimeService for NautilusRuntimeService {
                     user_specified_image: String::new(),
                     image_ref: String::new(),
                 }),
-                image_id: container.image.clone(),
+                image_id: container.vm.map_or_else(|| container.image.clone(), |vm| vm.image_id),
                 image_ref: container.image.clone(),
                 state: container_status as i32,
                 created_at: container.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -1214,7 +1203,7 @@ impl RuntimeService for NautilusRuntimeService {
         request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
         let req = request.into_inner();
-        let c = self.container_manager.get_container_state(&req.container_id).await
+        let c = self.container_manager.observed_container(&req.container_id).await
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("container {} not found", req.container_id)))?;
 
@@ -1232,7 +1221,7 @@ impl RuntimeService for NautilusRuntimeService {
                 id: c.id.clone(),
                 metadata: Some(ContainerMetadata {
                     name: c.name,
-                    attempt: 0,
+                    attempt: c.attempt,
                 }),
                 state: state as i32,
                 created_at: c.created_at.timestamp_nanos_opt().unwrap_or(0),
@@ -1270,7 +1259,7 @@ impl RuntimeService for NautilusRuntimeService {
                     .collect(),
                 log_path: c.log_path.unwrap_or_default(),
                 resources: None,
-                image_id: c.id,
+                image_id: c.vm.map_or(c.id, |vm| vm.image_id),
                 user: None,
                 stop_signal: 0, // SIGTERM (proto enum 0); not configurable yet
             }),
