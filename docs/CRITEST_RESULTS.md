@@ -4,6 +4,12 @@
 - 测试工具为 kubernetes-sigs/cri-tools 的 `critest v1.31.1`。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-24 Pod VM 工作负载和网络
+
+在 pro6000 的 Linux 6.12.118 嵌套 KVM 节点，runtime 和 image endpoint 指向同一个隔离 daemon。对 PR #24 运行未过滤的 critest v1.31.1。提交 `302d543` 得到 96 通过、0 失败、17 跳过，耗时 244.594 秒。提交 `714ae01` 得到 **95 通过、1 失败、17 跳过**，耗时 236.036 秒。失败发生在默认 OCI 后端，HostNetwork=false 的 AfterEach 对已快速退出的容器执行 Stop 时，systemd 已回收其 youki scope。较早提交的完整套件与聚焦运行均复现过。后续提交仅调整静态错误值的写法和格式。[修复跟踪](https://github.com/nautilus-runtime/nautilus/issues/25)
+
+`b7eb13f` 的 Linux Rust 测试为 96 通过、0 失败、8 项默认忽略。全库格式检查仍涉及基线的 31 个文件，Clippy 仍报告 29 条诊断。独立运行的真实 CRI 测试使用 Cloud Hypervisor v55.0，覆盖双 Pod 网络与 DNS、两个 OCI 容器、十次 ExecSync、超时和取消、guest 连接中断、daemon 被强制终止后的恢复、日志及重复清理。Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主上另行通过双 Pod 网络测试。[运行步骤](VM_RUNTIME.md)
+
 ## 2026-11-24 Pod VM 生命周期
 
 PR #10 的生产代码提交为 `af327ce`。用 Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主验证，再用 v55.0 在同机的 Linux 6.12.118、systemd 257 嵌套 KVM 节点复验。每轮启动两个实验性 Pod VM，再通过真实 daemon 的 CRI socket 验证 guest boot ID、强制终止并重启 daemon、并发及重复 Stop/Remove、意外退出后的清理。[实验范围与运行命令](VM_RUNTIME.md#首版使用系统级-systemd-托管-vmm)
