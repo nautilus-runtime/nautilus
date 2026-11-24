@@ -180,7 +180,7 @@ impl VmResources {
                 .map_err(|_| invalid("Pod CPU quota plus overhead overflows"))?;
             // systemd-run accepts percentages to two decimal places.
             let basis_points = total as u128 * 10_000;
-            if basis_points % period as u128 != 0
+            if !basis_points.is_multiple_of(period as u128)
                 || basis_points / period as u128 > i32::MAX as u128
             {
                 return Err(unsupported(
