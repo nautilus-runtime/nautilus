@@ -4,6 +4,10 @@
 - 测试工具为 kubernetes-sigs/cri-tools 的 `critest v1.31.1`。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-24 拉取阶段解包
+
+版本 `4666bb5` 通过 28 项库测试，包括解包失败后的重试、拉取日志恢复、快照复用、退役和延迟卸载。critest v1.31.1 运行镜像管理与 RemoveImage 幂等性相关的 9 项用例，9 项通过，其余 104 项未选中。独立 CRI 检查还验证了拉取超时后的四路重试和关闭 OverlayFS 后的完整生命周期。见[启动性能和测试边界](PERFORMANCE.md)。
+
 ## 2026-11-24 引擎升级验证
 
 youki 0.8.0 通过 27 项库测试、13 项 OCI 安全配置测试和 2 项集成测试。另以 CRI 验证了 exec 退出码、工作负载退出码、NoNewPrivs、seccomp 过滤器继承、双向挂载传播及旧版容器升级。2026-08-28 的 96 项 critest 结果对应当时的引擎版本。本轮测量口径和原始数据见[性能报告](PERFORMANCE.md)。

@@ -12,8 +12,8 @@
 | CRI 一致性 | **critest v1.31.1 96/0 全绿**(两连跑确认) | crictl 命令可用 |
 | 单元/集成测试 | cargo test 6 套件 28/28 绿 + e2e 5(e2e 偶发 wait4 挂起待查) | 套件绿色 |
 | 空闲内存 | **PSS 10 MiB**(RSS 11 MiB / 12 线程,release 实测) | < 100MB ✅ 大幅超额 |
-| 容器启动时间 | 预热 BusyBox，Nautilus 串行创建加启动 P95 两轮分别为 47.2、45.7 ms，同轮 containerd 为 71.8、68.4 ms。见[测试口径和数据](PERFORMANCE.md) | < 100 ms (P95)，预热场景两轮均达到。仅缓存压缩层时，首次创建加启动仍超过目标 |
-| 并发操作 | 预热 BusyBox，4 路并发创建加启动 P95 两轮分别为 91.1、80.4 ms | 1000+，容量上限待测 |
+| 容器启动时间 | BusyBox 在 PullImage 解包后，首次创建加启动 P95 为 64.5 ms（压缩层已缓存）和 63.5 ms（本地仓库实际传输），预热串行为 47.3 ms。见[测试口径和数据](PERFORMANCE.md) | < 100 ms (P95)，这三种已测场景达到 |
+| 并发操作 | 预热 BusyBox 四路创建加启动 P95 为 92.2 ms，同轮旧版为 89.3 ms，containerd 为 122.1 ms | 1000+，容量上限待测 |
 | 生产加固 | socket 0660、SIGTERM 优雅退出、registry auth、脚手架删除、警告清零 | — ✅ |
 | 多沙箱 | runc(libcontainer)+ wasmtime 双后端路由、RuntimeClass 路由验证通过 | — ✅ |
 | Wasm 策略引擎 | hooks 热加载 + fuel/timeout 限额,demo 验证通过 | — ✅ |
@@ -39,8 +39,8 @@
 
 ### 近期(稳定性与度量)
 
-1. **性能回归与容量测量**已完成两轮预热镜像对比，并测量了两端从本地压缩层首次启动的耗时。
-   下一步拆解首次创建的解包开销，补充空缓存拉取、多层镜像、CNI 和更高并发测试。见[与 containerd 的对比和原始样本](PERFORMANCE.md)。
+1. **性能回归与容量测量**已覆盖解包前移前后、压缩层缓存命中、本地 HTTPS 仓库实际传输和四路并发。
+   后续扩大四路长尾样本，跟踪并发启动超时，并补充多层大镜像、跨网络拉取、CNI 和更高并发测试。见[三方对比和原始样本](PERFORMANCE.md)。
 2. **e2e wait4 挂起排查**:`e2e_lifecycle_test` 两次复现阻塞在 wait4
    (疑与 CPU 饥饿同源),干净环境观察定位
 3. **debug 日志与流式输出隔离**:libcontainer 内部 DEBUG 行泄入 exec 流

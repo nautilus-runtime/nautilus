@@ -2,6 +2,44 @@
 
 This benchmark measures how long a CRI client waits for an OCI workload to run on Nautilus and containerd. Run both on the same Linux host. The serial case measures individual request latency. The parallel case shows how that latency changes when several pods start together.
 
+## Unpacking during PullImage · 2026-11-24
+
+Preparing the shared image tree during PullImage reduced first CreateContainer + StartContainer P95 by **53% with compressed layers cached** and **57% with a registry transfer**. Pull-to-ready P95 changed by less than 1% in both cases. A caller that pre-pulls the image gets the startup saving when it later submits a pod. A caller that pulls immediately before submitting the pod pays the unpacking cost in the pull.
+
+“Before” is Nautilus `6456996`. “After” is `4666bb5`, which includes pull-time unpacking and a bounded retry for a busy private OverlayFS mount. The control was containerd 2.2.2 with runc 1.3.4. The three dedicated endpoints used locked release builds for Nautilus, the same ARM64 BusyBox platform manifest, four logical CPUs, Linux 6.8, ext4, systemd cgroups and host-network pods. Each latency cell shows **P50 / P95 in milliseconds**. [Raw samples, including interrupted attempts](benchmarks/pull-unpack-arm64.csv)
+
+### First lifecycle
+
+| Starting state | Runtime | Pull | First create | First start | First create + start | Pull to workload ready |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Compressed layer cached | Nautilus before | 1.1 / 1.2 | 97.9 / 101.9 | 34.5 / 36.2 | 132.7 / 137.0 | 147.1 / 151.8 |
+| Compressed layer cached | Nautilus after | 71.4 / 78.4 | 27.1 / 30.3 | 34.3 / 37.5 | 61.6 / 64.5 | 146.9 / 151.7 |
+| Compressed layer cached | containerd | 68.8 / 72.4 | 13.9 / 15.5 | 52.8 / 59.7 | 66.4 / 73.4 | 207.6 / 215.6 |
+| Layer fetched over TLS | Nautilus before | 24.2 / 25.8 | 106.7 / 111.0 | 34.9 / 36.2 | 141.9 / 146.2 | 180.4 / 187.8 |
+| Layer fetched over TLS | Nautilus after | 102.7 / 108.9 | 26.4 / 28.0 | 34.7 / 36.3 | 61.5 / 63.5 | 178.0 / 186.5 |
+| Layer fetched over TLS | containerd | 136.1 / 141.7 | 13.2 / 16.6 | 48.3 / 54.7 | 62.1 / 67.4 | 268.4 / 279.2 |
+
+Each runtime completed 36 serial samples per starting state, cycling through all six runtime orders. A single monotonic interval ran from submitting PullImage to observing the workload's marker. The unpacked workload snapshot was absent before each pull. For the transfer series, each runtime also started without the workload's compressed content and used the same loopback HTTPS registry. Its access log confirmed 108 downloads of the 1,896,265-byte layer. The sandbox image and host filesystem cache stayed warm. WAN latency, larger images and CNI setup are outside this comparison.
+
+First CreateContainer alone still took longer on the updated Nautilus than on containerd. For cached layers its P95 was 30.3 vs 15.5 ms. Nautilus completed StartContainer sooner, and its sandbox P95 was 9.6 vs 74.0 ms. Both differences matter when interpreting the total.
+
+### Warm workloads
+
+| Concurrent pods | Runtime | Create + start | Pod to ready | Full lifecycles/s |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | Nautilus before | 44.8 / 46.8 | 53.5 / 56.6 | 7.75 |
+| 1 | Nautilus after | 44.4 / 47.3 | 53.0 / 56.4 | 7.77 |
+| 1 | containerd | 62.0 / 67.5 | 130.9 / 140.5 | 4.40 |
+| 4 | Nautilus before | 64.0 / 89.3 | 78.9 / 106.1 | 23.08 |
+| 4 | Nautilus after | 63.7 / 92.2 | 79.5 / 111.7 | 22.69 |
+| 4 | containerd | 106.6 / 122.1 | 234.9 / 262.4 | 9.71 |
+
+Warm create + start P95 rose by **0.5 ms serially** and **2.8 ms at concurrency four**. At four, throughput fell by 1.7%. The direction of the P95 difference varied across blocks. Approximate 95% bootstrap intervals for the P95 change were −0.2 to +1.2 ms serially and −8.1 to +10.5 ms at four, using 4,000 resamples of matched three-runtime waves within each block. These samples leave room for a small warm-path regression.
+
+The final tables include **120 serial workloads** and **152 concurrent workloads in 38 waves per runtime**. Two four-way attempts stopped on the baseline, once at the 45-second StartContainer deadline and once when CreateContainer returned `EBUSY` on unmount. All fully matched rounds from those attempts and the subsequent complete block are included. The final Nautilus and containerd completed all their dispatched waves. The preliminary build `0a225bf` also encountered an `EBUSY` unmount during warm-up. A regression test now holds a directory on the mounted rootfs open during teardown and verifies that unmount succeeds after release.
+
+To reproduce the tables from the CSV, select `series=final`, `phase=measure` and `matched=yes`. A matched round has a completed wave for each runtime. Rows from warm-up, unmatched waves and the preliminary build remain available. Failed RPCs have no latency row. The first-use and warm commands are under [Running the comparison](#running-the-comparison).
+
 ## Independent repeat · 2026-11-24
 
 With the BusyBox image already unpacked, Nautilus completed CreateContainer + StartContainer in **45.7 ms at P95** serially and **80.4 ms** with four concurrent pods. These were 33% and 38% lower than containerd 2.2.2 in the same window. The previous optimized run measured 47.2 and 91.1 ms for Nautilus. The runtime source and locked dependencies were identical at the two tested revisions, `b801cc1` and `240e461`. The difference between windows gives an indication of run-to-run variation. [Raw samples from the repeat](benchmarks/cri-lifecycle-arm64-repeat.csv)
