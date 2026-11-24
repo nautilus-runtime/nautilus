@@ -353,6 +353,10 @@ impl NautilusRuntimeService {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("pod {} not found", pod_id)))?;
 
+        if pod.runtime_handler == "vm" {
+            return Err(Status::unimplemented("guest Pod metrics unavailable"));
+        }
+
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let mut containers = Vec::new();
         let mut cpu_total = 0u64;
