@@ -32,6 +32,8 @@ kubectl get node "$NODE" -o jsonpath='{range .status.runtimeHandlers[*]}{.name}{
 kubectl label node "$NODE" nautilus-vm=enabled --overwrite
 ```
 
+`nautilus-vm=enabled` 由节点管理员维护。探测撤回 `vm` 后，可用 `kubectl label node "$NODE" nautilus-vm-` 暂停向该节点调度新的 VM Pod。
+
 ## 创建 RuntimeClass 和测试 Pod
 
 在具有该标签的节点上调度。示例镜像与 Kubernetes v1.37.2 的实测一致，Pod 内的 `/bin/sh` 会打印当前 guest 的 boot ID 并继续运行。

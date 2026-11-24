@@ -37,7 +37,9 @@
 
 每个 sandbox attempt 使用独立的临时服务。systemd 在 nautilusd 退出后继续持有 VMM 的进程组。Nautilus 在 `runtime.state_dir/vms` 记录 sandbox ID、启动 nonce、systemd InvocationID、私有目录及 socket 的文件身份和 guest boot ID。启动恢复时，匹配已登记的 VM 后重新连接，继续回收中断的创建或删除。遇到身份冲突时保留记录，在 CRI 中报告 NOTREADY，避免停止其他工作负载。
 
-实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。成功验证时 `guestReachable` 为 true，确认缺失时为 false。状态查询发生错误时该字段为 null，`error` 给出原因。已启动的实验 Pod 保持 NOTREADY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
+Cloud Hypervisor v55 在 HTTP 服务期间持有 `api.sock.lock` 的整文件 OFD 写锁。为每次新启动，Nautilus 在私有目录预先登记该锁的设备号、inode 和 nonce。VMM 被强制终止后，清理流程取得同类写锁并核对身份，再释放文件。升级时，运行中旧 VMM 的 systemd 身份、MainPID 打开的 inode 和持有的写锁可以补全记录。如果旧 VMM 已经退出，Nautilus 会将符合私有文件条件的未登记锁原子移至 `runtime.state_dir/vms/.api-lock-recovery/`，原 inode 和可追溯名称均保留。文件身份冲突或尚有进程持锁时，清理保留沙箱记录供重试。[Cloud Hypervisor v55 锁的实现](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v55.0/vmm/src/locked_unix_listener.rs#L41-L80)
+
+实验入口为 `PodManager::start_pod`，镜像路径配置见 [nautilus.toml](../nautilus.toml) 的 `[runtime.sandboxes.vm]`。可通过 daemon 的 `PodSandboxStatus(verbose=true)` 读取 `info["nautilus.vm"]` 中的 `guestReachable` 和 `bootId`。成功验证时 `guestReachable` 为 true，确认缺失时为 false。状态查询发生错误时该字段为 null，`error` 给出原因。仅具备身份握手的开发用 Pod 保持 NOTREADY，启用 VM 工作负载时，通过完整网络和工作负载握手的 Pod 报告 READY，`StopPodSandbox` 和 `RemovePodSandbox` 可重试。开发机可用以下命令运行真实 VM 验证：
 
 ```sh
 NAUTILUS_VM_VMM=/opt/cloud-hypervisor/bin/cloud-hypervisor \
