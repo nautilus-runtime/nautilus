@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 CRI 有限列表流
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118）运行未过滤的 `critest` v1.37.0。Runtime 和 Image 端点使用同一个 daemon socket。包含五个列表流的初版代码通过 105 项，0 失败，37 跳过，耗时 419.113 秒。
+
+随后用真实 gRPC 客户端对同一 daemon 上的 OCI 容器、Cloud Hypervisor v55.0 VM 容器及已拉取镜像调用五种列表流，核对 ID、父 Pod、AND 标签筛选、空结果、无重复和 EOF。该用例还发现普通容器列表漏用标签，修复后同时复验普通查询和列表流。
+
 ## 2026-11-25 Pod VM 的 CRI 用量统计
 
 在两个隔离节点用提交 `0b1e188` 的同一 daemon 二进制运行未过滤的 critest，检验默认 OCI 后端。每轮的 runtime 和 image endpoint 均指向该节点专用的 Unix socket。两轮退出码均为 0，清理后各自的 CRI Pod 和容器数均为零。
