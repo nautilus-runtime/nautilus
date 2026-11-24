@@ -2,7 +2,7 @@
 
 <p align="center"><a href="https://nautilus-runtime.github.io/nautilus/">Project website</a></p>
 
-Nautilus is a Linux container runtime written in Rust. It implements the Kubernetes Container Runtime Interface (CRI v1) and runs both OCI containers and WebAssembly commands. Kubelet and the bundled CLI use the same Unix socket, so you can try either runtime on a single machine before using it with a cluster.
+Nautilus is a Linux container runtime written in Rust. It implements the Kubernetes Container Runtime Interface (CRI v1) and runs OCI containers, WebAssembly commands, and OCI containers inside a Pod-level VM. Kubelet and the bundled CLI use the same Unix socket, so you can try either runtime on a single machine before using it with a cluster.
 
 ## What you can run
 
@@ -10,10 +10,11 @@ Nautilus is a Linux container runtime written in Rust. It implements the Kuberne
 | --- | --- | --- |
 | Linux container | `runc` (default) | An OCI image from a registry. Nautilus pulls and caches the layers and runs the container with libcontainer. |
 | WebAssembly command | `wasi` or `wasm` | A local WASI Preview 1 module exporting `_start`. Wasmtime runs it inside the daemon. |
+| Pod VM | `vm` (opt-in) | OCI images run inside one Linux guest per Pod. Requires KVM, Cloud Hypervisor and virtiofsd. |
 
 OCI containers support CNI pod networking, host port mappings, resource limits, logs and exec. You can also load a Wasm policy to allow or deny pod creation, container creation or container start. The [example policy](examples/policy-deny-label) rejects workloads carrying the `nautilus.policy/deny` label.
 
-On a Linux KVM node, `nautilus vm probe` boots a temporary Cloud Hypervisor guest and checks its vsock handshake. See the [probe instructions and Pod VM implementation plan](docs/VM_RUNTIME.md).
+To enable the VM handler on a Kubernetes node and run a Pod, follow the [RuntimeClass guide](docs/VM_RUNTIMECLASS.md). The [VM design](docs/VM_RUNTIME.md) also covers the standalone boot probe and recovery tests.
 
 ## Quick start
 
