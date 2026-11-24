@@ -7,6 +7,7 @@ pub mod resources;
 
 pub mod guest;
 pub(crate) mod workload;
+pub(crate) mod stream;
 
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::PermissionsExt;

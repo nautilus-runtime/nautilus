@@ -115,6 +115,8 @@ pub struct WorkloadSpec {
     pub args: Vec<String>,
     pub working_dir: String,
     pub strict_groups: bool,
+    pub tty: bool,
+    pub stdin_once: bool,
     /// Entrypoint override from CRI `command` (empty = use image default).
     pub entrypoint: Vec<String>,
     /// Extra environment variables.

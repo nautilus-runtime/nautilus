@@ -28,6 +28,7 @@
 
 use crate::core::state::StateManager;
 use crate::runtime::container::ContainerManager;
+use crate::vm::workload::{Operation, StreamOptions};
 use bytes::Bytes;
 use http::HeaderMap;
 use spdystream_rs::connection::Connection;
@@ -38,7 +39,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::sync::{mpsc, oneshot, watch, OnceCell};
 
 /// What the client asked for at CRI RPC time.
 #[derive(Clone, Debug)]
@@ -62,6 +63,7 @@ pub struct Session {
     /// Sandbox whose IP receives port-forward dials.
     pub pod_id: String,
     pub cmd: Vec<String>,
+    pub ports: Vec<u16>,
     pub tty: bool,
     pub stdin: bool,
     pub stdout: bool,
@@ -83,7 +85,8 @@ fn new_token() -> String {
 fn register(session: Session) -> String {
     let token = new_token();
     let mut g = sessions();
-    g.get_or_insert_with(HashMap::new).insert(token.clone(), session);
+    g.get_or_insert_with(HashMap::new)
+        .insert(token.clone(), session);
     token
 }
 
@@ -123,7 +126,9 @@ async fn accept_loop(
     state: Arc<StateManager>,
 ) {
     loop {
-        let Ok((tcp, _)) = listener.accept().await else { continue };
+        let Ok((tcp, _)) = listener.accept().await else {
+            continue;
+        };
         let exec = exec.clone();
         let state = state.clone();
         tokio::spawn(async move { handle_conn(tcp, exec, state).await });
@@ -176,7 +181,8 @@ async fn handle_conn(
 
     let ctx = Arc::new(ConnCtx {
         exec_process: OnceCell::new(),
-        pf_error_stream: Mutex::new(None),
+        pf_error_streams: Mutex::new(HashMap::new()),
+        closed: watch::channel(false).0,
     });
     let sess = session.clone();
     tracing::info!(mode, %token, "streaming session opened");
@@ -184,7 +190,13 @@ async fn handle_conn(
     let exec2 = exec.clone();
     let state2 = state.clone();
     let conn = match Connection::serve(tcp, move |s: Arc<Stream>| {
-        Box::pin(handle_stream(s, sess.clone(), ctx2.clone(), exec2.clone(), state2.clone()))
+        Box::pin(handle_stream(
+            s,
+            sess.clone(),
+            ctx2.clone(),
+            exec2.clone(),
+            state2.clone(),
+        ))
     })
     .await
     {
@@ -199,8 +211,9 @@ async fn handle_conn(
     // running detached in the container; kill it (no-op after natural exit).
     tokio::spawn(async move {
         conn.wait_closed().await;
+        ctx.closed.send_replace(true);
         tracing::info!(mode = mode_of(&session.kind), "streaming session closed");
-        if let Some(h) = ctx.exec_process.get() {
+        if let Some(Ok(h)) = ctx.exec_process.get() {
             let pid = h.pid.load(Ordering::Acquire);
             if pid > 0 {
                 tracing::info!(pid, "streaming: killing exec process on disconnect");
@@ -232,13 +245,16 @@ fn mode_of(kind: &SessionKind) -> &'static str {
 /// Per-connection state shared by the stream handler tasks.
 struct ConnCtx {
     /// The exec'd process, spawned by whichever channel stream arrives first.
-    exec_process: OnceCell<Arc<ExecHandle>>,
+    exec_process: OnceCell<Result<Arc<ExecHandle>, String>>,
     /// portforward's per-request error stream (client creates it first).
-    pf_error_stream: Mutex<Option<Arc<Stream>>>,
+    pf_error_streams: Mutex<HashMap<String, Arc<Stream>>>,
+    closed: watch::Sender<bool>,
 }
 
 /// Live handles to the exec'd process feeding the SPDY channel streams.
 struct ExecHandle {
+    _guest_lifetime: Option<oneshot::Sender<()>>,
+    resize: Option<mpsc::Sender<(u16, u16)>>,
     pid: Arc<AtomicU32>,
     /// Output queues drained by the stdout/stderr channel tasks. The pumps
     /// start at spawn time, which can precede the matching SPDY stream.
@@ -274,7 +290,9 @@ async fn handle_stream(
     tracing::debug!(stream_id = s.stream_id, %stream_type, "streaming stream open");
 
     match session.kind {
-        SessionKind::PortForward => handle_pf_stream(s, stream_type, session, ctx, state).await,
+        SessionKind::PortForward => {
+            handle_pf_stream(s, stream_type, session, ctx, state, exec).await
+        }
         _ => handle_exec_stream(s, stream_type, session, ctx, exec).await,
     }
 }
@@ -285,9 +303,9 @@ async fn ensure_exec(
     exec: &ContainerManager,
 ) -> Result<Arc<ExecHandle>, String> {
     ctx.exec_process
-        .get_or_try_init(|| spawn_exec(session, exec))
+        .get_or_init(|| spawn_exec(session, exec, ctx.closed.subscribe()))
         .await
-        .map(Arc::clone)
+        .clone()
 }
 
 /// Spawn the container process behind an exec/attach session: one process per
@@ -295,13 +313,45 @@ async fn ensure_exec(
 async fn spawn_exec(
     session: &Session,
     exec: &ContainerManager,
+    closed: watch::Receiver<bool>,
 ) -> Result<Arc<ExecHandle>, String> {
-    let streams = exec
-        .exec_stream(&session.container_id, &session.cmd, &[], None)
+    let container = exec
+        .get_container_state(&session.container_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "container no longer exists".to_owned())?;
+    let (streams, resize, lifetime) = if container.sandbox_kind == "vm" {
+        let options = StreamOptions {
+            stdin: session.stdin,
+            stdout: session.stdout,
+            stderr: session.stderr,
+            tty: session.tty,
+            port: None,
+        };
+        let op = match session.kind {
+            SessionKind::Exec => Operation::ExecStream {
+                argv: &session.cmd,
+                stream: options,
+            },
+            SessionKind::Attach => Operation::Attach { stream: options },
+            SessionKind::PortForward => return Err("unexpected port-forward session".into()),
+        };
+        let guest = exec
+            .guest_stream(&container.pod_id, &container.id, op, options, closed)
+            .await
+            .map_err(|e| e.to_string())?;
+        (guest.io, guest.resize, Some(guest.lifetime))
+    } else {
+        let streams = exec
+            .exec_stream(&session.container_id, &session.cmd, &[], None)
+            .await
+            .map_err(|e| e.to_string())?;
 
+        (streams, None, None)
+    };
     Ok(Arc::new(ExecHandle {
+        _guest_lifetime: lifetime,
+        resize,
         pid: streams.pid,
         stdout_q: Mutex::new(Some(streams.stdout)),
         stderr_q: Mutex::new(Some(streams.stderr)),
@@ -323,11 +373,11 @@ fn exit_code_status(code: i32) -> Bytes {
 }
 
 fn failure_status(msg: &str) -> Bytes {
-    // Minimal JSON string escaping; messages are our own runtime errors.
-    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
-    Bytes::from(format!(
-        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","message":"{escaped}","code":500}}"#
-    ))
+    Bytes::from(
+        serde_json::json!({"kind":"Status","apiVersion":"v1","metadata":{},
+        "status":"Failure","message": msg,"code":500})
+        .to_string(),
+    )
 }
 
 async fn handle_exec_stream(
@@ -356,7 +406,11 @@ async fn handle_exec_stream(
                 Some(rx) => rx.await.ok(),
                 None => None,
             };
-            tracing::info!(stream_id = s.stream_id, ?outcome, "exec error stream reporting exit");
+            tracing::info!(
+                stream_id = s.stream_id,
+                ?outcome,
+                "exec error stream reporting exit"
+            );
             let payload = match outcome {
                 Some(Ok(0)) => success_status(),
                 Some(Ok(code)) => exit_code_status(code),
@@ -440,50 +494,12 @@ async fn handle_exec_stream(
         }
         // Terminal resize: needs a pty (not wired); drain and ignore so the
         // tty-mode client is not disturbed.
-        "resize" => {
-            while let Ok(Some(_)) = s.read_data().await {}
-        }
-        _ => {
-            let _ = s.reset(RstStatus::RefusedStream).await;
-        }
-    }
-}
-
-async fn handle_pf_stream(
-    s: Arc<Stream>,
-    stream_type: String,
-    session: Arc<Session>,
-    ctx: Arc<ConnCtx>,
-    state: Arc<StateManager>,
-) {
-    match stream_type.as_str() {
-        // Per-request error channel: remember it so data-stream dial failures
-        // surface as protocol errors instead of a silent hang.
-        "error" => {
-            *ctx.pf_error_stream.lock().unwrap() = Some(s);
-        }
-        "data" => {
-            let port: u16 = s
-                .headers
-                .get("port")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            if port == 0 {
-                report_pf_error(&ctx, "port-forward: missing or invalid port header").await;
-                return;
-            }
-            // Dial the pod IP from the host; the bridge network is host-routable.
-            // Host-network pods have no CNI IP — they listen on the node itself.
-            let ip = match state.get_pod_state(&session.pod_id).await {
-                Ok(Some(pod)) if !pod.network_ip.is_empty() => pod.network_ip,
-                _ => "127.0.0.1".to_string(),
-            };
-            match tokio::net::TcpStream::connect((ip.as_str(), port)).await {
-                Ok(tcp) => relay_pf(s, tcp).await,
-                Err(e) => {
-                    tracing::debug!(%ip, port, error = %e, "port-forward dial failed");
-                    report_pf_error(&ctx, &format!("error forwarding port {port}: {e}")).await;
+        "resize" if session.tty => {
+            if let Ok(handle) = ensure_exec(&ctx, &session, &exec).await {
+                if let Some(tx) = &handle.resize {
+                    guest_resize(&s, tx).await;
+                } else {
+                    while let Ok(Some(_)) = s.read_data().await {}
                 }
             }
         }
@@ -493,11 +509,153 @@ async fn handle_pf_stream(
     }
 }
 
-async fn report_pf_error(ctx: &ConnCtx, msg: &str) {
-    let stream = ctx.pf_error_stream.lock().unwrap().clone();
-    if let Some(es) = stream {
-        let _ = es.write_data(failure_status(msg), true).await;
+/// The Kubernetes resize stream is a sequence of JSON objects. SPDY DATA
+/// frames may split one object or contain several.
+async fn guest_resize(s: &Stream, tx: &mpsc::Sender<(u16, u16)>) {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Size {
+        width: u16,
+        height: u16,
     }
+    let mut buffer = Vec::new();
+    while let Ok(Some(data)) = s.read_data().await {
+        buffer.extend_from_slice(&data);
+        if buffer.len() > 64 * 1024 {
+            break;
+        }
+        let mut items = serde_json::Deserializer::from_slice(&buffer).into_iter::<Size>();
+        let mut consumed = 0;
+        while let Some(item) = items.next() {
+            match item {
+                Ok(size) if size.width != 0 && size.height != 0 => {
+                    consumed = items.byte_offset();
+                    if tx.send((size.width, size.height)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) if e.is_eof() => break,
+                _ => return,
+            }
+        }
+        buffer.drain(..consumed);
+    }
+}
+
+async fn handle_pf_stream(
+    s: Arc<Stream>,
+    stream_type: String,
+    session: Arc<Session>,
+    ctx: Arc<ConnCtx>,
+    state: Arc<StateManager>,
+    exec: Arc<ContainerManager>,
+) {
+    let port = s
+        .headers
+        .get("port")
+        .and_then(|s| s.to_str().ok())
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let key = s
+        .headers
+        .get("requestID")
+        .and_then(|s| s.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| port.to_string());
+    if stream_type == "error" {
+        ctx.pf_error_streams.lock().unwrap().insert(key, s);
+        return;
+    }
+    if stream_type != "data" {
+        let _ = s.reset(RstStatus::RefusedStream).await;
+        return;
+    }
+    let result: Result<(), String> = async {
+        if port == 0 || (!session.ports.is_empty() && !session.ports.contains(&port)) {
+            return Err("port was not requested by CRI".into());
+        }
+        let pod = state
+            .get_pod_state(&session.pod_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Pod no longer exists".to_owned())?;
+        if pod.runtime_handler == "vm" {
+            let options = StreamOptions {
+                stdin: true,
+                stdout: true,
+                port: Some(port),
+                ..Default::default()
+            };
+            let stream = exec
+                .guest_stream(
+                    &pod.id,
+                    &pod.id,
+                    Operation::PortForward { stream: options },
+                    options,
+                    ctx.closed.subscribe(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let _lifetime = stream.lifetime;
+            relay_guest_port(s.clone(), stream.io).await
+        } else {
+            let ip = if pod.network_ip.is_empty() {
+                "127.0.0.1"
+            } else {
+                &pod.network_ip
+            };
+            let tcp = tokio::net::TcpStream::connect((ip, port))
+                .await
+                .map_err(|e| e.to_string())?;
+            relay_pf(s.clone(), tcp).await;
+            Ok(())
+        }
+    }
+    .await;
+    let error = ctx.pf_error_streams.lock().unwrap().remove(&key);
+    if let Some(stream) = error {
+        let msg = result.err().unwrap_or_default();
+        let _ = stream.write_data(Bytes::from(msg), true).await;
+    }
+    let _ = s.write_data(Bytes::new(), true).await;
+}
+
+async fn relay_guest_port(
+    s: Arc<Stream>,
+    mut io: crate::sandbox::ExecStreams,
+) -> Result<(), String> {
+    let stdin = io
+        .stdin
+        .take()
+        .ok_or_else(|| "guest port missing input".to_owned())?;
+    let upstream = async {
+        while let Some(data) = s.read_data().await.map_err(|e| e.to_string())? {
+            stdin
+                .send(data.to_vec())
+                .await
+                .map_err(|_| "guest port closed".to_owned())?;
+        }
+        drop(stdin);
+        std::future::pending::<Result<(), String>>().await
+    };
+    let downstream = async {
+        while let Some(chunk) = io.stdout.recv().await {
+            s.write_data(Bytes::from(chunk), false)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let code = io
+            .exit
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(format!("guest port returned {code}"))
+        }
+    };
+    tokio::select! {r = upstream => r,r = downstream => r}
 }
 
 /// Bidirectional byte relay between the SPDY data stream and the container
@@ -562,6 +720,7 @@ pub async fn exec_url(
         container_id,
         pod_id: String::new(),
         cmd,
+        ports: Vec::new(),
         tty,
         stdin,
         stdout,
@@ -587,6 +746,7 @@ pub async fn attach_url(
         container_id,
         pod_id: String::new(),
         cmd: vec!["/bin/sh".to_string()],
+        ports: Vec::new(),
         tty,
         stdin,
         stdout,
@@ -601,6 +761,7 @@ pub async fn port_forward_url(
     exec: Arc<ContainerManager>,
     state: Arc<StateManager>,
     pod_id: String,
+    ports: Vec<u16>,
 ) -> Result<String, crate::core::error::Error> {
     let port = ensure_started(exec, state).await?;
     let session = Session {
@@ -608,6 +769,7 @@ pub async fn port_forward_url(
         container_id: String::new(),
         pod_id,
         cmd: Vec::new(),
+        ports,
         tty: false,
         stdin: false,
         stdout: false,

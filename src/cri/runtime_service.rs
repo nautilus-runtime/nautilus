@@ -105,8 +105,8 @@ pub struct NautilusRuntimeService {
 fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &'static str)> {
     let unsupported = |msg| (tonic::Code::Unimplemented, msg);
     if config.windows.is_some() || !config.devices.is_empty() || !config.cdi_devices.is_empty()
-        || config.tty || config.stdin || config.stdin_once || config.stop_signal != 0 || !config.mounts.is_empty() {
-        return Err(unsupported("VM guest does not support requested devices, mounts, terminal, stdin, stop signal or Windows configuration"));
+        || config.stop_signal != 0 || !config.mounts.is_empty() {
+        return Err(unsupported("VM guest does not support requested devices, mounts, stop signal or Windows configuration"));
     }
     if config.envs.iter().any(|e| std::str::from_utf8(&e.value).is_err() || e.key.is_empty() || e.key.contains('=')) {
         return Err((tonic::Code::InvalidArgument, "invalid guest environment"));
@@ -1027,7 +1027,7 @@ impl RuntimeService for NautilusRuntimeService {
                 })
                 .collect(),
             env, resources, security, labels:config.labels, annotations:config.annotations, stdin:config.stdin,
-            working_dir:&config.working_dir, strict_groups, attempt:metadata.attempt,
+            working_dir:&config.working_dir, strict_groups, tty:config.tty, stdin_once:config.stdin_once, attempt:metadata.attempt,
         }).await.map_err(Status::from)?;
         
         if let Err(error) = self.pod_manager.add_container_to_pod(&req.pod_sandbox_id, &container_id).await {
@@ -1357,7 +1357,9 @@ impl RuntimeService for NautilusRuntimeService {
                 req.container_id, c.status
             )));
         }
-        if c.sandbox_kind == "vm" { return Err(Status::unimplemented("guest streaming exec unavailable")); }
+        if c.sandbox_kind == "vm" && (req.tty && req.stderr || !(req.stdin || req.stdout || req.stderr)) {
+            return Err(Status::invalid_argument("invalid VM exec stream selection"));
+        }
         let url = crate::cri::streaming::exec_url(
             self.container_manager.clone(),
             self._state_manager.clone(),
@@ -1395,7 +1397,9 @@ impl RuntimeService for NautilusRuntimeService {
                 req.container_id, c.status
             )));
         }
-        if c.sandbox_kind == "vm" { return Err(Status::unimplemented("guest attach unavailable")); }
+        if c.sandbox_kind == "vm" && (req.tty && req.stderr || !(req.stdin || req.stdout || req.stderr)) {
+            return Err(Status::invalid_argument("invalid VM attach stream selection"));
+        }
         let url = crate::cri::streaming::attach_url(
             self.container_manager.clone(),
             self._state_manager.clone(),
@@ -1429,11 +1433,13 @@ impl RuntimeService for NautilusRuntimeService {
                 req.pod_sandbox_id, pod.status
             )));
         }
-        if pod.runtime_handler == "vm" { return Err(Status::unimplemented("guest port forwarding unavailable")); }
+        let ports: Vec<u16> = req.port.into_iter().map(|n| u16::try_from(n).ok().filter(|p| *p > 0)
+            .ok_or_else(|| Status::invalid_argument("invalid forwarding port"))).collect::<Result<_,_>>()?;
         let url = crate::cri::streaming::port_forward_url(
             self.container_manager.clone(),
             self._state_manager.clone(),
             req.pod_sandbox_id,
+            ports,
         )
         .await
         .map_err(Status::from)?;
