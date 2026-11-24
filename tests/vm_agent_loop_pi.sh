@@ -23,18 +23,24 @@ agent() {
     --no-context-files --session "$work/session.jsonl" --mode json \
     --tools "$1" --model bench/nautilus-bench --thinking off \
     --system-prompt 'You are a coding assistant with read and write tools. Use the requested tool.' \
-    -p "$2" >> "$work/events.jsonl"
+    -p "$2" > "$work/$1.jsonl"
 }
 agent read 'Use read to open ticket.txt and tell me the identifier it contains.'
 agent write 'Now use write to save that same identifier in answer.txt. The content must be the exact identifier from the prior read.'
 node -e 'const fs = require("node:fs");
-const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n");
-const events = lines.filter(Boolean).map(line => JSON.parse(line));
-const tools = events.filter(e => e.type === "tool_execution_end" && !e.isError)
-  .map(e => e.toolName);
-if (tools.indexOf("read") < 0 || tools.lastIndexOf("write") <= tools.indexOf("read"))
-  throw Error("agent did not read then write: " + tools.join(",") + ". " +
-    (events.filter(e => e.message?.errorMessage).at(-1)?.message.errorMessage ?? ""));
+const tools = [];
+for (const [i, file] of process.argv.slice(1).entries()) {
+  const events = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const assistant = events.filter(e => e.type === "message_end" && e.message?.role === "assistant")
+    .map(e => e.message);
+  const ends = events.filter(e => e.type === "tool_execution_end");
+  const wanted = ["read", "write"][i];
+  if (!assistant.length || assistant.at(-1).stopReason !== "stop" ||
+      assistant.some(m => m.errorMessage || ["aborted", "error"].includes(m.stopReason)) ||
+      ends.some(e => e.isError) || !ends.some(e => e.toolName === wanted))
+    throw Error("agent did not successfully complete the " + wanted + " turn");
+  tools.push(...ends.map(e => e.toolName));
+}
 if (fs.readFileSync("ticket.txt", "utf8").trim() !== fs.readFileSync("answer.txt", "utf8").trim())
   throw Error("agent wrote an incorrect identifier");
-console.log(JSON.stringify({tools, verified: true}));' "$work/events.jsonl"
+console.log(JSON.stringify({tools, verified: true}));' "$work/read.jsonl" "$work/write.jsonl"

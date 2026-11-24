@@ -73,7 +73,8 @@ def run_agent(invoke, model_url, model):
     first_tool_at is a monotonic clock reading after the first model-selected
     tool returns. tool_ms excludes model and workspace preparation time.
     """
-    workspace = invoke(["/bin/sh", "-c", SETUP, "setup", secrets.choice(MODES)]).strip()
+    target = secrets.choice(MODES)
+    workspace = invoke(["/bin/sh", "-c", SETUP, "setup", target]).strip()
     if not workspace.startswith("/tmp/nautilus-agent.") or "/" in workspace[5:]:
         raise RuntimeError("invalid guest workspace")
     messages = [{"role": "system", "content": SYSTEM},
@@ -104,7 +105,9 @@ def run_agent(invoke, model_url, model):
         tool_ms.append((after - before) * 1000)
         actions.append(tool)
         if tool == "test" and output == "PASS" and edited:
+            repairs = [action for action in actions if action != "test"]
             return dict(first_tool_at=first_tool_at, tool_ms=tool_ms, actions=actions,
+                        target=target, first_repair_correct=repairs[0] == target,
                         inference_ms=inference_ms)
         if tool == "test" and output.startswith("FAIL"):
             if not remaining:
