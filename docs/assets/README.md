@@ -7,7 +7,7 @@ foil highlights. The SVGs trace the artwork as scalable, editable paths.
 | Artwork | PNG | SVG |
 | --- | --- | --- |
 | Horizontal logo | [1272 × 416](nautilus-logo-horizontal.png) | [Vector logo](nautilus-logo-horizontal.svg) |
-| Mascot | [1254 × 1254](nautilus-mascot.png) | [Vector mascot](nautilus-mascot.svg) |
+| Mascot | [1254 × 1254](nautilus-mascot.png) · [800 × 800, 986 kB](nautilus-mascot-small.png) | [Vector mascot](nautilus-mascot.svg) |
 | Wordmark | [1086 × 362](nautilus-wordmark.png) | [Vector wordmark](nautilus-wordmark.svg) |
 
 The [favicon](favicon.ico) contains 16, 24, 32, 48, 64, 128 and 256 px versions
