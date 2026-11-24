@@ -22,6 +22,14 @@
 
 `347c4dc` 上默认 OCI 的未过滤 critest v1.31.1 为 **95 通过、1 失败、17 跳过**，耗时 245.738 秒。唯一失败是 HostNetwork=false 清理快速退出容器时缺失 systemd scope，由 #25 跟踪。单独运行随项目引入的 SPDY 测试，36 项通过。[协议及验证步骤](GUEST_OCI_PROTOCOL.md)
 
+## 2026-11-24 普通 OCI 容器快速退出
+
+在独立的 Debian 13 节点（Linux 6.12.118、systemd 257、cgroup v2）上，提交 `b7eb13f` 的 `HostNetwork is false` 用例第二轮复现清理失败。daemon 已记录 init 的退出码 0，随后 systemd 回收了其 scope，StopContainer 枚举 cgroup 进程时收到 ENOENT。
+
+提交 `ae6e5b1` 针对同一用例连续运行 8 轮，每轮均为 1 通过、0 失败、112 跳过。同一隔离 daemon 的 Unix socket 用作 runtime 和 image endpoint，完整 critest v1.31.1 为 **96 通过、0 失败、17 跳过**，耗时 237.543 秒。通过 CRI 复查，测试结束后 Pod 与容器数量均为零。另用 12 个退出码为 37 的原生 OCI 容器执行 24 次 StopContainer 和 24 次 RemoveContainer，重复停止后退出码与结束时间均保持一致。[问题记录](https://github.com/nautilus-runtime/nautilus/issues/25)
+
+此前一次验证遇到镜像仓库代理中断，得到 12 通过、84 失败、17 跳过。代理恢复后使用新的状态目录完成验证。Linux Rust 测试 97 通过、8 项默认忽略。与基线 `20d68ed` 对照，fmt 报告同样的 31 个文件，clippy 在 `-D warnings` 下报告同样的 10 项诊断。
+
 ## 2026-11-24 Pod VM 生命周期
 
 PR #10 的生产代码提交为 `af327ce`。用 Cloud Hypervisor v54.1 在 Linux 5.15.0-191 物理宿主验证，再用 v55.0 在同机的 Linux 6.12.118、systemd 257 嵌套 KVM 节点复验。每轮启动两个实验性 Pod VM，再通过真实 daemon 的 CRI socket 验证 guest boot ID、强制终止并重启 daemon、并发及重复 Stop/Remove、意外退出后的清理。[实验范围与运行命令](VM_RUNTIME.md#首版使用系统级-systemd-托管-vmm)

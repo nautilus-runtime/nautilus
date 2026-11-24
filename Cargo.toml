@@ -94,6 +94,7 @@ rand = "0.8"
 async-trait = "0.1"
 wasmtime = "26"
 wasmtime-wasi = "26"
+libcgroups = { version = "=0.8.0", default-features = false, features = ["systemd"] }
 libcontainer = { version = "=0.8.0", path = "vendor/libcontainer" }
 
 [build-dependencies]
