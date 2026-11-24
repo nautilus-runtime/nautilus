@@ -7,6 +7,7 @@ Use `rtk` for shell commands in workspaces configured with the user's local `~/.
 - Read [the architecture](docs/ARCHITECTURE.md) before changing runtime behaviour. Workload commands and kubelet use the daemon's CRI socket. The local VM probe runs directly on the node.
 - For CRI changes, compare the pinned upstream definition in [the VM contract](docs/CRI_VM_CONTRACT.md) with [the vendored protobuf](proto/cri-api/runtime/v1/api.proto). Cargo generates the Rust bindings from that file.
 - For Pod-level VMs, use [the VM design and implementation plan](docs/VM_RUNTIME.md) to find the lifecycle owner, the current implementation scope and its acceptance tests.
+- When a VM design involves a tradeoff, compare the relevant stable Kata Containers and Firecracker implementations. Record the selected behaviour, upstream versions and a CRI acceptance case in [the VM design](docs/VM_RUNTIME.md).
 - Track VM implementation in [the parent GitHub issue](https://github.com/nautilus-runtime/nautilus/issues/1). Its sub-issues carry the acceptance criteria and blocking dependencies.
 - Keep new persisted fields readable from older sled records with `#[serde(default)]`. Preserve idempotent stop and remove operations so kubelet can retry cleanup.
 

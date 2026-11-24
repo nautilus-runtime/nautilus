@@ -54,7 +54,9 @@ cargo test --locked --test vm_pod_lifecycle_test two_pods_survive_owner_restart 
 
 宿主在同一文件系统的私有目录准备目录型 OCI bundle，包括 `config.json` 和 `rootfs/`。调用 `PodVmStore::publish_bundle` 后，guest 可以在挂载点下的 `containers/<container-uuid>/` 访问它。宿主固定目录文件描述符、核对目录身份并以不可覆盖的原子重命名发布；`remove_bundle` 可以重复调用。数据目录归 Pod 所有，宿主创建后不解析 guest 可写目录内的链接来寻址宿主资源。
 
-目前导出支持宿主准备的普通目录。CRI 宿主卷需单独实现授权、只读属性和挂载回收，并在 virtiofsd 的挂载命名空间验证可见性；在此之前，VM 工作负载必须拒绝这些挂载请求。
+当前实现导出宿主准备的容器 bundle。[宿主卷交付 #21](https://github.com/nautilus-runtime/nautilus/issues/21) 接受受信任 CRI 调用方指定的任意宿主文件或目录。源路径由节点解析，guest 只收到当前 Pod 的不透明卷 ID。实现需验证只读约束、跨宿主和 guest 的实时更新以及清理后的源数据完整性。在卷交付验收前，VM handler 对 CRI 挂载请求返回错误。
+
+这个选择参考了两个稳定版本。Kata 4.4.0 的 Cloud Hypervisor 路径逐项 bind mount 到 sandbox 共享目录，只读卷先在私有挂载点设为只读，再交给 virtiofsd。Kata 对识别出的 ConfigMap 和 Secret 使用 `watchable-bind` 支持 guest 内的文件变更通知。Firecracker v1.18.0 的 drives 接口提供镜像文件或块设备，以整块盘为单位控制只读属性。Nautilus 的验收会分别检查普通文件内容更新、目录内文件替换以及投射卷通知。[Kata 文件共享](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/fs_share_linux.go#L428-L469) · [Kata 投射卷](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/container.go#L519-L548) · [Firecracker 块设备](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/block.md)
 
 恢复和状态查询核对两个服务的 InvocationID、端点和导出目录身份。Stop/Remove 先停止 VMM，再停止 virtiofsd 并回收数据。身份校验失败时保留记录供重试。系统级 systemd 和 KVM 节点可用以下命令运行双 guest 验证：
 
@@ -134,6 +136,8 @@ nautilus vm probe --vmm /opt/cloud-hypervisor/bin/cloud-hypervisor \
 | [#14 Pod CPU 和内存](https://github.com/nautilus-runtime/nautilus/issues/14) | #3 | 对照 VMM 启动配置和宿主内核的 cgroup 限制。 |
 | [#15 CRI 容器生命周期](https://github.com/nautilus-runtime/nautilus/issues/15) | #11、#12 | 经真实 daemon socket 运行 OCI 镜像，验证状态、工作区、日志和恢复。 |
 | [#16 RuntimeClass 与 kubelet](https://github.com/nautilus-runtime/nautilus/issues/16) | #13、#14、#15 | 经真实 kubelet 验证调度、流式操作与清理，运行完整 critest。 |
+
+#16 分为 [#21 宿主卷实时交付](https://github.com/nautilus-runtime/nautilus/issues/21)、[#23 Exec / Attach / PortForward](https://github.com/nautilus-runtime/nautilus/issues/23) 和 [#22 真实 kubelet 及 RuntimeClass 验收](https://github.com/nautilus-runtime/nautilus/issues/22)。前两项可独立开发，最后一项在真实集群核对两条路径。
 
 首版使用每个 Pod 专属的 virtiofsd 导出容器 bundle。宿主复用 Nautilus 拉取的 OCI 镜像，为每个容器准备独立 rootfs。对 CRI 卷只开放已能兑现权限、读写和传播语义的类型。Kata 4.4.0 的 Cloud Hypervisor 配置也默认使用 virtio-fs，并为块设备 snapshotter 提供单独的接入路径。[Kata Go runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/Makefile#L266-L267) · [Kata Rust runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime-rs/Makefile#L240) · [Kata 存储设计](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture/storage.md)
 
