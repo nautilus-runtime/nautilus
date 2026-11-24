@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 OCI、WASI 和 VM CLI
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）使用真实 daemon 验证。OCI 与 VM 的前台命令分别返回独立 stdout、stderr 与退出码 37。WASI 本地模块收到参数并返回输出与退出码 29。无输出的 OCI 命令、`-d` 后执行 `exec`、前台收到 Ctrl-C 后退出 130，以及 `--rm` 回收隐式 Pod 均通过。
+
+完整 `critest` v1.37.0 使用同一个 Unix socket 作为 Runtime 和 Image 端点，105 通过、0 失败、37 跳过，耗时 292.075 秒。套件结束时 CRI Pod 与容器数均为零。
+
 ## 2026-11-25 CRI 有限列表流
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118）运行未过滤的 `critest` v1.37.0。Runtime 和 Image 端点使用同一个 daemon socket。包含五个列表流的初版代码通过 105 项，0 失败，37 跳过，耗时 419.113 秒。
