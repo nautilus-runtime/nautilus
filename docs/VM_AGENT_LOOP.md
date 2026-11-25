@@ -54,9 +54,22 @@
 
 16 并发时，16 个 VMM 和配套 virtiofsd 合计 PSS 的三波中位数为 2,525.85 MiB，实测每个 VM 的 VMM 配额均为 1 核、512 MiB。运行节点有 12 个 vCPU。并发从 8 增到 16 时，热调用中位吞吐从 212.2 增到 271.6 次/秒，冷启动 P95 从 10.152 增到 20.504 秒。16 是此次实测的最高并发，工作负载只使用少量 guest 内存。每 20 秒采样一次的节点可用内存最低为 7.24 GiB，磁盘可用空间最低为 32.67 GiB。
 
-同一个 daemon 全程未重启。它在各档开始前的 PSS 分别为 81、86、284、347、763 MiB。全部容量波次与后续单次 Pi 验收结束后，确认 CRI 中 Pod 和容器各为 0 时，daemon PSS 为 1.15 GiB。上述每 VM 的 PSS 只计 VMM 与 virtiofsd，做节点预算时还需单独计入 daemon。此次短时观测无法给出 daemon 的长期稳定驻留量或判定内存增长的原因。
+同一个 daemon 全程未重启。它在各档开始前的 PSS 分别为 81、86、284、347、763 MiB。全部容量波次与后续单次 Pi 验收结束后，确认 CRI 中 Pod 和容器各为 0 时，daemon PSS 为 1.15 GiB。上述每 VM 的 PSS 只计 VMM 与 virtiofsd，做节点预算时还需单独计入 daemon。随后用同规模 OCI 镜像复现并修复了这类解包驻留，见下方复验。
 
 五个档位各取消一条正在执行的工具命令。49.53–64.82 毫秒内检测到同一 PID 与启动时间的 sleep 已退出，并成功在原 guest 再执行命令。测试容器以长期 sleep 作 PID 1，五例的子进程状态均为 `Z`，直至移除该容器的 PID 命名空间才释放。其他 0、1、3、7、15 个并行会话均保留原 boot ID 与先前写入的工作区内容。32 波均清除本波的 VM 与 virtiofsd 服务、owner 记录、范围内挂载、网络命名空间及 IP 租约。最终剩余带测试标签的 workload 和 sandbox 均为 0。单会话与 16 并发整波 Stop/Remove 的 P50 分别为 1.130 和 4.143 秒。
+
+### daemon 解包内存复验
+
+在 pro6000 的独立 Debian 13 节点上，用约 250 MiB、21 个压缩层的测试镜像，经真实 CRI 依次运行 4、8、16 个并发 Pod VM，每波各运行两条热调用并完成清理。对比 Release 版 `40dc126` 与修复版 `b5f9af9`，两轮均使用默认 glibc 分配器配置。
+
+| daemon | 测试开始 PSS | 清理 28 个 Pod 后 PSS | 清理后匿名 PSS |
+| --- | ---: | ---: | ---: |
+| 原整层读取 | 62.0 MiB | 447.4 MiB | 433.3 MiB |
+| 流式读取 | 31.9 MiB | 62.9 MiB | 48.8 MiB |
+
+原版的阻塞线程退出后，PSS 仍约 447 MiB。独立的分配器诊断轮在清理后观察到约 293 MiB 的空闲 arena 内存和约 39 MiB 的在用 arena 内存。只固定 glibc 的 mmap 阈值再跑同一组负载，原版清理后降到 69.0 MiB。解包此前为每个层分配文件大小的堆缓冲。修复后从同一个已打开的缓存文件分段读取并回卷，保留先处理 whiteout、再应用层的顺序。[层解包](../src/storage/unpack.rs) · [glibc 分配器参数](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html) · [跟踪任务 #63](https://github.com/nautilus-runtime/nautilus/issues/63)
+
+基准报告记录清理后的 daemon PSS 与增长量。给 `--daemon-unit` 同时传入 `--max-daemon-pss-growth-mib` 可启用回归预算。单波 8 并发用同一镜像和 96 MiB 预算验证，旧版增长 206.8 MiB，修复版增长 33.1 MiB。此数据来自 OCI 层与 CRI 生命周期对照，容量上限和长稳验证仍待单独测量。[回归基准](../tests/vm_agent_loop_benchmark.py)
 
 ## 镜像内的 Pi CLI
 
