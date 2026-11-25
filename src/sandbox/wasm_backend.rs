@@ -41,20 +41,11 @@ struct ImageCommand {
     env: Vec<(String, String)>,
 }
 
-fn local_module(reference: &str) -> Option<&Path> {
-    if let Some(path) = reference.strip_prefix("file://") {
-        return Some(Path::new(path));
-    }
-    let path = Path::new(reference);
-    let legacy_path = path
-        .extension()
-        .is_some_and(|ext| ext == "wasm" || ext == "wat")
-        && path.is_file();
-    (path.is_absolute() || legacy_path).then_some(path)
+fn module_path(reference: &str) -> &Path {
+    Path::new(reference.strip_prefix("file://").unwrap_or(reference))
 }
 
-async fn image_module(root: &Path, entrypoint: &str) -> Result<PathBuf> {
-    let path = Path::new(entrypoint);
+fn copy_image_module(root: &Path, path: &Path, destination: &Path) -> Result<()> {
     let relative = path.strip_prefix("/").map_err(|_| {
         Error::Image("WASI image module must use an absolute path inside the image".into())
     })?;
@@ -65,13 +56,18 @@ async fn image_module(root: &Path, entrypoint: &str) -> Result<PathBuf> {
     {
         return Err(Error::Image("invalid WASI image module path".into()));
     }
-    let resolved = tokio::fs::canonicalize(root.join(relative)).await?;
-    if !resolved.starts_with(root) || !tokio::fs::metadata(&resolved).await?.is_file() {
+    let root = pathrs::Root::open(root)?;
+    let mut input = root.open_subpath(
+        relative,
+        pathrs::flags::OpenFlags::O_RDONLY | pathrs::flags::OpenFlags::O_NONBLOCK,
+    )?;
+    if !input.metadata()?.is_file() {
         return Err(Error::Image(
             "WASI module must be a regular file inside the image".into(),
         ));
     }
-    Ok(resolved)
+    io::copy(&mut input, &mut std::fs::File::create(destination)?)?;
+    Ok(())
 }
 
 type WriteRecord = Pin<Box<dyn Future<Output = io::Result<usize>> + Send>>;
@@ -230,10 +226,17 @@ impl WasmBackend {
         argv: Vec<String>,
         env: Vec<(String, String)>,
         log: PathBuf,
+        packaged: bool,
     ) -> Result<i32> {
         let mut builder = WasiCtxBuilder::new();
-        builder.stdout(CriLogWriter::stream(log.clone(), "stdout"));
-        builder.stderr(CriLogWriter::stream(log, "stderr"));
+        if packaged {
+            builder.stdout(CriLogWriter::stream(log.clone(), "stdout"));
+            builder.stderr(CriLogWriter::stream(log, "stderr"));
+        } else {
+            let file = tokio::fs::OpenOptions::new().append(true).open(log).await?;
+            builder.stdout(AsyncStdoutStream::new(AsyncWriteStream::new(16 * 1024, file.try_clone().await?)));
+            builder.stderr(AsyncStdoutStream::new(AsyncWriteStream::new(16 * 1024, file)));
+        }
         builder.args(&argv);
         for (k, v) in env {
             builder.env(&k, &v);
@@ -288,14 +291,10 @@ impl SandboxBackend for WasmBackend {
     }
 
     async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
-        if let Some(path) = local_module(&spec.image_ref) {
+        let path = module_path(&spec.image_ref);
+        if spec.image_ref.starts_with("file://") || path.is_absolute() || path.is_file() {
             self.compile(path.to_owned()).await?;
             return Ok(String::new());
-        }
-        if spec.image_ref.starts_with("file://") {
-            return Err(Error::Image(
-                "file:// WASI module paths must be absolute".into(),
-            ));
         }
         let storage = self.config.runtime.state_dir.join("wasi");
         tokio::fs::create_dir_all(&storage).await?;
@@ -319,12 +318,22 @@ impl SandboxBackend for WasmBackend {
         } else {
             (&spec.entrypoint, &spec.args)
         };
-        let (module_name, entry_args) = entrypoint.split_first().ok_or_else(|| {
-            Error::Image("WASI image requires a module path in its OCI entrypoint".into())
-        })?;
-        let resolved = image_module(&tokio::fs::canonicalize(&rootfs).await?, module_name).await?;
-        self.compile(resolved.clone()).await?;
-        tokio::fs::copy(&resolved, stage.path().join("module.wasm")).await?;
+        let (module_name, entry_args, args) = if let Some((module, rest)) = entrypoint.split_first() {
+            (module, rest, args.as_slice())
+        } else {
+            let (module, rest) = args.split_first().ok_or_else(|| {
+                Error::Image("WASI image requires an executable module path".into())
+            })?;
+            (module, rest, &[][..])
+        };
+        let packaged = stage.path().join("module.wasm");
+        let source = PathBuf::from(module_name);
+        let staged = packaged.clone();
+        let root = rootfs.clone();
+        tokio::task::spawn_blocking(move || copy_image_module(&root, &source, &staged))
+            .await
+            .map_err(|e| Error::Runtime(format!("WASI module staging task failed: {e}")))??;
+        self.compile(packaged).await?;
         tokio::fs::remove_dir_all(&rootfs).await?;
         let mut env: std::collections::BTreeMap<_, _> = image
             .env
@@ -348,7 +357,9 @@ impl SandboxBackend for WasmBackend {
     }
 
     async fn start(&self, spec: &WorkloadSpec) -> Result<StartOutcome> {
-        let (path, command) = if let Some(path) = local_module(&spec.image_ref) {
+        let packaged = !spec.image_id.is_empty();
+        let (path, command) = if !packaged {
+            let path = module_path(&spec.image_ref);
             (
                 path.to_owned(),
                 ImageCommand {
@@ -403,7 +414,7 @@ impl SandboxBackend for WasmBackend {
                 if active.await.is_err() {
                     return 137;
                 }
-                match Self::run_module(engine, module, argv, env, log).await {
+                match Self::run_module(engine, module, argv, env, log, packaged).await {
                     Ok(exit) => exit,
                     Err(error) => {
                         tracing::warn!(container_id = %id, %error, "WASI workload failed");

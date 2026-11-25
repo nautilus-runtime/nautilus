@@ -9,7 +9,7 @@ Nautilus is a Linux container runtime written in Rust. It implements the Kuberne
 | Workload | Runtime handler | Input |
 | --- | --- | --- |
 | Linux container | `runc` (default) | An OCI image from a registry. Nautilus pulls and caches the layers and runs the container with libcontainer. |
-| WebAssembly command | `wasi` or `wasm` | A local WASI Preview 1 module exporting `_start`. Wasmtime runs it inside the daemon. |
+| WebAssembly command | `wasi` or `wasm` | A WASI Preview 1 module exporting `_start`, supplied as a local file or an OCI image. Wasmtime runs it inside the daemon. |
 | Pod VM | `vm` (opt-in) | OCI images run inside one Linux guest per Pod. Requires KVM, Cloud Hypervisor and virtiofsd. |
 
 OCI containers support CNI pod networking, host port mappings, resource limits, logs and exec. You can also load a Wasm policy to allow or deny pod creation, container creation or container start. The [example policy](examples/policy-deny-label) rejects workloads carrying the `nautilus.policy/deny` label.

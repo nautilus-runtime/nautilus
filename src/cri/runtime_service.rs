@@ -1350,6 +1350,16 @@ impl RuntimeService for NautilusRuntimeService {
                 self.container_manager.reopen_guest_log(&c.id).await.map_err(Status::from)?;
                 return Ok(Response::new(ReopenContainerLogResponse {}));
             }
+            if matches!(c.sandbox_kind.as_str(), "wasi" | "wasm") && !c.image_id.is_empty() {
+                if let Some(lp) = c.log_path {
+                    if let Some(parent) = std::path::Path::new(&lp).parent() {
+                        tokio::fs::create_dir_all(parent).await.map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                    tokio::fs::OpenOptions::new().create(true).append(true).open(lp).await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                return Ok(Response::new(ReopenContainerLogResponse {}));
+            }
             if let Some(lp) = c.log_path {
                 if let Some(parent) = std::path::Path::new(&lp).parent() {
                     let _ = std::fs::create_dir_all(parent);

@@ -298,6 +298,7 @@ impl ContainerManager {
         Ok(WorkloadSpec {
             id: state.id.clone(),
             image_ref: state.image.clone(),
+            image_id: state.image_id.clone(),
             cgroup_parent: String::new(),
             args: state.wasi_args.clone(),
             entrypoint: Vec::new(),
