@@ -4,6 +4,70 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 原生 OCI init Attach
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）使用 Kubernetes v1.37.2 验证 `f046243`。管道模式连接 PID 1，返回首条 stdout、独立 stderr 和 stdin 输入。客户端关闭 stdin 后，init 观察到 EOF，输出仍进入 CRI 日志，`kubectl attach` 返回退出码 37。TTY 模式首次接入时读取启动输出，窗口从 24×80 调到 33×101。断开后重连同一个 init，Ctrl-C 触发 init 的信号处理并返回退出码 42。删除测试命名空间后 CRI 中没有该命名空间的 Pod sandbox 或容器。[真实 kubelet 验收脚本](../tests/kubelet_oci_attach_acceptance.py)
+
+通过真实 CRI socket，在确认另一容器已经退出后再调用 Attach，仍收到首条输出和工作负载退出码 37。Linux 串行 Rust 测试 117 通过、0 失败、8 项忽略，覆盖有界启动输出、任一通道过载时释放整个会话和快速退出。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 297.094 秒。结束时 CRI Pod 与容器均为零。
+
+## 2026-11-25 后台工作负载自动回收
+
+在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `nautilus run -d --rm`。OCI、Registry WASI 和 VM 均返回容器 ID，并在执行结束后回收容器及其隐式 Pod。VM 执行期间可见的宿主日志目录随后删除。CLI 对旧 daemon 在创建资源前拒绝此选项。
+
+强制终止 daemon 后，WASI 运行实例在重启期间收敛为已退出并完成回收。另一次在独立测试服务中保留 OCI 原进程，记录 daemon PID 变化，并确认相同的容器 init PID 在新 daemon 就绪后仍存活。原进程退出后，新 daemon 回收其隐式 Pod、容器、宿主日志目录和 OCI 运行状态。
+
+首轮 `critest` v1.37.0 的安全上下文用例因公开 Registry CDN 拉取超时失败。预拉取该用例镜像后，对同一候选版本和 socket 重跑未过滤的 Runtime 与 Image 套件，105 通过、0 失败、37 跳过，耗时 264.137 秒，结束时 CRI Pod 和容器数均为零。Linux 串行 Rust 测试为 114 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
+
+## 2026-11-25 原生 OCI cgroup v2 用量
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）用真实 CRI socket 验证 `fde4793`。systemd 驱动下，运行负载的子进程增加约 1.53 秒 CPU 时间。其 init 和同 Pod 的空闲容器 CPU 增量均为 0。两容器工作集为 17,125,376 和 167,936 字节。CPU 与内存采样均与宿主 cgroup 文件核对，Pod 的计数等于两容器之和。
+
+cgroupfs 驱动也返回了匹配的计数。强制删除负载时，首次 RemoveContainer 收到 cgroup 回收超时。基线构建也复现了该现象。两次均经重试清理全部测试 Pod 与容器。[真实 CRI 验收脚本](../tests/native_cgroup_acceptance.py) · [跟踪问题 #57](https://github.com/nautilus-runtime/nautilus/issues/57)
+
+在 Kubernetes v1.37.2 启用 `PodAndContainerStatsFromCRI` 后，真实 kubelet 的 `/stats/summary` 分别返回忙容器 490,809,000 ns 和空闲容器 8,649,000 ns，内存工作集相差 16,908,288 字节。Linux 串行 Rust 测试 118 通过、0 失败、8 项忽略。与原生 Attach 分支联合构建后，121 通过、0 失败、8 项忽略。联合构建严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 292.595 秒。结束时 CRI Pod 与容器均为零。
+
+## 2026-11-25 独立 CLI 与 kubelet 共用 socket
+
+在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）用同一 daemon 启动真实 kubelet v1.37.2 和 Nautilus CLI。标准 CRI 清单返回 Kubernetes 创建的原生 OCI 和 VM 容器，CLI 创建的 WASI 容器仅在 CLI 清单可见。经过 65 秒，独立 WASI 容器仍可读出此前已经退出的进程日志，两个 Kubernetes Pod 保持 Running。连续十次前台 `--rm` 与一次显式删除均成功。
+
+包含 CLI 所有权和后台回收候选的联合构建运行完整 `critest` v1.37.0，同一 Unix socket 同时作为 Runtime 和 Image 端点。105 通过、0 失败、37 跳过，耗时 294.146 秒，结束时 CRI Pod 和容器数均为零。独立测试该所有权变更的 Linux Rust 串行套件为 113 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
+
+## 2026-11-25 CRI 容器生命周期事件（GetContainerEvents）
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `GetContainerEvents`。双并发 CRI 订阅端分别验证了 OCI（退出码 37）、WASI（退出码 29）、Pod VM（退出码 35）、强制删除运行中 OCI 容器与 Pod VM 级联停删五种路径，均按 `CREATED -> STARTED -> STOPPED -> DELETED` 顺序送达且携带对应 Pod 状态与同 Pod 容器快照（删除事件排除已删容器），重复 Stop/Remove 不产生重复事件，新订阅重连不回放历史事件。另一次验证直接终止运行中 VM 的 VMM，两路订阅在发起停删前均收到 STOPPED，快照将不可取得退出码的容器标为 UNKNOWN。结束时 CRI Pod 与容器数归零。
+
+真实 Kubernetes v1.37.2 kubelet 启用 `--feature-gates=EventedPLEG=true` 后，`/configz` 报告 `EventedPLEG=true`，`/metrics` 报告 `kubelet_evented_pleg_connection_success_count 1` 与 `kubelet_evented_pleg_connection_error_count 0`；OCI（exit 37）、Cloud Hypervisor v55.0 Pod VM（exit 35）、TLS Registry 打包 WASI（exit 0）以及运行中删除的 OCI Pod 均触发 `Evented PLEG: requested pod relist after container termination` 并匹配对应 Pod UID 与容器 ID。
+
+完整未过滤 `critest` v1.37.0 对隔离 daemon 的同一 Unix socket 同时测试 Runtime 和 Image 端点，**105 通过、0 失败、37 跳过**，耗时 308.946 秒，结束时 CRI Pod 与容器数均为零。首次复验因测试节点上两个 bridge 使用同一子网，四项联网用例超时。改用独立子网后整套通过。Linux 离线串行 Rust 测试 112 通过、0 失败、8 项默认忽略，含 4 项事件状态机与滞后订阅单测。全库格式检查报告 31 个文件有差异，严格 Clippy 报告与基线相同的 29 项诊断。
+
+## 2026-11-25 OCI 镜像中的 WASI 命令
+
+Kubernetes v1.37.2 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118）通过 `wasi` RuntimeClass 从 TLS Registry 拉取多架构镜像。Pod 成功退出，`kubectl logs` 返回模块输出。第二个镜像只有 OCI CMD，入口经镜像内绝对符号链接解析，`kubectl logs` 与 `nautilus logs` 返回相同内容。单独运行的 CLI 也验证了镜像默认命令参数和环境变量以及请求覆盖。
+
+日志轮转后、CRI reopen 前写入的新文件内容被保留。重启 daemon 会清理上次中断的暂存目录和无容器记录的发布目录，并保留已有容器的文件。删除 Pod 后，CRI Pod、容器和暂存目录均归零。完整 `critest` v1.37.0 联合回归见下一节。Linux 单线程 Rust 测试为 108 通过、0 失败、8 项默认忽略。全库格式检查仍有存量差异，严格 Clippy 报告与基线相同的 29 项诊断。
+
+## 2026-11-25 OCI 镜像元数据校验
+
+在 pro6000 的独立 Debian 13 节点（Linux 6.12.118）以 OCI WASI 联合构建验证，共用的 CRI ImageService 从 TLS Registry 拉取多架构镜像。分别篡改 registry 返回的 manifest digest、index 所选子 manifest 和 config JSON，三种拉取均被拒绝。使用 SHA-512 校验 config descriptor 的镜像仍以配置原始字节的 SHA-256 作为 CRI ImageID，kubelet v1.37.2 用该镜像成功启动 WASI 命令。
+
+联合构建在同一 Unix socket 同时测试 Runtime 和 Image 端点。完整 `critest` v1.37.0 为 105 通过、0 失败、37 跳过，耗时 294.798 秒，结束时 Pod 与容器列表均为空。
+
+## 2026-11-25 WASI 异步生命周期
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118）验证。忙循环和等待 WASI 时钟的模块均在仍然运行时返回容器 ID，随后从 CRI 停止并得到退出码 137。重复停止成功。前台输出和 Ctrl-C 后 `--rm` 回收通过。强制终止 daemon 后，重启在同一状态库中将原实例标为 `RuntimeRestarted`，最后 CRI Pod 和容器列表均为空。
+
+完整 `critest` v1.37.0 使用同一 Unix socket 的 Runtime 和 Image 端点，105 通过、0 失败、37 跳过，耗时 687.680 秒。随后将入口点检查保留在 Start 调用以恢复 Create 的旧语义。该修订通过 Linux 单元测试。
+
+## 2026-11-25 OCI、WASI 和 VM CLI
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）使用真实 daemon 验证。OCI 与 VM 的前台命令分别返回独立 stdout、stderr 与退出码 37。WASI 本地模块收到参数并返回输出与退出码 29。无输出的 OCI 命令、`-d` 后执行 `exec`、前台收到 Ctrl-C 后退出 130，以及 `--rm` 回收隐式 Pod 均通过。
+
+完整 `critest` v1.37.0 使用同一个 Unix socket 作为 Runtime 和 Image 端点，105 通过、0 失败、37 跳过，耗时 292.075 秒。套件结束时 CRI Pod 与容器数均为零。
+
 ## 2026-11-25 CRI 有限列表流
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118）运行未过滤的 `critest` v1.37.0。Runtime 和 Image 端点使用同一个 daemon socket。包含五个列表流的初版代码通过 105 项，0 失败，37 跳过，耗时 419.113 秒。

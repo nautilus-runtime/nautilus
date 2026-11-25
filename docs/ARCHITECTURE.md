@@ -53,6 +53,8 @@ nautilusd ── systemd ── Cloud Hypervisor ── Pod guest
 宿主 CNI ── Pod netns / TAP ── guest NIC
 ```
 
+WASI 容器由 daemon 内的 Wasmtime 执行。CRI 先持久化 Running，再放行该次执行。CPU 密集的 guest 由 epoch 驱动让出调度，等待 WASI 时钟或异步日志 I/O 的任务也能由 Stop 取消。daemon 重启时将上一实例留下的 Running 记录收敛为 RuntimeRestarted，以便 kubelet 按 Pod 重启策略处理。
+
 ### 技术栈(实际依赖)
 
 | 领域 | 选型 | 说明 |
@@ -62,7 +64,7 @@ nautilusd ── systemd ── Cloud Hypervisor ── Pod guest
 | OCI 容器引擎 | **youki libcontainer 0.8.0** | 默认进程内运行，支持外部 runc 驱动。exec 继承 OCI 安全设置的差异见[依赖说明](../vendor/libcontainer/NAUTILUS.md)。 |
 | WASM | wasmtime 26 + wasmtime-wasi 26 | 沙箱执行 + 策略引擎复用 |
 | 镜像分发 | oci-distribution 0.11(rustls) | 原生拉取,零 docker CLI 依赖 |
-| 流式协议 | spdystream-rs 0.1.2 | remotecommand v4 与 port-forward。VM 路径在 guest 内连接原 init、调整 PTY 窗口和拨号 TCP。 |
+| 流式协议 | spdystream-rs 0.1.2 | remotecommand v4 与 port-forward。原生 OCI 与 VM 均可连接原 init 和调整其 PTY 窗口，VM 的端口转发由 guest 拨号。 |
 | 状态存储 | sled 0.34 | PodState/ContainerState 持久化 |
 | OCI 类型 | oci-spec 0.10 | spec 生成 |
 | 安全 | nix / libc / libseccomp | ns、mount、cap、seccomp |
@@ -135,8 +137,7 @@ pub trait Sandbox: Send + Sync {
 - 工作负载**直 exec**(无 shell wrapper):容器 init/tenant 退出码诚实、pid1 语义正确。
 - CRI LinuxContainerResources → `ResourceLimits` → OCI `linux.resources`
   (cpu shares/quota/period/cpuset/memory,仅写非零约束)。
-- stdio:**pipe2(O_CLOEXEC) + 阻塞线程读写 + EINTR 重试**。
-  (socketpair 无法经 /proc/self/fd 重开;AsyncFd+fork 会冻结 gRPC accept loop)
+- **init stdio** 使用可经 `/proc/self/fd` 重开的 pipe，TTY 容器使用独立 devpts 内的 PTY。阻塞读写线程将输出写入 CRI 日志，并通过有界队列送给 Attach 客户端。
 - OOM 归因:start 时记录 system.slice oom_kill 基线 + 30ms 轮询 scope
   memory.events + `oom_killed()` 兜底;exit 137 → reason=OOMKilled。
 - 日志:CRI LogPath 标准落盘(RFC3339 行格式、append、rotate 后 reopen)。
@@ -215,8 +216,8 @@ hostNetwork 为 pod 级字段,容器强制继承(跳过 netns/CNI/port-publish)�
 - 后端 `SandboxBackend::exec_stream`:libcontainer tenant + socketpair stdio,
   WNOHANG reap;断连 SIGKILL 防泄漏
 
-已知限制:attach 为容器内新起 `/bin/sh`(主进程 stdio 走文件);tty 无真实 PTY;
-debug 日志级别下 libcontainer 内部行可能泄入 exec 流输出(生产 INFO 干净)。
+- 原生 OCI Attach 的 token 绑定现有 init 实例。首个输出客户端最多回读每个通道最早的 16 KiB，随后接收实时输出。stdin 同时由一个客户端使用。断开连接释放其写入权，`stdinOnce` 同时关闭 pipe 写端或向 canonical PTY 发送 EOF 字符。
+- 原生 OCI Attach 要求默认的 libcontainer 驱动，且 init 由当前 daemon 启动。原生 Exec 单独使用 tenant 进程，仍使用非终端 stdio。
 
 ### 4.7 安全
 
@@ -275,7 +276,9 @@ debug 日志级别下 libcontainer 内部行可能泄入 exec 流输出(生产 I
 - grpc-timeout 三层强制(预算下限 + tokio 定时器 + Instant 回检)
 - exec_sync 超时下沉 backend(WNOHANG + SIGKILL + reap,不泄漏进程)
 - 资源统计:container_stats / list_container_stats / pod_sandbox_stats
-  (/proc 进程级计账);`scripts/measure_memory.sh` 内存测量
+  (原生 libcontainer 容器读取所属 cgroup v2 的累计 CPU 时间、内存工作集、RSS、缺页次数与 swap。
+  CPU、内存和 I/O 压力来自同一 cgroup 的 PSI，未提供的计数不填充。
+  其他后端和 cgroup v1 节点沿用 `/proc` 进程统计);`scripts/measure_memory.sh` 内存测量
 
 ## 6. 验证体系
 

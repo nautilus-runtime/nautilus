@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
 
+mod init_io;
+pub(crate) use init_io::InitIo;
+
 /// Lifecycle driver behind the runc sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Driver {
@@ -27,19 +30,22 @@ enum Driver {
 // The saved libcontainer config owns this triplet for the lifetime of the
 // container. Validate the complete slice hierarchy reported by libcgroups.
 fn owns_systemd_scope(container: &Container, scope: &Path) -> bool {
-    let Ok(config) = container.spec() else {
-        return false;
-    };
-    let Some(triplet) = config.cgroup_path.to_str() else {
+    container
+        .spec()
+        .is_ok_and(|config| matches_systemd_scope(container.id(), &config.cgroup_path, scope))
+}
+
+fn matches_systemd_scope(id: &str, configured: &Path, scope: &Path) -> bool {
+    let Some(triplet) = configured.to_str() else {
         return false;
     };
     let Some((slice, unit)) = triplet.split_once(':') else {
         return false;
     };
-    let Some((prefix, id)) = unit.split_once(':') else {
+    let Some((prefix, configured_id)) = unit.split_once(':') else {
         return false;
     };
-    if id != container.id() {
+    if configured_id != id {
         return false;
     }
     let expected_slice = match (slice, prefix) {
@@ -63,6 +69,39 @@ fn owns_systemd_scope(container: &Container, scope: &Path) -> bool {
         .and_then(|name| crate::vm::resources::parent_slice(name).ok().flatten())
         .as_deref()
         == Some(expected_slice)
+}
+
+fn cgroup_v2_relative(path: &Path) -> Option<&Path> {
+    let relative = path.strip_prefix("/").ok()?;
+    (!relative.as_os_str().is_empty()
+        && relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))))
+    .then_some(relative)
+}
+
+fn owned_cgroup_v2(
+    id: &str,
+    configured: &Path,
+    membership: &str,
+    systemd: bool,
+) -> Option<PathBuf> {
+    let root = Path::new("/sys/fs/cgroup");
+    let member = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let member = root.join(cgroup_v2_relative(Path::new(member))?);
+    if systemd {
+        return member
+            .ancestors()
+            .find(|scope| matches_systemd_scope(id, configured, scope))
+            .map(Path::to_owned);
+    }
+
+    let relative = cgroup_v2_relative(configured)?;
+    let scope = root.join(relative);
+    (relative.file_name() == Some(std::ffi::OsStr::new(id)) && member.starts_with(&scope))
+        .then_some(scope)
 }
 
 // The init can exit between libcontainer's liveness check and its next
@@ -139,6 +178,30 @@ impl RuncBackend {
         }
     }
 
+    pub(crate) fn workload_cgroup_v2(&self, id: &str, pid: u32) -> Option<PathBuf> {
+        if self.driver() != Driver::Libcontainer {
+            return None;
+        }
+        let root = self.config.runtime.runc.root.join(id);
+        let state = OciState::load(&root).ok()?;
+        if state.id != id
+            || state.pid != Some(i32::try_from(pid).ok()?)
+            || state.bundle != self.bundle_dir(id).canonicalize().ok()?
+            || !matches!(state.status, OciStatus::Running | OciStatus::Paused)
+        {
+            return None;
+        }
+        let container = Container { state, root };
+        let config = container.spec().ok()?;
+        let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        owned_cgroup_v2(
+            id,
+            &config.cgroup_path,
+            &membership,
+            container.state.use_systemd,
+        )
+    }
+
     /// State directory for libcontainer-managed containers.
     fn lc_root(&self) -> PathBuf {
         let p = PathBuf::from(&self.config.runtime.runc.root);
@@ -159,6 +222,7 @@ impl RuncBackend {
         let systemd = self.config.runtime.runc.systemd_cgroup;
         let id = spec.id.clone();
         let bundle = self.bundle_dir(&spec.id);
+        let tty = spec.tty;
 
         // Pipes for the init's stdout/stderr: unlike socketpairs, pipe fds can
         // be RE-OPENED by the workload via /proc/self/fd (apache/nginx style
@@ -187,13 +251,11 @@ impl RuncBackend {
         let c_out_fd = c_out;
         let c_err_fd = c_err;
 
-        // CRI stdin=true: hand the init a pipe whose write half the daemon
-        // parks, so stdin-reading workloads block for input instead of
-        // EOF-exiting the moment they start (this is what keeps an attach
-        // target shell alive until a client actually attaches).
+        // Keep the pipe open before the first attach so readers can wait for
+        // interactive input. Terminal workloads use the PTY master instead.
         let mut stdin_hold: Option<std::os::fd::OwnedFd> = None;
         let mut c_in_fd: Option<std::os::fd::OwnedFd> = None;
-        if spec.open_stdin {
+        if spec.open_stdin && !tty {
             use nix::fcntl::OFlag;
             use std::os::fd::FromRawFd;
             let (r, w) = nix::unistd::pipe2(OFlag::O_CLOEXEC)
@@ -204,7 +266,7 @@ impl RuncBackend {
 
         let log_file = spec.output_dir.join(&spec.log_relpath);
 
-        let (pid, scope_mem_events, oom_baseline) = {
+        let (pid, scope_mem_events, oom_baseline, terminal) = {
             let id = id.clone();
             tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || -> Result<_> {
             let lc = |e: libcontainer::error::LibcontainerError| {
@@ -247,11 +309,16 @@ impl RuncBackend {
             if let Some(fd) = c_in_fd {
                 builder = builder.with_stdin(fd);
             }
-            let (mut container, _pty) = builder
+            let (mut container, terminal) = builder
                 .as_init(bundle.clone())
+                .with_detach(!tty)
                 .with_systemd(systemd)
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: create: {e}")))?;
+            if tty && terminal.is_none() {
+                container.delete(true).map_err(lc)?;
+                return Err(Error::Runtime(format!("libcontainer {id}: missing init PTY")));
+            }
             // The created init is already in its cgroup, but cannot execute user
             // code until start(). Capture its own path and the parent counter now.
             let pid = container.pid().map(|p| p.as_raw() as u32).unwrap_or(0);
@@ -267,31 +334,40 @@ impl RuncBackend {
                 Error::Runtime(format!("libcontainer {id}: start: {e}"))
             })?;
             container.refresh_status().map_err(lc)?;
-            // Park the open-stdin write half now that the container is
-            // actually running; a failed start must not leave a holder behind.
-            if let Some(hold) = stdin_hold {
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
-                open_stdins().lock().unwrap().insert(id.clone(), tx);
-                std::thread::spawn(move || {
-                    let w = std::fs::File::from(hold);
-                    // No data is ever written: the goal is an OPEN, idle
-                    // stdin. Releasing happens when close_container_stdin
-                    // drops the sender (stop/remove).
-                    let _ = rx.recv();
-                    drop(w);
-                });
-            }
             // AppArmor is applied by libcontainer's init process from the spec
             // profile before the workload execve; no host-side
             // attr write needed here.
-            Ok((pid, scope, baseline))
+            Ok((pid, scope, baseline, terminal))
             }))
             .await
             .map_err(|e| Error::Runtime(format!("libcontainer worker join failed: {e}")))?
         }?;
 
-        Self::spawn_output_logger(p_out, &log_file, "stdout");
-        Self::spawn_output_logger(p_err, &log_file, "stderr");
+        let terminal = terminal.map(|fd| Arc::new(std::fs::File::from(fd)));
+        let stdin = if spec.open_stdin && tty {
+            terminal.clone()
+        } else {
+            stdin_hold.map(|fd| Arc::new(std::fs::File::from(fd)))
+        };
+        let io = Arc::new(InitIo::new(pid, stdin, terminal.clone(), spec.stdin_once));
+        if let Some(terminal) = terminal {
+            Self::spawn_output_logger(terminal, &log_file, "stdout", io.clone());
+            io.stderr.finish();
+        } else {
+            Self::spawn_output_logger(
+                Arc::new(std::fs::File::from(p_out)),
+                &log_file,
+                "stdout",
+                io.clone(),
+            );
+            Self::spawn_output_logger(
+                Arc::new(std::fs::File::from(p_err)),
+                &log_file,
+                "stderr",
+                io.clone(),
+            );
+        }
+        init_ios().lock().unwrap().insert(id, io);
 
         // The persistent Pod parent also accounts for OOMs from containers
         // whose scopes are removed before the watcher can observe their exit.
@@ -329,9 +405,10 @@ impl RuncBackend {
     /// the path (ReopenContainerLog / rotation) are picked up on the next line
     /// instead of writing into an unlinked inode.
     fn spawn_output_logger(
-        pipe: std::os::fd::OwnedFd,
+        pipe: Arc<std::fs::File>,
         log_file: &std::path::Path,
         stream: &'static str,
+        io: Arc<InitIo>,
     ) {
         let log_file = log_file.to_path_buf();
         tracing::info!(stream, file = %log_file.display(), "output logger spawned");
@@ -344,7 +421,8 @@ impl RuncBackend {
         std::thread::spawn(move || {
             use std::io::Read;
 
-            let mut pipe = std::fs::File::from(pipe);
+            let mut pipe = &*pipe;
+            let output = if stream == "stdout" { &io.stdout } else { &io.stderr };
             let mut buf = [0u8; 8192];
             let mut pending: Vec<u8> = Vec::new();
             loop {
@@ -355,7 +433,10 @@ impl RuncBackend {
                     // is silently dropped.
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
-                    Ok(n) => pending.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        output.send(&buf[..n]);
+                        pending.extend_from_slice(&buf[..n]);
+                    }
                 }
                 // Flush every complete line; hold the partial tail back.
                 while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
@@ -366,6 +447,7 @@ impl RuncBackend {
             if !pending.is_empty() {
                 Self::write_log_line(&log_file, stream, &pending);
             }
+            output.finish();
         });
     }
 
@@ -378,7 +460,9 @@ impl RuncBackend {
             .append(true)
             .open(log_file)
         {
-            let _ = writeln!(f, "{ts} {stream} F {}", String::from_utf8_lossy(line));
+            // A single append keeps records from the two logger threads together.
+            let record = format!("{ts} {stream} F {}\n", String::from_utf8_lossy(line));
+            let _ = f.write_all(record.as_bytes());
         }
     }
 
@@ -435,10 +519,14 @@ impl RuncBackend {
         }).await.map_err(|e| Error::Runtime(format!("libcontainer worker: {e}")))?
     }
 
+    pub(crate) async fn has_stopped(&self, id: &str) -> Result<bool> {
+        Ok(!self.signal_if_running(id, None).await?)
+    }
+
     async fn wait_stopped(&self, id: &str, timeout: std::time::Duration) -> Result<bool> {
         let started = tokio::time::Instant::now();
         loop {
-            if !self.signal_if_running(id, None).await? {
+            if self.has_stopped(id).await? {
                 return Ok(true);
             }
             let remaining = timeout.saturating_sub(started.elapsed());
@@ -566,6 +654,7 @@ impl RuncBackend {
         ipc_ns: Option<&str>,
         pid_ns: Option<&str>,
         security: Option<&crate::sandbox::ContainerSecurity>,
+        tty: bool,
     ) -> Result<()> {
         // The workload is exec'd DIRECTLY (no shell wrapper): it is pid 1 of
         // the container (CRI semantics — ContainerPID conformance requires
@@ -680,7 +769,7 @@ impl RuncBackend {
         let mut spec = serde_json::json!({
             "ociVersion": "1.0.2",
             "process": {
-                "terminal": false,
+                "terminal": tty,
                 "user": {"uid": uid, "gid": gid},
                 "args": proc_args,
                 "env": env_full,
@@ -729,6 +818,15 @@ impl RuncBackend {
             },
             "hostname": hostname.unwrap_or("nautilus")
         });
+        if tty {
+            // libcontainer resolves /dev/ptmx through this container's devpts.
+            spec["mounts"].as_array_mut().unwrap().push(serde_json::json!({
+                "destination": "/dev/pts",
+                "type": "devpts",
+                "source": "devpts",
+                "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"]
+            }));
+        }
         // Bidirectional (rshared) volumes only propagate container-made mounts
         // back to the host when the container's mount root is SHARED as well;
         // youki defaults the root to slave, which is one-way.
@@ -865,20 +963,30 @@ fn oom_hits() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
 /// stdin pipe write-half open (through the holder thread) so stdin-reading
 /// workloads (attach shells) block instead of EOF-exiting before a client
 /// attaches. Dropping the sender closes the pipe.
-fn open_stdins()
--> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<()>>> {
-    static M: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<()>>>,
-    > = std::sync::OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+type InitIoMap = std::sync::Mutex<std::collections::HashMap<String, Arc<InitIo>>>;
+
+fn init_ios() -> &'static InitIoMap {
+    static IOS: std::sync::OnceLock<InitIoMap> = std::sync::OnceLock::new();
+    IOS.get_or_init(InitIoMap::default)
 }
 
-/// Close a container's parked open stdin (idempotent; no-op when the
-/// container never requested CRI stdin).
+pub(crate) fn init_io(container_id: &str, pid: u32) -> Option<Arc<InitIo>> {
+    init_ios()
+        .lock()
+        .unwrap()
+        .get(container_id)
+        .filter(|io| io.pid == pid)
+        .cloned()
+}
+
 pub fn close_container_stdin(container_id: &str) {
-    if let Some(tx) = open_stdins().lock().unwrap().remove(container_id) {
-        drop(tx);
+    if let Some(io) = init_ios().lock().unwrap().get(container_id) {
+        io.close_stdin();
     }
+}
+
+pub(crate) fn remove_init_io(container_id: &str) {
+    init_ios().lock().unwrap().remove(container_id);
 }
 
 /// Parse the `oom_kill` counter out of a cgroup v2 `memory.events`.
@@ -999,6 +1107,7 @@ impl RuncBackend {
             spec.ipc_ns.as_deref(),
             spec.pid_ns.as_deref(),
             spec.security.as_ref(),
+            spec.tty,
         )
         })).await.map_err(|e| Error::Runtime(format!("prepare rootfs view: {e}")))??;
         tracing::info!(container_id = %id, image = %image, "runc bundle prepared");
@@ -1017,6 +1126,9 @@ impl SandboxBackend for RuncBackend {
     }
 
     async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
+        if spec.tty && self.driver() == Driver::Exec {
+            return Err(Error::Runtime("native init TTY requires the libcontainer driver".into()));
+        }
         let bundle = self.bundle_dir(&spec.id);
         crate::storage::snapshot::begin(&bundle)?;
         let result = async {
@@ -1723,6 +1835,66 @@ mod stop_tests {
         )
         .unwrap();
         assert!(!owns_systemd_scope(&container, &scope));
+    }
+
+    #[test]
+    fn unified_systemd_stats_use_the_owned_scope_for_nested_init() {
+        let config = Path::new("kubepods-burstable.slice:nautilus:init");
+        let scope = "/kubepods.slice/kubepods-burstable.slice/nautilus-init.scope";
+        assert_eq!(
+            owned_cgroup_v2("init", config, &format!("0::{scope}/nested\n"), true),
+            Some(Path::new("/sys/fs/cgroup").join(scope.trim_start_matches('/')))
+        );
+        for member in [
+            "0::/kubepods-burstable.slice/nautilus-init.scope",
+            "0::/kubepods.slice/kubepods-burstable.slice/nautilus-peer.scope",
+            "0::/kubepods.slice/kubepods-burstable.slice/nautilus-init.scope/../other",
+            "3:cpu:/kubepods.slice/kubepods-burstable.slice/nautilus-init.scope",
+            "0::/",
+        ] {
+            assert_eq!(
+                owned_cgroup_v2("init", config, member, true),
+                None,
+                "{member}"
+            );
+        }
+        let member = "0::/system.slice/youki-init.scope";
+        assert_eq!(
+            owned_cgroup_v2("init", Path::new(":youki:init"), member, true),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/system.slice/youki-init.scope"
+            ))
+        );
+    }
+
+    #[test]
+    fn unified_cgroupfs_stats_require_the_saved_container_path() {
+        let config = Path::new("/kubepods/pod01/init");
+        for member in [
+            "2:cpuset:/other\n0::/kubepods/pod01/init\n",
+            "0::/kubepods/pod01/init/nested",
+        ] {
+            assert_eq!(
+                owned_cgroup_v2("init", config, member, false),
+                Some(PathBuf::from("/sys/fs/cgroup/kubepods/pod01/init"))
+            );
+        }
+        for member in [
+            "0::/kubepods/pod01/init-peer",
+            "0::/kubepods/pod02/init",
+            "0::/kubepods/pod01",
+            "0::/kubepods/pod01/init/..",
+        ] {
+            assert_eq!(
+                owned_cgroup_v2("init", config, member, false),
+                None,
+                "{member}"
+            );
+        }
+        assert_eq!(
+            owned_cgroup_v2("peer", config, "0::/kubepods/pod01/init", false),
+            None
+        );
     }
 
     #[tokio::test]

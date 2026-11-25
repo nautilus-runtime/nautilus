@@ -140,7 +140,15 @@ Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 
 - 使用量为 `memory.current`。工作集为使用量减 `memory.stat inactive_file`，下限为零。RSS 取匿名内存 `anon` 加内核提供的 `swapcached`；随附的 initramfs 不启用 swap，旧内核无该字段时交换缓存为零。次缺页为 `pgfault - pgmajfault`，下限为零，主缺页取 `pgmajfault`。有限的 `memory.max` 减工作集得到可用内存。无限额时省略可用内存。I/O、PSI、网络等可选字段待独立采样后提供。[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 - 验收通过真实 daemon 的四个 CRI 统计 RPC，令同一 Pod 的一个容器写入 16 MiB tmpfs 并计算摘要，另一个容器休眠。核对两者 CPU 增量、内存差异、Pod 汇总、列表的 ID 与标签组合筛选，以及另一个 guest 断连期间的可用性。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
 
+## 独立 CLI 工作负载和 kubelet
+
+Kata Containers 4.4.0 经 containerd 向 Kubernetes 提供 VM RuntimeClass。其本地工具使用 containerd 的 runtime namespace 定位工作负载，Kubernetes 使用 `k8s.io`。Firecracker v1.18.0 是 VMM，历史 Firecracker-containerd 集成在归档提交 `6052d72` 中为独立实例配置自己的 socket 和状态目录。Nautilus 在同一个 CRI socket 上持久化独立 CLI Pod 的所有权。默认 CRI 清单、批量统计和生命周期事件仅反映 kubelet 工作负载，Nautilus CLI 通过自身请求标记保留完整清单。已有状态记录缺省属于普通 CRI。 [Kata 开发指南](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/Developer-Guide.md) · [Firecracker v1.18.0](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.18.0) · [Firecracker-containerd 配置](https://github.com/firecracker-microvm/firecracker-containerd/blob/6052d721aea61a8cad3c347b0c07504ac95d869c/docs/getting-started.md)
+
+验收在同一 daemon 上启动真实 kubelet 和独立 CLI。CLI 的 WASI 命令应保持可查询，退出后可读取其输出并执行 `--rm` 回收。通过标准 CRI 清单和事件订阅确认独立 CLI 的 Pod 与容器不可见，同时核对 Kubernetes 创建的 OCI 和 VM Pod 仍能通过原 CRI 路径查询及清理。
+
 ## 交付顺序
+
+尚未交付的交互式启动、扩展指标、资源热更新与检查点按[后续优先级与设计](CRI_FOLLOW_UP.md)推进。该方案记录了与 Kata、Firecracker 的对照及每个后端的验收条件。
 
 | 事项 | 依赖 | 合并前验收 |
 | --- | --- | --- |

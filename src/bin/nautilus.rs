@@ -14,11 +14,13 @@ use nautilus::proto::runtime::v1::{
     ContainerConfig, ContainerMetadata, ContainerState, ContainerStatsRequest,
     ContainerStatusRequest, ContainerStatusResponse, CreateContainerRequest,
     CreateContainerResponse, ExecSyncRequest, ImageSpec, ImageStatusRequest, KeyValue,
-    LinuxContainerConfig, LinuxContainerResources, ListContainerStatsRequest,
+    LinuxContainerConfig, LinuxContainerResources, LinuxContainerSecurityContext,
+    LinuxPodSandboxConfig, LinuxSandboxSecurityContext, ListContainerStatsRequest,
     ListContainersRequest, ListImagesRequest, PullImageRequest,
     RemoveContainerRequest, RemoveImageRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
     StartContainerRequest, StatusRequest, StopContainerRequest, ImageFsInfoRequest,
-    ContainerFilter, PodSandboxConfig, PodSandboxMetadata, PodSandboxStatusRequest, VersionRequest,
+    ContainerFilter, NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxMetadata,
+    PodSandboxStatusRequest, VersionRequest,
 };
 use hyper_util::rt::TokioIo;
 use std::path::PathBuf;
@@ -77,7 +79,7 @@ enum VmCommand {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a command in a new container (defaults to detached, like `docker run -d`)
+    /// Run a command in a new container
     Run {
         /// Container name (generated when omitted)
         #[arg(long)]
@@ -100,8 +102,8 @@ enum Commands {
         /// CPUs in which to allow execution (e.g. "0", "0-2")
         #[arg(long)]
         cpuset_cpus: Option<String>,
-        /// Sandbox runtime handler: runc | wasi | wasm
-        #[arg(long, default_value = "runc")]
+        /// Sandbox runtime handler: runc | wasi | wasm | vm
+        #[arg(long, default_value = "")]
         runtime: String,
         /// Override the image entrypoint
         #[arg(long)]
@@ -109,10 +111,13 @@ enum Commands {
         /// Working directory inside the container
         #[arg(short = 'w', long = "workdir")]
         workdir: Option<String>,
-        /// Wait for exit, print captured output, then remove (foreground-like)
+        /// Start in the background and print the container ID
+        #[arg(short, long)]
+        detach: bool,
+        /// Remove the container and sandbox after the command exits
         #[arg(long)]
         rm: bool,
-        /// Image reference (OCI image; wasm modules use a file:// path instead)
+        /// OCI image reference or a local WASI module path
         image: String,
         /// Command + arguments (overrides the image CMD; entrypoint kept unless --entrypoint)
         #[arg(trailing_var_arg = true)]
@@ -182,13 +187,11 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    // Piping into `head` closes stdout early; without this the default
-    // SIGPIPE-ignored Rust behaviour turns EPIPE into a println! panic.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
     let cli = Cli::parse();
+    if !matches!(&cli.command, CliCommand::Cri(command) if matches!(**command, Commands::Run { detach: false, .. })) {
+        // Foreground run must still reach container cleanup when stdout closes.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -203,8 +206,22 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-type RClient = RuntimeServiceClient<Channel>;
+type RClient =
+    RuntimeServiceClient<tonic::service::interceptor::InterceptedService<Channel, Standalone>>;
 type IClient = ImageServiceClient<Channel>;
+
+#[derive(Clone)]
+struct Standalone;
+
+impl tonic::service::Interceptor for Standalone {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request.metadata_mut().insert(
+            nautilus::cri::STANDALONE_METADATA,
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        Ok(request)
+    }
+}
 
 async fn connect(socket: &str) -> Result<(RClient, IClient), String> {
     let p = socket.to_string();
@@ -220,7 +237,7 @@ async fn connect(socket: &str) -> Result<(RClient, IClient), String> {
             }
         }));
     Ok((
-        RuntimeServiceClient::new(channel.clone()),
+        RuntimeServiceClient::with_interceptor(channel.clone(), Standalone),
         ImageServiceClient::new(channel),
     ))
 }
@@ -256,15 +273,16 @@ async fn dispatch(cli: Cli) -> Result<u8, String> {
             runtime,
             entrypoint,
             workdir,
+            detach,
             rm,
             image,
             command,
         } => {
-            cmd_run(
+            return cmd_run(
                 &mut r, &mut i, name, env, label, publish, memory, cpus, cpuset_cpus,
-                runtime, entrypoint, workdir, rm, image, command,
+                runtime, entrypoint, workdir, detach, rm, image, command,
             )
-            .await?
+            .await;
         }
         Commands::Ps { all, last } => cmd_ps(&mut r, all, last).await?,
         Commands::Images { repo } => cmd_images(&mut i, repo).await?,
@@ -307,8 +325,9 @@ fn parse_memory(s: &str) -> Result<i64, String> {
     };
     num.trim()
         .parse::<i64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("invalid memory size: {}", s))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("invalid memory size: {}", s))
 }
 
 fn short(id: &str) -> String {
@@ -416,11 +435,8 @@ async fn container_status(r: &mut RClient, id: &str) -> Result<ContainerStatusRe
     Ok(resp)
 }
 
-/// Make sure `image` is usable by the daemon. Returns the reference the caller
-/// must use for container creation: normally None (keep as-is), but when the
-/// user passed a local image-ID prefix (`nautilus run a952f42cef39`, docker
-/// semantics) the canonical repo tag of that image is returned instead.
-async fn ensure_image(i: &mut IClient, image: &str) -> Result<Option<String>, String> {
+/// Prepare the image and return a replacement reference when needed.
+async fn ensure_image(i: &mut IClient, image: &str, pin: bool) -> Result<Option<String>, String> {
     let st = i
         .image_status(Request::new(ImageStatusRequest {
             image: Some(ImageSpec {
@@ -432,13 +448,13 @@ async fn ensure_image(i: &mut IClient, image: &str) -> Result<Option<String>, St
         .await
         .map_err(status)?
         .into_inner();
-    if st.image.is_some() {
-        return Ok(None);
+    if let Some(found) = st.image {
+        return Ok(pin.then_some(found.id));
     }
     // Docker parity: a hex prefix matches a locally-pulled image by its
     // config-digest IMAGE ID — never treat it as a registry name.
     if is_image_id_prefix(image) {
-        return match resolve_local_id(i, image).await {
+        return match resolve_local_id(i, image, pin).await {
             Ok(Some(resolved)) => {
                 eprintln!("Resolved '{}' to local image {}", image, resolved);
                 Ok(Some(resolved))
@@ -451,7 +467,7 @@ async fn ensure_image(i: &mut IClient, image: &str) -> Result<Option<String>, St
         };
     }
     eprintln!("Unable to find image '{}' locally; pulling", image);
-    pull_image(i, image).await.map(|_| None)
+    pull_image(i, image).await.map(|id| pin.then_some(id))
 }
 
 /// True when `s` looks like a truncated content digest: 4+ hex chars.
@@ -461,7 +477,7 @@ fn is_image_id_prefix(s: &str) -> bool {
 
 /// Find the unique local image whose config-digest ID starts with `prefix`.
 /// Ambiguous or missing matches produce docker-style errors.
-async fn resolve_local_id(i: &mut IClient, prefix: &str) -> Result<Option<String>, String> {
+async fn resolve_local_id(i: &mut IClient, prefix: &str, pin: bool) -> Result<Option<String>, String> {
     let resp = i
         .list_images(Request::new(ListImagesRequest::default()))
         .await
@@ -471,12 +487,14 @@ async fn resolve_local_id(i: &mut IClient, prefix: &str) -> Result<Option<String
     for img in &resp.images {
         let id = img.nautilus_image_id.trim_start_matches("sha256:");
         if id.starts_with(prefix) {
-            hits.push(
+            hits.push(if pin {
+                img.id.clone()
+            } else {
                 img.repo_tags
                     .first()
                     .cloned()
-                    .unwrap_or_else(|| img.id.clone()),
-            );
+                    .unwrap_or_else(|| img.id.clone())
+            });
         }
     }
     match hits.len() {
@@ -523,10 +541,27 @@ async fn cmd_run(
     runtime: String,
     entrypoint: Option<String>,
     workdir: Option<String>,
+    detach: bool,
     rm: bool,
     image: String,
     command: Vec<String>,
-) -> Result<(), String> {
+) -> Result<u8, String> {
+    let is_vm = runtime == "vm";
+    let is_wasi = matches!(runtime.as_str(), "wasm" | "wasi");
+    let auto_remove = detach && rm;
+    if is_vm && !publish.is_empty() {
+        return Err("the VM runtime does not support --publish".into());
+    }
+    if is_vm || auto_remove {
+        let capabilities = r.status(StatusRequest { verbose: auto_remove }).await.map_err(status)?
+            .into_inner();
+        if is_vm && !capabilities.runtime_handlers.iter().any(|handler| handler.name == "vm") {
+            return Err("VM runtime is unavailable. Enable and configure the VM handler on the daemon node".into());
+        }
+        if auto_remove && capabilities.info.get(nautilus::cri::AUTO_REMOVE_ANNOTATION).map(String::as_str) != Some("true") {
+            return Err("The daemon does not support detached automatic removal. Upgrade nautilusd or omit --rm".into());
+        }
+    }
     let env = kv_pairs(env, "env")?;
     let mut labels = kv_pairs(label, "label")?;
 
@@ -568,40 +603,17 @@ async fn cmd_run(
         }
     }
 
-    // wasm/wasi workloads reference local file:// modules — no registry pull.
-    let mut image = image;
-    if runtime.is_empty() || runtime == "runc" {
-        if let Some(resolved) = ensure_image(i, &image).await? {
-            image = resolved;
-        }
-    }
-
     let memory_limit = memory.as_deref().map(parse_memory).transpose()?;
 
-    // Implicit single-container sandbox.
-    let uid = uuid::Uuid::new_v4().to_string();
-    let pod = PodSandboxConfig {
-        metadata: Some(PodSandboxMetadata {
-            name: cname.clone(),
-            uid,
-            namespace: "ctl".to_string(),
-            attempt: 0,
-        }),
-        labels: [(CTL_LABEL.to_string(), "true".to_string())].into_iter().collect(),
-        ..Default::default()
-    };
-    // Empty handler selects the daemon default ("runc").
-    let handler = if runtime == "runc" { String::new() } else { runtime.clone() };
-    let pod_id = r
-        .run_pod_sandbox(Request::new(RunPodSandboxRequest {
-            config: Some(pod),
-            runtime_handler: handler,
-        }))
-        .await
-        .map_err(status)?
-        .into_inner()
-        .pod_sandbox_id;
-
+    if memory_limit.is_some_and(|limit| limit <= 0) {
+        return Err("memory limit must be positive".into());
+    }
+    if cpus.is_some_and(|count| !count.is_finite() || count < 0.00001 || count >= i64::MAX as f64 / 100_000.0) {
+        return Err("CPU limit must be a positive number of cores".into());
+    }
+    if is_vm && cpuset_cpus.as_deref().is_some_and(|cpus| !cpus.is_empty()) {
+        return Err("the VM runtime does not support --cpuset-cpus".into());
+    }
     let resources = LinuxContainerResources {
         cpu_period: if cpus.is_some() { 100_000 } else { 0 },
         cpu_quota: cpus.map(|c| (c * 100_000f64) as i64).unwrap_or(0),
@@ -609,6 +621,58 @@ async fn cmd_run(
         cpuset_cpus: cpuset_cpus.unwrap_or_default(),
         ..Default::default()
     };
+    // OCI workloads and packaged WASI modules share the image cache.
+    let mut image = image;
+    let is_local_module = is_wasi && (image.starts_with("file://") || image.starts_with('/')
+        || std::path::Path::new(&image).is_file());
+    if !is_local_module && matches!(runtime.as_str(), "" | "runc" | "vm" | "wasi" | "wasm") {
+        if let Some(resolved) = ensure_image(i, &image, is_wasi).await? {
+            image = resolved;
+        }
+    }
+
+    let namespaces = is_vm.then(|| NamespaceOption {
+        pid: NamespaceMode::Container as i32,
+        ..Default::default()
+    });
+    let auto_remove_annotations: std::collections::HashMap<String, String> = auto_remove
+        .then(|| [(nautilus::cri::AUTO_REMOVE_ANNOTATION.to_string(), "true".to_string())].into_iter().collect())
+        .unwrap_or_default();
+    // For VM workloads the sandbox receives the CPU and RAM limits at boot.
+    let pod = PodSandboxConfig {
+        metadata: Some(PodSandboxMetadata {
+            name: cname.clone(),
+            uid: uuid::Uuid::new_v4().to_string(),
+            namespace: "ctl".to_string(),
+            attempt: 0,
+        }),
+        labels: [(CTL_LABEL.to_string(), "true".to_string())].into_iter().collect(),
+        annotations: auto_remove_annotations.clone(),
+        linux: namespaces.clone().map(|options| LinuxPodSandboxConfig {
+            security_context: Some(LinuxSandboxSecurityContext {
+                namespace_options: Some(options),
+                ..Default::default()
+            }),
+            resources: Some(resources.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut interrupt = if detach {
+        None
+    } else {
+        Some(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| e.to_string())?)
+    };
+    let pod_id = r
+        .run_pod_sandbox(Request::new(RunPodSandboxRequest {
+            config: Some(pod),
+            runtime_handler: runtime,
+        }))
+        .await
+        .map_err(status)?
+        .into_inner()
+        .pod_sandbox_id;
 
     let ctr_config = ContainerConfig {
         metadata: Some(ContainerMetadata {
@@ -630,15 +694,21 @@ async fn cmd_run(
             .collect(),
         working_dir: workdir.unwrap_or_default(),
         labels: labels.into_iter().collect(),
+        annotations: auto_remove_annotations,
         linux: Some(LinuxContainerConfig {
             resources: Some(resources),
+            security_context: namespaces.map(|options| LinuxContainerSecurityContext {
+                namespace_options: Some(options),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
     };
 
     let mut created_id = None;
-    let workload: Result<(), String> = async {
+    let mut started = false;
+    let workload = async {
         let response: CreateContainerResponse = r.create_container(Request::new(CreateContainerRequest {
             pod_sandbox_id: pod_id.clone(),
             config: Some(ctr_config),
@@ -649,39 +719,110 @@ async fn cmd_run(
             return Err("daemon returned an empty container id".into());
         }
         created_id = Some(id.clone());
-        r.start_container(Request::new(StartContainerRequest { container_id: id.clone() }))
-            .await.map_err(status)?;
-        println!("{id}");
-        if rm {
-            wait_exit(r, &id).await?;
-            // A batch backend may finish without creating a log file.
-            let _ = print_log_tail(r, &id, 0).await;
+        let launch = r.start_container(Request::new(StartContainerRequest { container_id: id.clone() }));
+        let reply = if let Some(interrupt) = interrupt.as_mut() {
+            tokio::select! {
+                biased;
+                _ = interrupt.recv() => return Ok(130),
+                reply = launch => reply,
+            }
+        } else {
+            launch.await
+        };
+        reply.map_err(status)?;
+        started = true;
+        if let Some(interrupt) = interrupt.as_mut() {
+            tokio::select! {
+                result = follow_workload(r, &id, !is_local_module, !is_vm && !is_wasi) => result,
+                _ = interrupt.recv() => {
+                    r.stop_container(Request::new(StopContainerRequest {
+                        container_id: id.clone(),
+                        timeout: if is_wasi { 0 } else { 10 },
+                    })).await.map_err(status)?;
+                    Ok(130)
+                }
+            }
+        } else {
+            println!("{id}");
+            Ok(0)
         }
-        Ok(())
     }.await;
-    if rm || workload.is_err() {
-        let condition = if workload.is_ok() { Some("exited") } else { Some("not-running") };
-        let cleanup = remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await.map(|_| ());
+    if !started || (rm && !detach) {
+        let condition = if started && workload.is_ok() { Some("exited") } else { None };
+        let cleanup = remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await;
         return match (workload, cleanup) {
             (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup of sandbox {pod_id} failed: {cleanup}")),
-            (result, Ok(())) => result,
-            (Ok(()), error) => error,
+            (result, Ok(_)) => result,
+            (Ok(_), Err(error)) => Err(error),
         };
     }
-    Ok(())
+    workload
 }
 
-async fn wait_exit(r: &mut RClient, id: &str) -> Result<(), String> {
+async fn follow_workload(
+    r: &mut RClient,
+    id: &str,
+    cri_log: bool,
+    wait_for_native_log: bool,
+) -> Result<u8, String> {
+    let mut offset = 0;
+    let mut pending = Vec::new();
+    let mut saw_exit = false;
     loop {
-        let exited = container_status(r, id)
+        let snapshot = container_status(r, id)
             .await?
             .status
-            .map(|s| s.state == ContainerState::ContainerExited as i32)
-            .unwrap_or(true);
-        if exited {
-            return Ok(());
+            .ok_or_else(|| "daemon returned no container status".to_string())?;
+        if !snapshot.log_path.is_empty() {
+            let data = read_log(&snapshot.log_path, offset).await?;
+            offset += data.len() as u64;
+            if cri_log {
+                pending.extend(data);
+                let consumed = pending.iter().rposition(|byte| *byte == b'\n').map_or(0, |i| i + 1);
+                for line in pending[..consumed].split_inclusive(|byte| *byte == b'\n') {
+                    write_cri_log_line(line);
+                }
+                pending.drain(..consumed);
+            } else {
+                write_stdout(&data);
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if snapshot.state == ContainerState::ContainerUnknown as i32 {
+            return Err(format!("workload {id} is no longer reachable"));
+        }
+        if snapshot.state == ContainerState::ContainerExited as i32 {
+            if saw_exit || !wait_for_native_log {
+                write_stdout(&pending);
+                return Ok(u8::try_from(snapshot.exit_code).unwrap_or(125));
+            }
+            // The native backend's output pipes drain on separate threads.
+            saw_exit = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn write_cri_log_line(line: &[u8]) {
+    let mut fields = line.splitn(4, |&byte| byte == b' ');
+    let timestamp = fields.next();
+    let (Some(stream @ (b"stdout" | b"stderr")), Some(tag @ (b"F" | b"P")), Some(message)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        write_stdout(line);
+        return;
+    };
+    if !timestamp.is_some_and(|t| t.ends_with(b"Z") && t.contains(&b'T')) {
+        write_stdout(line);
+        return;
+    }
+    let message = if tag == b"P" { message.strip_suffix(b"\n").unwrap_or(message) } else { message };
+    if stream == b"stderr" {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(message);
+        let _ = err.flush();
+    } else {
+        write_stdout(message);
     }
 }
 
@@ -902,6 +1043,7 @@ async fn remove_implicit_workload(
             request.metadata_mut().insert("nautilus-remove-if", tonic::metadata::MetadataValue::from_static(value));
         }
         match r.remove_container(request).await {
+            Err(error) if error.code() == tonic::Code::NotFound => {}
             Err(error) if condition == Some("exited") && error.code() == tonic::Code::FailedPrecondition => return Ok(false),
             result => { result.map_err(status)?; }
         }
@@ -979,9 +1121,11 @@ async fn cmd_prune(r: &mut RClient) -> Result<(), String> {
 
 async fn read_log(path: &str, offset: u64) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut f = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| format!("log not readable (started? permissions?): {}: {}", path, e))?;
+    let mut f = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read log {path}: {e}")),
+    };
     let len = f.metadata().await.map_err(|e| e.to_string())?.len();
     if len <= offset {
         return Ok(Vec::new());
@@ -1005,29 +1149,21 @@ async fn log_path_of(r: &mut RClient, id: &str) -> Result<String, String> {
     }
 }
 
-async fn print_log_tail(r: &mut RClient, id: &str, tail: usize) -> Result<(), String> {
-    let path = log_path_of(r, id).await?;
-    let data = read_log(&path, 0).await?;
-    let text = String::from_utf8_lossy(&data);
-    let lines: Vec<&str> = text.lines().collect();
-    let start = if tail > 0 { lines.len().saturating_sub(tail) } else { 0 };
-    for l in &lines[start..] {
-        println!("{}", l);
-    }
-    Ok(())
-}
-
 async fn cmd_logs(r: &mut RClient, target: String, follow: bool, tail: usize) -> Result<(), String> {
     let c = resolve_container(r, &target).await?;
     let path = log_path_of(r, &c.id).await?;
+    let cri_log = c.image_id.starts_with("sha256:");
 
     if !follow {
         let data = read_log(&path, 0).await?;
-        let text = String::from_utf8_lossy(&data);
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&[u8]> = data.split_inclusive(|byte| *byte == b'\n').collect();
         let start = if tail > 0 { lines.len().saturating_sub(tail) } else { 0 };
-        for l in &lines[start..] {
-            println!("{}", l);
+        for line in &lines[start..] {
+            if cri_log {
+                write_cri_log_line(line);
+            } else {
+                println!("{}", String::from_utf8_lossy(line).trim_end_matches('\n'));
+            }
         }
         return Ok(());
     }
@@ -1035,22 +1171,29 @@ async fn cmd_logs(r: &mut RClient, target: String, follow: bool, tail: usize) ->
     // Follow: incremental reads until the container exits and output drains.
     let mut offset: u64 = if tail > 0 {
         let data = read_log(&path, 0).await?;
-        let text = String::from_utf8_lossy(&data);
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&[u8]> = data.split_inclusive(|byte| *byte == b'\n').collect();
         let start = lines.len().saturating_sub(tail);
         let skip: u64 = lines[..start]
             .iter()
-            .map(|l| l.len() as u64 + 1)
+            .map(|l| l.len() as u64)
             .sum();
         skip.min(data.len() as u64)
     } else {
         0
     };
+    let mut pending = Vec::new();
     loop {
         let data = read_log(&path, offset).await?;
-        if !data.is_empty() {
-            offset += data.len() as u64;
+        offset += data.len() as u64;
+        if !cri_log {
             write_stdout(&data);
+        } else if !data.is_empty() {
+            pending.extend(data);
+            let consumed = pending.iter().rposition(|byte| *byte == b'\n').map_or(0, |i| i + 1);
+            for line in pending[..consumed].split_inclusive(|byte| *byte == b'\n') {
+                write_cri_log_line(line);
+            }
+            pending.drain(..consumed);
         }
         let exited = container_status(r, &c.id)
             .await
@@ -1060,7 +1203,12 @@ async fn cmd_logs(r: &mut RClient, target: String, follow: bool, tail: usize) ->
             .unwrap_or(true);
         if exited {
             let rest = read_log(&path, offset).await?;
-            if !rest.is_empty() {
+            if cri_log {
+                pending.extend(rest);
+                for line in pending.split_inclusive(|byte| *byte == b'\n') {
+                    write_cri_log_line(line);
+                }
+            } else if !rest.is_empty() {
                 write_stdout(&rest);
             }
             break;

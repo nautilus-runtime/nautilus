@@ -9,7 +9,7 @@ Nautilus is a Linux container runtime written in Rust. It implements the Kuberne
 | Workload | Runtime handler | Input |
 | --- | --- | --- |
 | Linux container | `runc` (default) | An OCI image from a registry. Nautilus pulls and caches the layers and runs the container with libcontainer. |
-| WebAssembly command | `wasi` or `wasm` | A local WASI Preview 1 module exporting `_start`. Wasmtime runs it inside the daemon. |
+| WebAssembly command | `wasi` or `wasm` | A WASI Preview 1 module exporting `_start`, supplied as a local file or an OCI image. Wasmtime runs it inside the daemon. |
 | Pod VM | `vm` (opt-in) | OCI images run inside one Linux guest per Pod. Requires KVM, Cloud Hypervisor and virtiofsd. |
 
 OCI containers support CNI pod networking, host port mappings, resource limits, logs and exec. You can also load a Wasm policy to allow or deny pod creation, container creation or container start. The [example policy](examples/policy-deny-label) rejects workloads carrying the `nautilus.policy/deny` label.
@@ -46,12 +46,12 @@ sudo nautilus version
 sudo nautilus run --rm busybox:1.36 echo 'Hello from Nautilus'
 ```
 
-Nautilus pulls the image on first use and prints the container ID and its output. With `--rm`, the CLI waits for the command to finish and removes both the container and the sandbox it created. The image stays cached for the next run.
+Nautilus pulls the image on first use and follows the command output. With `--rm`, the CLI waits for the command to finish and removes both the container and the sandbox it created. With `-d --rm`, the CLI prints the container ID and the daemon removes the workload and sandbox after exit. The image stays cached for the next run.
 
-The CLI starts containers in the background by default. This example starts a container named `demo`, reads its logs and runs a second command inside it.
+The CLI follows workload output and returns the workload exit code by default. Pass `-d` to start in the background and print the container ID.
 
 ```sh
-sudo nautilus run --name demo busybox:1.36 sh -c 'while true; do echo tick; sleep 2; done'
+sudo nautilus run -d --name demo busybox:1.36 sh -c 'while true; do echo tick; sleep 2; done'
 sudo nautilus ps
 sudo nautilus logs --tail 5 demo
 sudo nautilus exec demo uname -m
@@ -67,7 +67,28 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads the module from its local filesystem. WASI stdout and stderr go to the daemon log, which you can read with `sudo journalctl -u nautilusd`.
+The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-d` for background execution and add `--rm` to reclaim the workload when it exits.
+
+For Kubernetes, package the module in an OCI image and use its absolute path as the entrypoint. Build for the Linux node platform. In this example, set `IMAGE` to a registry tag that your node can pull.
+
+```sh
+docker buildx build --platform linux/amd64 --push -t "$IMAGE" examples/wasi-command
+kubectl apply -f examples/wasi-command/runtimeclass.yaml
+kubectl run wasi-hello --image="$IMAGE" --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"nautilus-wasi","automountServiceAccountToken":false}}'
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/wasi-hello --timeout=90s
+kubectl logs wasi-hello
+```
+
+### Run a container in a Pod VM
+
+On a node with the VM handler enabled, run a Linux image inside a new VM.
+
+```sh
+sudo nautilus run --rm --runtime vm --memory 512m --cpus 1 busybox:1.36 uname -r
+```
+
+Kubernetes workloads select the same handler using [RuntimeClass](docs/VM_RUNTIMECLASS.md).
 
 ## Use CRI tools
 

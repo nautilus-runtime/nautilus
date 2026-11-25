@@ -9,17 +9,16 @@ use std::{io, path::Path, time::Duration};
 
 impl ContainerManager {
     async fn save_guest(&self, state: &ContainerState) -> Result<()> {
+        let mut containers = self.containers.write().await;
         self.state_manager.save_container_state(state).await?;
-        self.containers
-            .write()
-            .await
-            .insert(state.id.clone(), state.clone());
+        containers.insert(state.id.clone(), state.clone());
         Ok(())
     }
 
     async fn forget_guest(&self, id: &str) -> Result<()> {
+        let mut containers = self.containers.write().await;
+        containers.remove(id);
         self.state_manager.delete_container_state(id).await?;
-        self.containers.write().await.remove(id);
         Ok(())
     }
 
@@ -158,15 +157,19 @@ impl ContainerManager {
         let reply = match backend.call(id, op).await {
             Ok(reply) => reply,
             Err(e) => {
-                if observing
-                    && !matches!(
+                if observing {
+                    let owner =
+                        crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"));
+                    if matches!(owner.status(&state.pod_id).await, Ok(None)) {
+                        self.mark_guest_lost(&mut state).await?;
+                    } else if !matches!(
                         state.status,
                         ContainerStatus::Unknown | ContainerStatus::Stopped
-                    )
-                {
-                    state.status = ContainerStatus::Unknown;
-                    state.finish_reason = "ContainerStatusUnknown".into();
-                    self.save_guest(&state).await?;
+                    ) {
+                        state.status = ContainerStatus::Unknown;
+                        state.finish_reason = "ContainerStatusUnknown".into();
+                        self.save_guest(&state).await?;
+                    }
                 }
                 return Err(e);
             }
@@ -194,9 +197,8 @@ impl ContainerManager {
         }
     }
 
-    pub(crate) async fn observed_containers(&self) -> Result<Vec<ContainerState>> {
+    pub(crate) async fn observed_containers(&self, records: Vec<ContainerState>) -> Result<Vec<ContainerState>> {
         use futures::TryStreamExt;
-        let records = self.state_manager.list_containers().await?;
         stream::iter(records)
             .map(|state| async move {
                 if state
@@ -225,21 +227,26 @@ impl ContainerManager {
         self.forget_guest(&state.id).await
     }
 
-    /// Called only after the owner's VMM shutdown is confirmed. No host waitpid
-    /// or synthesized guest exit code is available for a lost container.
+    // The VMM is gone and the guest exit code is unavailable.
+    async fn mark_guest_lost(&self, state: &mut ContainerState) -> Result<()> {
+        if let Some(vm) = state.vm.as_mut() {
+            if state.status != ContainerStatus::Stopped {
+                state.status = ContainerStatus::Unknown;
+                state.finish_reason = "ContainerStatusUnknown".into();
+                state.exit_code = None;
+            }
+            vm.logs_complete = true;
+            self.save_guest(state).await?;
+        }
+        Ok(())
+    }
+
+    /// Called only after the owner's VMM shutdown is confirmed.
     pub(crate) async fn guest_pod_lost(&self, pod: &str) -> Result<()> {
         for record in self.state_manager.list_containers_in_pod(pod).await? {
             let _guard = self.vm_operations.lock(&record.id).await;
             if let Some(mut state) = self.state_manager.get_container_state(&record.id).await? {
-                if let Some(vm) = state.vm.as_mut() {
-                    if state.status != ContainerStatus::Stopped {
-                        state.status = ContainerStatus::Unknown;
-                        state.finish_reason = "ContainerStatusUnknown".into();
-                        state.exit_code = None;
-                    }
-                    vm.logs_complete = true;
-                    self.save_guest(&state).await?;
-                }
+                self.mark_guest_lost(&mut state).await?;
             }
         }
         Ok(())
@@ -248,6 +255,14 @@ impl ContainerManager {
     async fn remove_guest_locked(&self, state: &ContainerState) -> Result<()> {
         let backend = VmBackend::new(self._config.clone(), &state.pod_id);
         backend.remove(&state.id).await?;
+        let captured = self
+            ._config
+            .storage
+            .container_dir
+            .join(format!("{}-out", state.id));
+        if tokio::fs::try_exists(&captured).await? {
+            tokio::fs::remove_dir_all(captured).await?;
+        }
         self.forget_guest(&state.id).await
     }
 
@@ -267,6 +282,8 @@ impl ContainerManager {
                     let reply = backend.call(id, Operation::Stop { timeout_ms: 0 }).await?;
                     observe(&mut state, reply)?;
                     self.sync_guest(&mut state, &backend, true, true).await?;
+                } else {
+                    self.mark_guest_lost(&mut state).await?;
                 }
             }
             self.remove_guest_locked(&state).await?;

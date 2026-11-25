@@ -71,7 +71,7 @@ pod_ip() { ct inspect "$1" | sed -n 's/.*"Ip": "\(.*\)".*/\1/p' | head -1; }
 
 echo "=== nginx: HTTP serving across netns ==="
 must ct pull docker.io/library/nginx:latest
-NG=$(ct run --name ngx1 docker.io/library/nginx:latest)
+NG=$(ct run -d --name ngx1 docker.io/library/nginx:latest)
 sleep 3
 NG_IP=$(pod_ip ngx1)
 [ -n "$NG_IP" ] || { echo "WL-HARDFAIL: no pod ip for nginx"; exit 1; }
@@ -85,7 +85,7 @@ expect "nginx alive after restart" "Welcome to nginx" \
     ssh $SSHOPTS "$HOST" "curl -s --max-time 5 http://$NG_IP/"
 
 echo "=== redis: kv roundtrip ==="
-must ct run --name rds1 docker.io/library/redis:7-alpine
+must ct run -d --name rds1 docker.io/library/redis:7-alpine
 sleep 2
 expect "redis ping -> PONG" PONG ct exec rds1 redis-cli ping
 expect "redis set/get" "^v1$" ct exec rds1 sh -c 'redis-cli set k1 v1 >/dev/null && redis-cli get k1'
@@ -93,7 +93,7 @@ expect "redis bgrewrite log line" "Ready to accept connections" ct logs rds1
 
 echo "=== postgres: initdb + sql roundtrip ==="
 pg_password=$(openssl rand -hex 24)
-PG=$(ct run --name pg1 -e "POSTGRES_PASSWORD=$pg_password" -e POSTGRES_DB=appdb \
+PG=$(ct run -d --name pg1 -e "POSTGRES_PASSWORD=$pg_password" -e POSTGRES_DB=appdb \
         docker.io/library/postgres:16-alpine)
 unset pg_password
 [ -n "$PG" ] || { echo "WL-HARDFAIL: postgres run failed"; exit 1; }
@@ -116,7 +116,7 @@ expect "alpine exec output" alpine-ok printf '%s' "$AL"
 expect "alpine arch matches host" "$ARCH" printf '%s' "$AL"
 
 echo "=== whoami: tiny HTTP service ==="
-must ct run --name who1 docker.io/traefik/whoami:latest
+must ct run -d --name who1 docker.io/traefik/whoami:latest
 sleep 2
 WHO_IP=$(pod_ip who1)
 expect "whoami serves on pod ip ($WHO_IP)" Hostname \

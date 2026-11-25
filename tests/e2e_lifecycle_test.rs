@@ -268,6 +268,7 @@ async fn test_e2e_state_persistence() {
             attempt: 0,
             vm_attempt: None,
             vm_probe: false,
+            standalone: false,
             cgroup_parent: String::new(),
             id: pod_id.clone(),
             name: "persistent-test-pod".to_string(),
@@ -303,6 +304,7 @@ async fn test_e2e_state_persistence() {
             image: "alpine:latest".to_string(),
             image_id: String::new(),
             env: HashMap::new(),
+            wasi_args: Vec::new(),
             status: nautilus::core::ContainerStatus::Running,
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
@@ -318,6 +320,8 @@ async fn test_e2e_state_persistence() {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             open_stdin: false,
+            stdin_once: false,
+            tty: false,
             vm: None,
         };
         

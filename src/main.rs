@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_manager.clone(),
         image_service.image_manager(),
     );
-    runtime_service.recover_vm_pods().await?;
+    runtime_service.recover_workloads().await?;
     
     // Initialize network manager
     let network_manager = NetworkManager::new(config_arc.clone());
@@ -140,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to initialize image service: {}", e)))?;
 
     runtime_service.start_vm_readiness_probe();
+    runtime_service.start_auto_removal().await;
 
     // Setup socket
     let path = Path::new(&socket_path);

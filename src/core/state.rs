@@ -1,10 +1,10 @@
 use crate::core::Result;
 use serde::{Deserialize, Serialize};
 use sled::Db;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +37,9 @@ pub struct ContainerState {
     /// Environment variables requested via CRI (merged over image config env).
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Arguments for a WASI command, restored when it starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wasi_args: Vec<String>,
     pub labels: HashMap<String, String>,
     pub annotations: HashMap<String, String>,
     /// Host-path volumes from CRI ContainerConfig.mounts.
@@ -45,11 +48,13 @@ pub struct ContainerState {
     /// CRI ContainerStatus.reason (e.g. "OOMKilled").
     #[serde(default)]
     pub finish_reason: String,
-    /// CRI ContainerConfig.stdin: the init's stdin must stay OPEN (daemon-held
-    /// pipe) so stdin-oriented workloads (attach shells) don't EOF-exit
-    /// before a client attaches.
+    /// Keep init stdin open before the first attach.
     #[serde(default)]
     pub open_stdin: bool,
+    #[serde(default)]
+    pub stdin_once: bool,
+    #[serde(default)]
+    pub tty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmContainer>,
 }
@@ -93,6 +98,9 @@ pub struct PodState {
     /// Internal startup probe; kubelet must never enumerate this sandbox.
     #[serde(default)]
     pub vm_probe: bool,
+    /// Pod created by the standalone Nautilus client on the shared CRI socket.
+    #[serde(default)]
+    pub standalone: bool,
     /// Exact CRI cgroup parent assigned by kubelet.
     #[serde(default)]
     pub cgroup_parent: String,
@@ -169,15 +177,185 @@ pub enum PodStatus {
 #[derive(Debug)]
 pub struct StateManager {
     db: Arc<RwLock<Db>>,
+    pod_containers: Arc<Mutex<PodContainers>>,
+    container_events: broadcast::Sender<Arc<ContainerEvent>>,
+    all_container_events: broadcast::Sender<Arc<ContainerEvent>>,
+}
+
+#[derive(Debug, Default)]
+struct PodContainers(HashMap<String, BTreeSet<String>>);
+
+impl PodContainers {
+    fn update(&mut self, prior: Option<&ContainerState>, next: Option<&ContainerState>) {
+        if matches!((prior, next), (Some(prior), Some(next)) if prior.pod_id == next.pod_id) {
+            return;
+        }
+        if let Some(prior) = prior {
+            if let Some(containers) = self.0.get_mut(&prior.pod_id) {
+                containers.remove(&prior.id);
+                if containers.is_empty() {
+                    self.0.remove(&prior.pod_id);
+                }
+            }
+        }
+        if let Some(next) = next {
+            self.0.entry(next.pod_id.clone()).or_default().insert(next.id.clone());
+        }
+    }
+}
+
+pub(crate) const CONTAINER_EVENT_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerEventKind {
+    Created,
+    Started,
+    Stopped,
+    Deleted,
+}
+
+#[derive(Debug)]
+pub(crate) struct ContainerEvent {
+    pub id: String,
+    pub kind: ContainerEventKind,
+    pub created_at: i64,
+    pub pod: Option<PodState>,
+    pub containers: Vec<ContainerState>,
+}
+
+fn published_workload(state: &ContainerState) -> bool {
+    state.vm.as_ref().is_none_or(|vm| !vm.preparing)
+}
+
+fn container_event_kinds(
+    prior: Option<&ContainerState>,
+    state: Option<&ContainerState>,
+) -> Vec<ContainerEventKind> {
+    use ContainerEventKind::{Created, Deleted, Started, Stopped};
+
+    let prior = prior.filter(|state| published_workload(state));
+    let Some(state) = state.filter(|state| published_workload(state)) else {
+        return prior.map_or_else(Vec::new, |_| vec![Deleted]);
+    };
+    if prior.is_none() && state.status == ContainerStatus::Created {
+        return vec![Created];
+    }
+
+    let mut events = Vec::new();
+    let started =
+        state.started_at.is_some() && prior.and_then(|s| s.started_at) != state.started_at;
+    if started
+        && matches!(
+            state.status,
+            ContainerStatus::Running | ContainerStatus::Stopped
+        )
+    {
+        events.push(Started);
+    }
+    let lost_guest = state.status == ContainerStatus::Unknown
+        && state.started_at.is_some()
+        && state.vm.as_ref().is_some_and(|vm| vm.logs_complete)
+        && prior.is_some_and(|s| s.vm.as_ref().is_some_and(|vm| !vm.logs_complete));
+    if lost_guest
+        || (state.status == ContainerStatus::Stopped
+            && (started || prior.is_none_or(|s| s.status != ContainerStatus::Stopped)))
+    {
+        events.push(Stopped);
+    }
+    events
+}
+
+fn publish_container_events(
+    db: &Db,
+    pod_containers: &PodContainers,
+    sender: &broadcast::Sender<Arc<ContainerEvent>>,
+    all_sender: &broadcast::Sender<Arc<ContainerEvent>>,
+    prior: Option<&ContainerState>,
+    state: Option<&ContainerState>,
+) -> Result<()> {
+    let kinds = container_event_kinds(prior, state);
+    if kinds.is_empty() {
+        return Ok(());
+    }
+    let changed = state.or(prior).expect("an event has a container record");
+    let pod: Option<PodState> = db
+        .get(format!("pod:{}", changed.pod_id))?
+        .map(|value| serde_json::from_slice(&value))
+        .transpose()?;
+    if pod.as_ref().is_some_and(|pod| pod.vm_probe) {
+        return Ok(());
+    }
+    let cri_visible = !pod.as_ref().is_some_and(|pod| pod.standalone);
+    if all_sender.receiver_count() == 0 && (!cri_visible || sender.receiver_count() == 0) {
+        return Ok(());
+    }
+
+    let mut containers = Vec::new();
+    for id in pod_containers.0.get(&changed.pod_id).into_iter().flatten() {
+        if let Some(value) = db.get(format!("container:{id}"))? {
+            let container: ContainerState = serde_json::from_slice(&value)?;
+            if published_workload(&container) {
+                containers.push(container);
+            }
+        }
+    }
+    let mut kinds = kinds.into_iter().peekable();
+    while let Some(kind) = kinds.next() {
+        let mut snapshot = if kinds.peek().is_none() {
+            std::mem::take(&mut containers)
+        } else {
+            containers.clone()
+        };
+        if kind == ContainerEventKind::Started && changed.status == ContainerStatus::Stopped {
+            // A guest Start may already have observed the command's exit.
+            if let Some(container) = snapshot.iter_mut().find(|c| c.id == changed.id) {
+                container.status = ContainerStatus::Running;
+                container.finished_at = None;
+                container.exit_code = None;
+                container.finish_reason.clear();
+            }
+        }
+        let event = Arc::new(ContainerEvent {
+            id: changed.id.clone(),
+            kind,
+            created_at: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            pod: pod.clone(),
+            containers: snapshot,
+        });
+        if cri_visible {
+            let _ = sender.send(event.clone());
+        }
+        let _ = all_sender.send(event);
+    }
+    Ok(())
 }
 
 impl StateManager {
     /// Create a new StateManager with the given database path
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db = sled::open(db_path)?;
+        // Pod state can lag CreateContainer while the committed workload is already visible.
+        let mut pod_containers = PodContainers::default();
+        for entry in db.scan_prefix(b"container:") {
+            let (_, value) = entry?;
+            if let Ok(container) = serde_json::from_slice(&value) {
+                pod_containers.update(None, Some(&container));
+            }
+        }
         Ok(Self {
             db: Arc::new(RwLock::new(db)),
+            pod_containers: Arc::new(Mutex::new(pod_containers)),
+            container_events: broadcast::channel(CONTAINER_EVENT_CAPACITY).0,
+            all_container_events: broadcast::channel(CONTAINER_EVENT_CAPACITY).0,
         })
+    }
+
+    pub(crate) fn subscribe_container_events(&self) -> broadcast::Receiver<Arc<ContainerEvent>> {
+        self.container_events.subscribe()
+    }
+
+    pub(crate) fn subscribe_all_container_events(&self) -> broadcast::Receiver<Arc<ContainerEvent>> {
+        self.all_container_events.subscribe()
     }
 
     /// Generate a new unique container ID
@@ -192,12 +370,7 @@ impl StateManager {
 
     /// Save container state to database
     pub async fn save_container_state(&self, state: &ContainerState) -> Result<()> {
-        let db = self.db.read().await;
-        let key = format!("container:{}", state.id);
-        let value = serde_json::to_vec(state)?;
-        db.insert(key.as_bytes(), value)?;
-        db.flush_async().await?;
-        Ok(())
+        self.write_container(&state.id, Some(state)).await
     }
 
     /// Get container state from database
@@ -214,11 +387,34 @@ impl StateManager {
 
     /// Delete container state from database
     pub async fn delete_container_state(&self, id: &str) -> Result<()> {
-        let db = self.db.read().await;
+        self.write_container(id, None).await
+    }
+
+    async fn write_container(&self, id: &str, state: Option<&ContainerState>) -> Result<()> {
+        // Keep the commit and its snapshot in order even if the RPC disconnects.
+        let db = self.db.clone().write_owned().await;
+        let pod_containers = self.pod_containers.clone();
+        let events = self.container_events.clone();
+        let all_container_events = self.all_container_events.clone();
         let key = format!("container:{}", id);
-        db.remove(key.as_bytes())?;
-        db.flush_async().await?;
-        Ok(())
+        let state = state.cloned();
+        tokio::task::spawn_blocking(move || {
+            let prior = match &state {
+                Some(state) => db.insert(key, serde_json::to_vec(state)?)?,
+                None => db.remove(key)?,
+            };
+            let prior = prior.and_then(|value| serde_json::from_slice(&value).ok());
+            let mut pod_containers = pod_containers.lock().unwrap();
+            pod_containers.update(prior.as_ref(), state.as_ref());
+            db.flush()?;
+            if events.receiver_count() != 0 || all_container_events.receiver_count() != 0 {
+                let published = publish_container_events(&db, &pod_containers, &events, &all_container_events, prior.as_ref(), state.as_ref());
+                if let Err(error) = published {
+                    tracing::warn!(%error, "could not read committed container event snapshot");
+                }
+            }
+            Ok(())
+        }).await.map_err(|e| crate::core::Error::Runtime(format!("container state commit task: {e}")))?
     }
 
     /// Save pod state to database
@@ -342,5 +538,147 @@ impl StateManager {
             self.save_pod_state(&state).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    fn sample_container(id: &str, pod_id: &str, vm: Option<VmContainer>) -> ContainerState {
+        ContainerState {
+            id: id.into(),
+            pod_id: pod_id.into(),
+            attempt: 0,
+            name: "c".into(),
+            image: "img".into(),
+            image_id: String::new(),
+            status: ContainerStatus::Created,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            pid: None,
+            log_path: None,
+            sandbox_kind: if vm.is_some() { "vm" } else { "runc" }.into(),
+            resources: None,
+            security: None,
+            env: HashMap::new(),
+            wasi_args: Vec::new(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            volumes: Vec::new(),
+            finish_reason: String::new(),
+            open_stdin: false,
+            stdin_once: false,
+            tty: false,
+            vm,
+        }
+    }
+
+    #[test]
+    fn vm_preparing_fast_exit_and_lost_guest_transitions() {
+        use ContainerEventKind::{Created, Deleted, Started, Stopped};
+
+        let mut vm_ctr = sample_container(
+            "c1",
+            "p1",
+            Some(VmContainer {
+                image_id: String::new(),
+                preparing: true,
+                logs_complete: false,
+                relative_log: "c.log".into(),
+                cursor: Default::default(),
+            }),
+        );
+        vm_ctr.status = ContainerStatus::Unknown;
+        assert!(container_event_kinds(None, Some(&vm_ctr)).is_empty());
+
+        // Rollback while preparing emits nothing.
+        assert!(container_event_kinds(Some(&vm_ctr), None).is_empty());
+
+        // Publish created container.
+        let mut created = vm_ctr.clone();
+        created.status = ContainerStatus::Created;
+        created.vm.as_mut().unwrap().preparing = false;
+        assert_eq!(
+            container_event_kinds(Some(&vm_ctr), Some(&created)),
+            vec![Created]
+        );
+
+        // Fast-exit guest observed directly in Stopped on Start emits Started then Stopped.
+        let mut fast_exited = created.clone();
+        fast_exited.status = ContainerStatus::Stopped;
+        fast_exited.started_at = Some(chrono::Utc::now());
+        fast_exited.finished_at = Some(chrono::Utc::now());
+        fast_exited.exit_code = Some(35);
+        assert_eq!(
+            container_event_kinds(Some(&created), Some(&fast_exited)),
+            vec![Started, Stopped]
+        );
+
+        // Repeat stop emits nothing.
+        assert!(container_event_kinds(Some(&fast_exited), Some(&fast_exited)).is_empty());
+
+        // Running -> Unknown (temporary disconnect) emits nothing; then logs_complete emits Stopped.
+        let mut running = created.clone();
+        running.status = ContainerStatus::Running;
+        running.started_at = Some(chrono::Utc::now());
+        let mut disconnected = running.clone();
+        disconnected.status = ContainerStatus::Unknown;
+        assert!(container_event_kinds(Some(&running), Some(&disconnected)).is_empty());
+        let mut lost = disconnected.clone();
+        lost.vm.as_mut().unwrap().logs_complete = true;
+        assert_eq!(
+            container_event_kinds(Some(&disconnected), Some(&lost)),
+            vec![Stopped]
+        );
+        assert!(container_event_kinds(Some(&lost), Some(&lost)).is_empty());
+
+        // Deleting a published container emits Deleted.
+        assert_eq!(container_event_kinds(Some(&lost), None), vec![Deleted]);
+    }
+
+    #[tokio::test]
+    async fn vm_probe_pod_does_not_emit_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(tmp.path().join("state")).unwrap();
+        let mut rx = manager.subscribe_container_events();
+        let probe_pod = PodState {
+            id: "probe-pod".into(),
+            standalone: false,
+            name: "probe".into(),
+            namespace: "system".into(),
+            uid: "probe-uid".into(),
+            attempt: 0,
+            status: PodStatus::Running,
+            created_at: chrono::Utc::now(),
+            containers: Vec::new(),
+            network_namespace: None,
+            network_ip: String::new(),
+            netns_holder_pid: None,
+            pidns_holder_pid: None,
+            ipc_holder_pid: None,
+            cgroup_parent: String::new(),
+            hostname: String::new(),
+            dns_servers: Vec::new(),
+            dns_searches: Vec::new(),
+            dns_options: Vec::new(),
+            log_directory: String::new(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            runtime_handler: "vm".into(),
+            host_network: false,
+            host_pid: false,
+            host_ipc: false,
+            privileged: false,
+            vm_attempt: None,
+            vm_probe: true,
+        };
+        manager.save_pod_state(&probe_pod).await.unwrap();
+        let ctr = sample_container("probe-ctr", "probe-pod", None);
+        manager.save_container_state(&ctr).await.unwrap();
+        manager.delete_container_state("probe-ctr").await.unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }

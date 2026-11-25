@@ -7,10 +7,13 @@
 //! anywhere on the host.
 
 use crate::core::{Config, Error, Result};
-use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::manifest::OciImageManifest;
+use oci_distribution::client::{current_platform_resolver, ClientConfig, ClientProtocol};
+use oci_distribution::manifest::{
+    OciImageManifest, OciManifest, IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
+};
 use oci_distribution::{secrets::RegistryAuth, Client, Reference};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -29,6 +32,7 @@ pub struct ImageWorkload {
 struct CachedImage {
     manifest: OciImageManifest,
     config: oci_distribution::config::ConfigFile,
+    image_id: String,
     /// Digest of the resolved platform manifest (`sha256:...`), the digest
     /// half of a `repo@digest` reference. Empty for cache files written
     /// before this field existed.
@@ -118,9 +122,15 @@ async fn load_cached(config: &Config, reference: &Reference) -> Option<CachedIma
         }
         blobs.push((path, desc.media_type.clone()));
     }
+    let image_id = if file.image_id.is_empty() {
+        file.manifest.config.digest.clone()
+    } else {
+        file.image_id
+    };
     Some(CachedImage {
         manifest: file.manifest,
         config: file.config,
+        image_id,
         manifest_digest: file.manifest_digest.clone(),
         blobs,
     })
@@ -130,6 +140,8 @@ async fn load_cached(config: &Config, reference: &Reference) -> Option<CachedIma
 struct CachedManifestFile {
     manifest: OciImageManifest,
     config: oci_distribution::config::ConfigFile,
+    #[serde(default)]
+    image_id: String,
     #[serde(default)]
     manifest_digest: String,
 }
@@ -169,6 +181,90 @@ impl<'a, W: AsyncWrite + Unpin> AsyncWrite for HashingWriter<'a, W> {
     }
 }
 
+const MANIFEST_MEDIA_TYPES: &[&str] = &[
+    IMAGE_MANIFEST_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
+];
+
+fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
+    let actual = if expected.starts_with("sha256:") {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    } else if expected.starts_with("sha512:") {
+        format!("sha512:{:x}", Sha512::digest(bytes))
+    } else {
+        return Err(Error::Image(format!("unsupported OCI digest {expected:?}")));
+    };
+    if actual != expected {
+        return Err(Error::Image(format!(
+            "OCI content digest mismatch: expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_size(bytes: &[u8], expected: i64) -> Result<()> {
+    if usize::try_from(expected) != Ok(bytes.len()) {
+        return Err(Error::Image(format!(
+            "OCI descriptor size mismatch: expected {expected}, got {}", bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+async fn pull_manifest(
+    client: &Client,
+    reference: &Reference,
+    auth: &RegistryAuth,
+    size: Option<i64>,
+) -> Result<(OciManifest, String)> {
+    let (body, reported_digest) = client
+        .pull_manifest_raw(reference, auth, MANIFEST_MEDIA_TYPES)
+        .await
+        .map_err(|e| Error::Image(format!("pull manifest {reference}: {e}")))?;
+    if let Some(size) = size {
+        verify_size(&body, size)?;
+    }
+    verify_digest(&body, &reported_digest)?;
+    if let Some(expected) = reference.digest().filter(|expected| *expected != reported_digest) {
+        verify_digest(&body, expected)?;
+    }
+    let manifest = serde_json::from_slice(&body)
+        .map_err(|e| Error::Image(format!("parse manifest {reference}: {e}")))?;
+    let (schema, media_type) = match &manifest {
+        OciManifest::Image(image) => (image.schema_version, image.media_type.as_deref()),
+        OciManifest::ImageIndex(index) => (index.schema_version, index.media_type.as_deref()),
+    };
+    if schema != 2 || media_type.is_some_and(|media| !MANIFEST_MEDIA_TYPES.contains(&media)) {
+        return Err(Error::Image(format!("unsupported OCI manifest format for {reference}")));
+    }
+    Ok((manifest, reference.digest().map_or(reported_digest, str::to_owned)))
+}
+
+async fn pull_image_manifest(
+    client: &Client,
+    reference: &Reference,
+    auth: &RegistryAuth,
+) -> Result<(OciImageManifest, String)> {
+    let (manifest, digest) = pull_manifest(client, reference, auth, None).await?;
+    match manifest {
+        OciManifest::Image(image) => Ok((image, digest)),
+        OciManifest::ImageIndex(index) => {
+            let entry = current_platform_resolver(&index.manifests)
+                .and_then(|digest| index.manifests.iter().find(|entry| entry.digest == digest))
+                .ok_or_else(|| Error::Image(format!("no image in {reference} matches this node")))?;
+            let pinned = Reference::with_digest(
+                reference.registry().into(), reference.repository().into(), entry.digest.clone(),
+            );
+            match pull_manifest(client, &pinned, auth, Some(entry.size)).await? {
+                (OciManifest::Image(image), digest) => Ok((image, digest)),
+                _ => Err(Error::Image(format!("expected an image manifest at {pinned}"))),
+            }
+        }
+    }
+}
+
 impl CachedImage {
     /// Resolve the platform manifest and make sure every layer blob is in the
     /// content-addressed cache (streaming download + sha256 verify).
@@ -179,20 +275,20 @@ impl CachedImage {
         auth: &RegistryAuth,
         publish_ref: bool,
     ) -> Result<Self> {
-        // Platform-aware resolution: an index (multi-arch) is reduced to the
-        // matching image manifest by the client.
-        let (manifest, manifest_digest) = client
-            .pull_image_manifest(reference, auth)
-            .await
-            .map_err(|e| Error::Image(format!("pull manifest {reference}: {e}")))?;
+        let (manifest, manifest_digest) = pull_image_manifest(client, reference, auth).await?;
 
         // Fetch and parse the image configuration object.
         let cfg_desc = &manifest.config;
-        let mut cfg_bytes = Vec::with_capacity(cfg_desc.size.max(0) as usize);
+        let mut cfg_bytes = Vec::new();
         client
             .pull_blob(reference, cfg_desc, &mut cfg_bytes)
             .await
             .map_err(|e| Error::Image(format!("pull image config: {e}")))?;
+        verify_size(&cfg_bytes, cfg_desc.size)?;
+        verify_digest(&cfg_bytes, &cfg_desc.digest)?;
+        // OCI ImageID uses SHA-256 even when the configuration descriptor
+        // uses another supported digest algorithm.
+        let image_id = format!("sha256:{:x}", Sha256::digest(&cfg_bytes));
         let config_file: oci_distribution::config::ConfigFile = serde_json::from_slice(&cfg_bytes)
             .map_err(|e| Error::Image(format!("parse image config: {e}")))?;
 
@@ -237,6 +333,7 @@ impl CachedImage {
         let cache_file = CachedManifestFile {
             manifest: manifest.clone(),
             config: config_file.clone(),
+            image_id: image_id.clone(),
             manifest_digest: manifest_digest.clone(),
         };
         let json = serde_json::to_vec(&cache_file)?;
@@ -249,6 +346,7 @@ impl CachedImage {
         Ok(Self {
             manifest,
             config: config_file,
+            image_id,
             manifest_digest,
             blobs,
         })
@@ -257,7 +355,7 @@ impl CachedImage {
     fn workload(&self) -> ImageWorkload {
         let cfg = self.config.config.as_ref();
         ImageWorkload {
-            image_id: self.manifest.config.digest.clone(),
+            image_id: self.image_id.clone(),
             entrypoint: cfg
                 .and_then(|c| c.entrypoint.clone())
                 .unwrap_or_default(),
@@ -364,7 +462,12 @@ async fn pin_cached_tag(config: &Config, reference: &Reference) -> Result<Option
     if reference != &pinned && !tokio::fs::try_exists(&alias).await? {
         super::atomic_write(&alias, &json).await?;
     }
-    Ok(Some((old.manifest.config.digest, digest.to_owned())))
+    let image_id = if old.image_id.is_empty() {
+        old.manifest.config.digest
+    } else {
+        old.image_id
+    };
+    Ok(Some((image_id, digest.to_owned())))
 }
 
 pub(super) async fn cached_manifest_for_id(config: &Config, image_ref: &str, id: &str) -> Result<Option<String>> {
@@ -423,7 +526,7 @@ impl CachedImage {
         } else {
             self.manifest_digest.as_bytes().to_owned()
         };
-        Ok(super::snapshot::key(&self.manifest.config.digest, &identity))
+        Ok(super::snapshot::key(&self.image_id, &identity))
     }
 
     fn unpack(&self, dst: &Path, image_dir: &Path) -> Result<()> {
@@ -431,12 +534,12 @@ impl CachedImage {
             crate::storage::unpack::apply_layer(dst, &std::fs::read(path)?, media_type)?;
         }
         let meta = serde_json::json!({
-            "image_id": self.manifest.config.digest,
+            "image_id": self.image_id,
             "created": self.config.created.map(|c| c.to_rfc3339()),
             "size": dir_size(dst),
         });
         let sidecar = image_dir.join(format!("{}.nmeta",
-            super::image::safe_image_name(&self.manifest.config.digest)));
+            super::image::safe_image_name(&self.image_id)));
         // Size is optional display metadata. Never expose a partial JSON file.
         if let Ok(mut file) = tempfile::NamedTempFile::new_in(image_dir) {
             if serde_json::to_writer(&mut file, &meta).is_ok() {
@@ -460,7 +563,7 @@ impl CachedImage {
                 .unwrap_or_default()
         };
         ImageFacts {
-            config_digest: self.manifest.config.digest.clone(),
+            config_digest: self.image_id.clone(),
             manifest_digest,
             created: self.config.created,
             size,
@@ -549,6 +652,21 @@ async fn prepare_root(config: &Config, image_ref: &str, rootfs_dir: &Path, overl
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn registry_metadata_requires_matching_bytes_and_size() {
+        let bytes = br#"{"schemaVersion":2}"#;
+        let sha256 = format!("sha256:{:x}", Sha256::digest(bytes));
+        let sha512 = format!("sha512:{:x}", Sha512::digest(bytes));
+        assert!(verify_digest(bytes, &sha256).is_ok());
+        assert!(verify_digest(bytes, &sha512).is_ok());
+        assert!(verify_digest(b"{}", &sha256).is_err());
+        assert!(verify_digest(bytes, "sha1:invalid").is_err());
+        assert!(verify_size(bytes, bytes.len() as i64).is_ok());
+        assert!(verify_size(bytes, 0).is_err());
+        assert!(verify_size(bytes, -1).is_err());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -561,6 +679,7 @@ mod tests {
         let file = CachedManifestFile {
             manifest: OciImageManifest::default(),
             config: Default::default(),
+            image_id: String::new(),
             manifest_digest: manifest_digest.clone(),
         };
         std::fs::write(manifest_cache_path(&cfg, &tag), serde_json::to_vec(&file).unwrap()).unwrap();
