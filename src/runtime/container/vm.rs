@@ -157,15 +157,19 @@ impl ContainerManager {
         let reply = match backend.call(id, op).await {
             Ok(reply) => reply,
             Err(e) => {
-                if observing
-                    && !matches!(
+                if observing {
+                    let owner =
+                        crate::vm::owner::PodVmStore::new(self._config.runtime.state_dir.join("vms"));
+                    if matches!(owner.status(&state.pod_id).await, Ok(None)) {
+                        self.mark_guest_lost(&mut state).await?;
+                    } else if !matches!(
                         state.status,
                         ContainerStatus::Unknown | ContainerStatus::Stopped
-                    )
-                {
-                    state.status = ContainerStatus::Unknown;
-                    state.finish_reason = "ContainerStatusUnknown".into();
-                    self.save_guest(&state).await?;
+                    ) {
+                        state.status = ContainerStatus::Unknown;
+                        state.finish_reason = "ContainerStatusUnknown".into();
+                        self.save_guest(&state).await?;
+                    }
                 }
                 return Err(e);
             }

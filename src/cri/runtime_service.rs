@@ -1204,18 +1204,15 @@ impl RuntimeService for NautilusRuntimeService {
                 .map_err(Status::from)?;
         }
 
-        let result = if matches!(before.sandbox_kind.as_str(), "wasi" | "wasm") {
-            // Finish the state/activation handoff under the Pod lock even if the RPC is cancelled.
-            let manager = self.container_manager.clone();
-            tokio::spawn(async move {
-                let _guard = _guard;
-                manager.start_container(&req.container_id).await
-            })
-            .await
-            .map_err(|e| Status::internal(format!("WASI startup task stopped: {e}")))?
-        } else {
-            self.container_manager.start_container(&req.container_id).await
-        };
+        // Keep process activation, committed state and exit observation together
+        // even when the caller cancels after the backend has started.
+        let manager = self.container_manager.clone();
+        let result = tokio::spawn(async move {
+            let _guard = _guard;
+            manager.start_container(&req.container_id).await
+        })
+        .await
+        .map_err(|e| Status::internal(format!("container startup task stopped: {e}")))?;
         result.map_err(|e| Status::internal(format!("Failed to start container: {e}")))?;
         
         Ok(Response::new(StartContainerResponse {}))

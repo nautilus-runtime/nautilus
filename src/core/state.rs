@@ -382,10 +382,10 @@ impl StateManager {
                 Some(state) => db.insert(key, serde_json::to_vec(state)?)?,
                 None => db.remove(key)?,
             };
-            db.flush()?;
             let prior = prior.and_then(|value| serde_json::from_slice(&value).ok());
             let mut pod_containers = pod_containers.lock().unwrap();
             pod_containers.update(prior.as_ref(), state.as_ref());
+            db.flush()?;
             if events.receiver_count() != 0 {
                 let published = publish_container_events(&db, &pod_containers, &events, prior.as_ref(), state.as_ref());
                 if let Err(error) = published {

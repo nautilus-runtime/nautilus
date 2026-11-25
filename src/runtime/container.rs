@@ -662,7 +662,11 @@ impl ContainerManager {
                 let exit = self.native_exits.lock().unwrap().get(&(container_id.to_string(), pid)).cloned();
                 if let Some(mut exit) = exit {
                     // The backend confirms termination, while waitpid supplies the actual exit code.
-                    let _ = tokio::time::timeout(Duration::from_secs(1), exit.changed()).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), exit.changed())
+                        .await
+                        .map_err(|_| Error::Runtime(format!(
+                            "waiting for the exit status of container {container_id}"
+                        )))?;
                 }
             }
         }
@@ -741,17 +745,16 @@ impl ContainerManager {
             }
         }
 
-        // If not in cache, load from state manager
-        if let Some(state) = self.state_manager.get_container_state(container_id).await? {
-            // Cache it for future use
-            {
-                let mut containers = self.containers.write().await;
-                containers.insert(container_id.to_string(), state.clone());
-            }
-            Ok(Some(state))
-        } else {
-            Ok(None)
+        // Do not fill a cold cache with a record another operation has replaced or deleted.
+        let mut containers = self.containers.write().await;
+        if let Some(state) = containers.get(container_id) {
+            return Ok(Some(state.clone()));
         }
+        let state = self.state_manager.get_container_state(container_id).await?;
+        if let Some(state) = &state {
+            containers.insert(container_id.to_string(), state.clone());
+        }
+        Ok(state)
     }
 
     /// List all containers
