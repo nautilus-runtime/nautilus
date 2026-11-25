@@ -197,7 +197,7 @@ impl NautilusRuntimeService {
     pub(super) async fn read_native_cgroup<T: Send + 'static>(
         &self,
         c: &ContainerState,
-        sample: impl FnOnce(&Root) -> T + Send + 'static,
+        sample: impl FnOnce(&Root, &Path, &Path) -> T + Send + 'static,
     ) -> Result<Option<T>, Status> {
         if c.sandbox_kind != "runc" || self._config.runtime.runc.driver == "exec" {
             return Ok(None);
@@ -214,11 +214,12 @@ impl NautilusRuntimeService {
             if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
                 return Ok(None);
             }
-            let group = backend
+            let path = backend
                 .workload_cgroup_v2(&id, pid)
-                .and_then(|path| Root::open(path).ok())
                 .ok_or_else(|| Status::unavailable("owned container cgroup is not readable"))?;
-            Ok::<_, Status>(Some(sample(&group)))
+            let group = Root::open(&path)
+                .map_err(|_| Status::unavailable("owned container cgroup is not readable"))?;
+            Ok::<_, Status>(Some(sample(&group, &path, &backend.bundle_dir(&id))))
         })
         .await
         .map_err(|e| Status::internal(format!("container stats worker: {e}")))?
@@ -237,7 +238,7 @@ impl NautilusRuntimeService {
             .ok_or_else(|| Status::failed_precondition("container is not running"))?;
         let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let cgroup = self
-            .read_native_cgroup(c, move |group| cgroup_usage(group, timestamp))
+            .read_native_cgroup(c, move |group, _, _| cgroup_usage(group, timestamp))
             .await?;
         let mut stats = match cgroup {
             // Init-only CPU may be lower than the previous cgroup sample.

@@ -607,7 +607,7 @@ impl RuncBackend {
         Ok(())
     }
 
-    fn bundle_dir(&self, id: &str) -> PathBuf {
+    pub(crate) fn bundle_dir(&self, id: &str) -> PathBuf {
         PathBuf::from(&self.config.storage.container_dir).join(id)
     }
 
