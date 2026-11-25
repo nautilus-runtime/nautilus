@@ -626,6 +626,7 @@ mod event_tests {
         let mut rx = manager.subscribe_container_events();
         let probe_pod = PodState {
             id: "probe-pod".into(),
+            standalone: false,
             name: "probe".into(),
             namespace: "system".into(),
             uid: "probe-uid".into(),
