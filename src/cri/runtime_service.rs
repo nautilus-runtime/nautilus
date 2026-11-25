@@ -1744,14 +1744,16 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
-        let samples = self
-            .list_pod_sandbox_stats(request.map(|_| ListPodSandboxStatsRequest { filter: None }))
-            .await?
-            .into_inner()
-            .stats;
-        Ok(Response::new(ListPodSandboxMetricsResponse {
-            pod_metrics: samples.into_iter().filter_map(metrics::pod_metrics).collect(),
-        }))
+        let include = includes_standalone(&request);
+        let pods = self.pod_manager.list_pods().await.map_err(Status::from)?;
+        let matches = pods.into_iter().filter(|pod| include || !pod.standalone);
+        let pod_metrics = futures::stream::iter(matches)
+            .map(|pod| async move { self.collect_pod_metrics(&pod).await.ok() })
+            .buffered(8)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        Ok(Response::new(ListPodSandboxMetricsResponse { pod_metrics }))
     }
 
     async fn runtime_config(
