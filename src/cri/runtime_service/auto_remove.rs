@@ -1,5 +1,6 @@
 use super::{ContainerEventKind, ContainerStatus, NautilusRuntimeService, PodState, PodStatus};
 use crate::cri::AUTO_REMOVE_ANNOTATION;
+use crate::sandbox::runc_backend::RuncBackend;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tonic::Status;
@@ -77,15 +78,33 @@ impl NautilusRuntimeService {
             .map_err(Status::from)?;
         let finished = match records.as_slice() {
             [] => allow_empty || matches!(pod.status, PodStatus::Succeeded | PodStatus::Failed),
-            [container] => {
-                container
+            [container]
+                if container
                     .annotations
                     .get(AUTO_REMOVE_ANNOTATION)
                     .map(String::as_str)
-                    == Some("true")
-                    && (container.status == ContainerStatus::Stopped
-                        || (container.status == ContainerStatus::Unknown
-                            && container.vm.as_ref().is_some_and(|vm| vm.logs_complete)))
+                    == Some("true") =>
+            {
+                match container.status {
+                    ContainerStatus::Stopped => true,
+                    ContainerStatus::Unknown => {
+                        container.vm.as_ref().is_some_and(|vm| vm.logs_complete)
+                    }
+                    ContainerStatus::Running | ContainerStatus::Paused
+                        if container.sandbox_kind == "runc" =>
+                    {
+                        // After a restart, confirm the stored runtime owner is stopped.
+                        // This status check does not signal a process.
+                        RuncBackend::new(self._config.clone())
+                            .has_stopped(&container.id)
+                            .await
+                            .map_err(Status::from)?
+                    }
+                    ContainerStatus::Created => {
+                        allow_empty && matches!(container.sandbox_kind.as_str(), "wasi" | "wasm")
+                    }
+                    _ => false,
+                }
             }
             _ => false,
         };
