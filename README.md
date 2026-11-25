@@ -46,7 +46,7 @@ sudo nautilus version
 sudo nautilus run --rm busybox:1.36 echo 'Hello from Nautilus'
 ```
 
-Nautilus pulls the image on first use and follows the command output. With `--rm`, the CLI waits for the command to finish and removes both the container and the sandbox it created. The image stays cached for the next run.
+Nautilus pulls the image on first use and follows the command output. With `--rm`, the CLI waits for the command to finish and removes both the container and the sandbox it created. With `-d --rm`, the CLI prints the container ID and the daemon removes the workload and sandbox after exit. The image stays cached for the next run.
 
 The CLI follows workload output and returns the workload exit code by default. Pass `-d` to start in the background and print the container ID.
 
@@ -67,7 +67,7 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-d` for background execution or `--rm` for cleanup after a foreground command.
+The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-d` for background execution and add `--rm` to reclaim the workload when it exits.
 
 For Kubernetes, package the module in an OCI image and use its absolute path as the entrypoint. Build for the Linux node platform. In this example, set `IMAGE` to a registry tag that your node can pull.
 

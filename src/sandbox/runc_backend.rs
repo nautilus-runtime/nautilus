@@ -437,10 +437,14 @@ impl RuncBackend {
         }).await.map_err(|e| Error::Runtime(format!("libcontainer worker: {e}")))?
     }
 
+    pub(crate) async fn has_stopped(&self, id: &str) -> Result<bool> {
+        Ok(!self.signal_if_running(id, None).await?)
+    }
+
     async fn wait_stopped(&self, id: &str, timeout: std::time::Duration) -> Result<bool> {
         let started = tokio::time::Instant::now();
         loop {
-            if !self.signal_if_running(id, None).await? {
+            if self.has_stopped(id).await? {
                 return Ok(true);
             }
             let remaining = timeout.saturating_sub(started.elapsed());

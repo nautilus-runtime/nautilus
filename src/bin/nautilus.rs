@@ -115,7 +115,7 @@ enum Commands {
         #[arg(short, long)]
         detach: bool,
         /// Remove the container and sandbox after the command exits
-        #[arg(long, conflicts_with = "detach")]
+        #[arg(long)]
         rm: bool,
         /// OCI image reference or a local WASI module path
         image: String,
@@ -548,14 +548,18 @@ async fn cmd_run(
 ) -> Result<u8, String> {
     let is_vm = runtime == "vm";
     let is_wasi = matches!(runtime.as_str(), "wasm" | "wasi");
+    let auto_remove = detach && rm;
     if is_vm && !publish.is_empty() {
         return Err("the VM runtime does not support --publish".into());
     }
-    if is_vm {
-        let handlers = r.status(StatusRequest::default()).await.map_err(status)?
-            .into_inner().runtime_handlers;
-        if !handlers.iter().any(|handler| handler.name == "vm") {
+    if is_vm || auto_remove {
+        let capabilities = r.status(StatusRequest { verbose: auto_remove }).await.map_err(status)?
+            .into_inner();
+        if is_vm && !capabilities.runtime_handlers.iter().any(|handler| handler.name == "vm") {
             return Err("VM runtime is unavailable. Enable and configure the VM handler on the daemon node".into());
+        }
+        if auto_remove && capabilities.info.get(nautilus::cri::AUTO_REMOVE_ANNOTATION).map(String::as_str) != Some("true") {
+            return Err("The daemon does not support detached automatic removal. Upgrade nautilusd or omit --rm".into());
         }
     }
     let env = kv_pairs(env, "env")?;
@@ -631,6 +635,9 @@ async fn cmd_run(
         pid: NamespaceMode::Container as i32,
         ..Default::default()
     });
+    let auto_remove_annotations: std::collections::HashMap<String, String> = auto_remove
+        .then(|| [(nautilus::cri::AUTO_REMOVE_ANNOTATION.to_string(), "true".to_string())].into_iter().collect())
+        .unwrap_or_default();
     // For VM workloads the sandbox receives the CPU and RAM limits at boot.
     let pod = PodSandboxConfig {
         metadata: Some(PodSandboxMetadata {
@@ -640,6 +647,7 @@ async fn cmd_run(
             attempt: 0,
         }),
         labels: [(CTL_LABEL.to_string(), "true".to_string())].into_iter().collect(),
+        annotations: auto_remove_annotations.clone(),
         linux: namespaces.clone().map(|options| LinuxPodSandboxConfig {
             security_context: Some(LinuxSandboxSecurityContext {
                 namespace_options: Some(options),
@@ -686,6 +694,7 @@ async fn cmd_run(
             .collect(),
         working_dir: workdir.unwrap_or_default(),
         labels: labels.into_iter().collect(),
+        annotations: auto_remove_annotations,
         linux: Some(LinuxContainerConfig {
             resources: Some(resources),
             security_context: namespaces.map(|options| LinuxContainerSecurityContext {
@@ -738,7 +747,7 @@ async fn cmd_run(
             Ok(0)
         }
     }.await;
-    if rm || !started {
+    if !started || (rm && !detach) {
         let condition = if started && workload.is_ok() { Some("exited") } else { None };
         let cleanup = remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await;
         return match (workload, cleanup) {

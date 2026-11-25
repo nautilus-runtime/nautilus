@@ -1,3 +1,4 @@
+mod auto_remove;
 mod stats;
 
 use super::list_stream::{batches, ListStream};
@@ -1645,7 +1646,7 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn status(
         &self,
-        _request: Request<StatusRequest>,
+        request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         use crate::proto::runtime::v1 as rt;
         let cond = |t: &str| rt::RuntimeCondition {
@@ -1671,7 +1672,11 @@ impl RuntimeService for NautilusRuntimeService {
             }),
             runtime_handlers: handlers,
             features: None,
-            info: Default::default(),
+            info: if request.into_inner().verbose {
+                [(super::AUTO_REMOVE_ANNOTATION.to_owned(), "true".to_owned())].into_iter().collect()
+            } else {
+                Default::default()
+            },
         }))
     }
 
@@ -1942,6 +1947,7 @@ mod container_event_tests {
         pod: &str,
         module: &std::path::Path,
         name: &str,
+        auto_remove: bool,
     ) -> String {
         service
             .create_container(Request::new(CreateContainerRequest {
@@ -1951,6 +1957,10 @@ mod container_event_tests {
                         name: name.into(),
                         ..Default::default()
                     }),
+                    annotations: auto_remove
+                        .then(|| [(super::super::AUTO_REMOVE_ANNOTATION.into(), "true".into())]
+                            .into_iter().collect())
+                        .unwrap_or_default(),
                     image: Some(ImageSpec {
                         image: module.display().to_string(),
                         ..Default::default()
@@ -2008,8 +2018,8 @@ mod container_event_tests {
             .await
             .unwrap()
             .into_inner();
-        let local = create_wasi(&service, &standalone, &module, "standalone").await;
-        let pod = create_wasi(&service, &kubernetes, &module, "kubernetes").await;
+        let local = create_wasi(&service, &standalone, &module, "standalone", false).await;
+        let pod = create_wasi(&service, &kubernetes, &module, "kubernetes", false).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), kube_events.next())
                 .await.unwrap().unwrap().unwrap().container_id,
@@ -2038,10 +2048,36 @@ mod container_event_tests {
     }
 
     #[tokio::test]
+    async fn detached_auto_removal_reclaims_only_the_opted_in_sandbox() {
+        let (_tmp, service, module) = setup();
+        service.start_auto_removal().await;
+        let mut requested = wasi_pod_request();
+        requested.config.as_mut().unwrap().annotations.insert(
+            super::super::AUTO_REMOVE_ANNOTATION.into(), "true".into(),
+        );
+        let regular = service.run_pod_sandbox(Request::new(requested.clone()))
+            .await.unwrap().into_inner().pod_sandbox_id;
+        let automatic = service.run_pod_sandbox(standalone_request(requested))
+            .await.unwrap().into_inner().pod_sandbox_id;
+        for pod in [&regular, &automatic] {
+            let id = create_wasi(&service, pod, &module, "quick-exit", true).await;
+            service.start_container(Request::new(StartContainerRequest { container_id: id }))
+                .await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.pod_manager.get_pod_state(&automatic).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(service.container_manager.list_containers_in_pod(&automatic).await.unwrap().is_empty());
+        assert!(service.pod_manager.get_pod_state(&regular).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn wasi_lifecycle_snapshots_include_siblings_and_skip_retries() {
         let (_tmp, service, module) = setup();
         let pod = wasi_pod(&service).await;
-        let sibling = create_wasi(&service, &pod, &module, "sibling").await;
+        let sibling = create_wasi(&service, &pod, &module, "sibling", false).await;
         // The workload record is visible before CreateContainer links it to the Pod.
         service
             .pod_manager
@@ -2053,7 +2089,7 @@ mod container_event_tests {
             .await
             .unwrap()
             .into_inner();
-        let id = create_wasi(&service, &pod, &module, "short-lived").await;
+        let id = create_wasi(&service, &pod, &module, "short-lived", false).await;
         service
             .start_container(Request::new(StartContainerRequest {
                 container_id: id.clone(),
@@ -2132,7 +2168,7 @@ mod container_event_tests {
             .await
             .unwrap()
             .into_inner();
-        let next = create_wasi(&service, &pod, &module, "next").await;
+        let next = create_wasi(&service, &pod, &module, "next", false).await;
         for stream in [&mut events, &mut reconnected] {
             let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
                 .await
@@ -2151,7 +2187,7 @@ mod container_event_tests {
     async fn lagged_subscriber_is_terminated() {
         let (_tmp, service, module) = setup();
         let pod = wasi_pod(&service).await;
-        let id = create_wasi(&service, &pod, &module, "subject").await;
+        let id = create_wasi(&service, &pod, &module, "subject", false).await;
         let mut state = service
             ._state_manager
             .get_container_state(&id)

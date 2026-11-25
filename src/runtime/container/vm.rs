@@ -255,6 +255,14 @@ impl ContainerManager {
     async fn remove_guest_locked(&self, state: &ContainerState) -> Result<()> {
         let backend = VmBackend::new(self._config.clone(), &state.pod_id);
         backend.remove(&state.id).await?;
+        let captured = self
+            ._config
+            .storage
+            .container_dir
+            .join(format!("{}-out", state.id));
+        if tokio::fs::try_exists(&captured).await? {
+            tokio::fs::remove_dir_all(captured).await?;
+        }
         self.forget_guest(&state.id).await
     }
 
