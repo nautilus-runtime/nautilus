@@ -1,4 +1,4 @@
-use super::{ContainerEventKind, ContainerStatus, NautilusRuntimeService, PodState};
+use super::{ContainerEventKind, ContainerStatus, NautilusRuntimeService, PodState, PodStatus};
 use crate::cri::AUTO_REMOVE_ANNOTATION;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -61,22 +61,22 @@ impl NautilusRuntimeService {
 
     async fn remove_finished_standalone(&self, id: &str, allow_empty: bool) -> Result<(), Status> {
         let _guard = self.pod_manager.operation_guard(id).await;
-        if !self
+        let Some(pod) = self
             .pod_manager
             .get_pod_state(id)
             .await
             .map_err(Status::from)?
-            .is_some_and(|pod| auto_remove(&pod))
-        {
+            .filter(auto_remove)
+        else {
             return Ok(());
-        }
+        };
         let records = self
             .container_manager
             .list_containers_in_pod(id)
             .await
             .map_err(Status::from)?;
         let finished = match records.as_slice() {
-            [] => allow_empty,
+            [] => allow_empty || matches!(pod.status, PodStatus::Succeeded | PodStatus::Failed),
             [container] => {
                 container.status == ContainerStatus::Stopped
                     || (container.status == ContainerStatus::Unknown
