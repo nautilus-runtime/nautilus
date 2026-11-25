@@ -211,7 +211,10 @@ async fn handle_conn(
         conn.wait_closed().await;
         ctx.closed.send_replace(true);
         tracing::info!(mode = mode_of(&session.kind), "streaming session closed");
-        let handle = ctx.exec_process.get().filter(|_| matches!(session.kind, SessionKind::Exec));
+        let handle = ctx
+            .exec_process
+            .get()
+            .filter(|_| matches!(session.kind, SessionKind::Exec));
         if let Some(Ok(h)) = handle {
             let pid = h.pid.load(Ordering::Acquire);
             if pid > 0 {
@@ -345,10 +348,13 @@ async fn spawn_exec(
         tty: session.tty,
     };
     let (streams, resize, lifetime) = if let Some(init) = &session.native_attach {
-        let init = init.upgrade()
+        let init = init
+            .upgrade()
             .ok_or_else(|| "attach target instance is no longer available".to_owned())?;
         let stopped = container.status == crate::core::state::ContainerStatus::Stopped;
-        let (streams, resize) = init.attach(options, stopped, closed).map_err(|e| e.to_string())?;
+        let (streams, resize) = init
+            .attach(options, stopped, closed)
+            .map_err(|e| e.to_string())?;
         (streams, resize, None)
     } else if container.sandbox_kind == "vm" {
         let op = match session.kind {
@@ -360,7 +366,13 @@ async fn spawn_exec(
             SessionKind::PortForward => return Err("unexpected port-forward session".into()),
         };
         let guest = exec
-            .guest_stream(&container.pod_id, &container.id, op, options, closed.subscribe())
+            .guest_stream(
+                &container.pod_id,
+                &container.id,
+                op,
+                options,
+                closed.subscribe(),
+            )
             .await
             .map_err(|e| e.to_string())?;
         (guest.io, guest.resize, Some(guest.lifetime))
