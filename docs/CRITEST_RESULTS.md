@@ -38,6 +38,12 @@ cgroupfs 驱动也返回了匹配的计数。强制删除负载时，首次 Remo
 
 完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 292.595 秒。结束时 CRI Pod 与容器均为零。
 
+## 2026-11-25 原生 OCI 内存、交换和压力统计
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）验证 `848deb0`。通过真实 CRI socket 将容器 RSS、主缺页和次缺页、64 MiB 限额下的可用内存、交换空间用量和 CPU／内存／I/O 压力累计时间与所属 cgroup 文件核对。Pod CPU 和工作集等于容器之和。[回归探针](../tests/native_cgroup_acceptance.py)
+
+Kubernetes v1.37.2 的 `/stats/summary` 返回可用内存、RSS 和缺页计数。每个测试容器的可用内存与工作集之和等于其 64 MiB 限额。完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 381.696 秒，结束时 CRI Pod 与容器均为零。Linux 串行 Rust 测试 122 通过、0 失败、8 项忽略，严格 Clippy 保持基线的 29 项诊断。
+
 ## 2026-11-25 独立 CLI 与 kubelet 共用 socket
 
 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）用同一 daemon 启动真实 kubelet v1.37.2 和 Nautilus CLI。标准 CRI 清单返回 Kubernetes 创建的原生 OCI 和 VM 容器，CLI 创建的 WASI 容器仅在 CLI 清单可见。经过 65 秒，独立 WASI 容器仍可读出此前已经退出的进程日志，两个 Kubernetes Pod 保持 Running。连续十次前台 `--rm` 与一次显式删除均成功。
