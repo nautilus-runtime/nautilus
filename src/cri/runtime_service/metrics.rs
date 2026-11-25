@@ -4,6 +4,7 @@ use crate::proto::runtime::v1::{
     ContainerMetrics, CpuUsage, MemoryUsage, Metric, MetricDescriptor, MetricType,
     PodSandboxMetrics, UInt64Value,
 };
+use crate::vm::workload::Sample;
 use futures::StreamExt;
 use pathrs::{error::ErrorKind, flags::OpenFlags, Root};
 use std::collections::{HashMap, HashSet};
@@ -848,6 +849,32 @@ fn base_metrics(
     .collect()
 }
 
+fn guest_cgroup_metrics(sample: &Sample, labels: &[String]) -> Result<Vec<Metric>, &'static str> {
+    let (cpu, memory) = stats::readings(sample)?;
+    let mut metrics = base_metrics(Some(cpu), Some(memory), labels);
+    let counter = |file: &str, key: &str| sample.cgroup_counters.get(file)?.get(key).copied();
+    for family in FAMILIES {
+        if matches!(family.source, Faults) {
+            for key in ["pgfault", "pgmajfault"] {
+                if let Some(value) = counter("memory.stat", key) {
+                    metrics.push(family.metric(labels, &[key, "hierarchy"], value));
+                }
+            }
+        }
+        let value = match family.source {
+            Field(file, key) => counter(file, key),
+            Seconds(file, key) if family.name != CPU_USAGE.name => {
+                counter(file, key).map(|us| us / SECOND_US)
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            metrics.push(family.metric(labels, &[], value));
+        }
+    }
+    Ok(metrics)
+}
+
 impl NautilusRuntimeService {
     async fn native_pod_network_metrics(&self, pod: &PodState) -> Vec<Metric> {
         let Some(pid) = pod.netns_holder_pid.filter(|pid| *pid > 0) else {
@@ -879,28 +906,22 @@ impl NautilusRuntimeService {
             .await
             .map_err(Status::from)?;
         if pod.runtime_handler == "vm" {
-            let sample = self
-                .guest_pod_stats(pod)
-                .await?
-                .linux
-                .ok_or_else(|| Status::data_loss("guest metrics require Linux stats"))?;
-            let container_metrics = sample
-                .containers
-                .into_iter()
-                .filter_map(|sample| {
-                    let id = sample.attributes?.id;
-                    let container = containers.iter().find(|c| c.id == id)?;
-                    let metrics =
-                        base_metrics(sample.cpu, sample.memory, &labels(pod, Some(container)));
-                    Some(ContainerMetrics {
-                        container_id: id,
+            let (sample, mut samples) = self.guest_pod_samples(pod).await?;
+            let mut container_metrics = Vec::new();
+            for container in containers {
+                if let Some(sample) = samples.remove(&container.id) {
+                    let metrics = guest_cgroup_metrics(&sample, &labels(pod, Some(&container)))
+                        .map_err(Status::data_loss)?;
+                    container_metrics.push(ContainerMetrics {
+                        container_id: container.id,
                         metrics,
-                    })
-                })
-                .collect();
+                    });
+                }
+            }
             return Ok(PodSandboxMetrics {
                 pod_sandbox_id: pod.id.clone(),
-                metrics: base_metrics(sample.cpu, sample.memory, &labels(pod, None)),
+                metrics: guest_cgroup_metrics(&sample, &labels(pod, None))
+                    .map_err(Status::data_loss)?,
                 container_metrics,
             });
         }
@@ -948,6 +969,56 @@ impl NautilusRuntimeService {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn guest_cgroup_metrics_support_legacy_and_extended_samples() {
+        let mut sample = serde_json::json!({
+            "timestamp": 1,
+            "cpuUsageNanos": 2_500_000_000u64,
+            "memoryUsageBytes": 4096,
+            "workingSetBytes": 3072,
+            "rssBytes": 1024,
+            "pageFaults": 5,
+            "majorPageFaults": 2,
+        });
+        let labels = LABELS.map(String::from);
+        let legacy = serde_json::from_value(sample.clone()).unwrap();
+        assert_eq!(guest_cgroup_metrics(&legacy, &labels).unwrap().len(), 3);
+
+        sample["cgroupCounters"] = serde_json::json!({
+            "cpu.stat": {"nr_throttled": 0, "throttled_usec": 1_500_000},
+            "memory.stat": {"anon": 1024, "pgfault": 7, "pgmajfault": 2},
+        });
+        let extended = serde_json::from_value(sample).unwrap();
+        let metrics = guest_cgroup_metrics(&extended, &labels).unwrap();
+        let value = |name| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .and_then(|m| m.value.as_ref().map(|v| v.value))
+        };
+        assert_eq!(value(CPU_USAGE.name), Some(2));
+        assert_eq!(value("container_cpu_cfs_throttled_periods_total"), Some(0));
+        assert_eq!(value("container_cpu_cfs_throttled_seconds_total"), Some(1));
+        assert_eq!(value("container_cpu_cfs_periods_total"), None);
+        assert_eq!(value("container_memory_rss"), Some(1024));
+        assert_eq!(value("container_memory_cache"), None);
+        let faults: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.name == "container_memory_failures_total")
+            .collect();
+        assert_eq!(faults.len(), 2);
+        assert_eq!(
+            faults[0].label_values[LABELS.len()..],
+            ["pgfault", "hierarchy"]
+        );
+        assert_eq!(faults[0].value.as_ref().unwrap().value, 7);
+        assert_eq!(
+            faults[1].label_values[LABELS.len()..],
+            ["pgmajfault", "hierarchy"]
+        );
+        assert_eq!(faults[1].value.as_ref().unwrap().value, 2);
+    }
 
     #[test]
     fn native_descriptor_labels_values_and_units_match() {

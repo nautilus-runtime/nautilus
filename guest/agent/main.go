@@ -26,6 +26,7 @@ const runtimeRoot = "/run/nautilus/runc"
 const maxOutput = 256 * 1024
 
 var uuid = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+var errResponseTooLong = errors.New("response too long")
 
 func validID(s string) bool {
 	return uuid.MatchString(s) && s != "00000000-0000-0000-0000-000000000000"
@@ -101,13 +102,27 @@ func writeFrame(w io.Writer, data any) error {
 		return err
 	}
 	if len(body) > 1<<20 {
-		return errors.New("response too long")
+		return errResponseTooLong
 	}
 	if err = binary.Write(w, binary.BigEndian, uint32(len(body))); err != nil {
 		return err
 	}
 	_, err = w.Write(body)
 	return err
+}
+
+func writeResponse(w io.Writer, res response) error {
+	err := writeFrame(w, res)
+	if !errors.Is(err, errResponseTooLong) || res.Stats == nil {
+		return err
+	}
+	// Keep basic stats available for Pods whose extended sample exceeds the wire limit.
+	res.Stats.CgroupCounters = nil
+	for id, child := range res.Containers {
+		child.CgroupCounters = nil
+		res.Containers[id] = child
+	}
+	return writeFrame(w, res)
 }
 
 func (s *server) serve(f *os.File) {
@@ -148,7 +163,7 @@ func (s *server) serve(f *os.File) {
 	}
 	res.Version, res.ID = 1, req.ID
 	f.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	writeFrame(f, res)
+	writeResponse(f, res)
 }
 
 func mount(typ, source, path string, flags uintptr) error {

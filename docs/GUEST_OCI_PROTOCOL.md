@@ -23,6 +23,8 @@
 
 统计样本的 `timestamp` 为 Unix epoch 纳秒。必填的无符号计数为 `cpuUsageNanos`、`memoryUsageBytes`、`workingSetBytes`、`rssBytes`、`pageFaults` 和 `majorPageFaults`。两次独立采样间隔达到一秒后可提供 `usageNanoCores`，cgroup 有有限的内存上限时提供 `availableBytes`。采样失败返回错误。宿主按样本自身的时间戳填充 CRI 字段。[统计语义](VM_RUNTIME.md#guest-工作负载统计)
 
+扩展指标使用可选的 `cgroupCounters` 对象，按 `cpu.stat`、`memory.stat` 文件名及 Linux 字段名组织无符号计数。只填入已观测的 CPU user/system、CFS 限流、内存缓存/匿名页/内核内存/映射文件及缺页字段，零值照常发送。旧 agent 可以省略该对象。应答超出 1 MiB 时，guest 省略扩展计数并保留基础样本。
+
 状态应答具有 `createdAt`、`startedAt`、`finishedAt`，单位为 Unix epoch 纳秒，尚未发生的时间可省略。`exitCode` 在退出状态或 exec 结果中有效；信号退出取 128 加信号编号。guest 作为 subreaper 对容器 init 执行 wait，退出状态发布前会排空日志管道。宿主根据时间和状态填写 CRI 字段。
 
 成功应答具有 `{"version":1,"requestId":"…","ok":true,...}`。失败时 `ok=false`，`code` 取 `invalid`（协议、参数或 bundle）、`identity`、`not_found`、`conflict`（不符合当前生命周期）、`timeout`、`limit` 或 `runtime`，`message` 用于诊断。客户端首先检查 `ok`。格式损坏的请求可能没有可回显的 requestId。传输失败时 create/start/stop/remove 可对同一容器重新调用；exec 可能已经产生工作负载副作用，宿主须将断连报告给调用方。agent 以每次调用的 cgroup 回收 exec，覆盖超时、断连及脱离原进程组的后代。其他容器和目标容器的 init 继续运行。最多 32 个连接并发，其中最多 24 个执行 exec 或使用交互流。

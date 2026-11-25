@@ -5,7 +5,7 @@
 | 顺序 | 功能 | 使用场景和优先级 |
 | --- | --- | --- |
 | 1 · P0 | 交互式启动与 Attach | 开发、人工排障和 Agent 工具环境的交互入口。先修复原生 OCI Attach，再让 CLI 复用 OCI 和 VM 的同一调用路径。[#45](https://github.com/nautilus-runtime/nautilus/issues/45) |
-| 2 · P0 | CRI 扩展指标 | 已接通原生 cAdvisor 指标和 VM 基础 CPU、内存指标。后续补齐 guest 侧的扩展采样。[#40](https://github.com/nautilus-runtime/nautilus/issues/40) · [PR #47](https://github.com/nautilus-runtime/nautilus/pull/47) |
+| 2 · P0 | CRI 扩展指标 | 已接通原生 cAdvisor 指标和 VM guest CPU 限流、内存明细。guest 文件系统、块 I/O、网络及进程指标仍待实现。[#40](https://github.com/nautilus-runtime/nautilus/issues/40) · [PR #47](https://github.com/nautilus-runtime/nautilus/pull/47) |
 | 3 · P1 | 原地更新 CPU 和内存 | 在容量调整和部分自动扩缩容流程中触发。先实现原生容器和 kubelet 的 Pod 资源同步，再验证 VM 资源更新。[#41](https://github.com/nautilus-runtime/nautilus/issues/41) |
 | 4 · P2 | Checkpoint / Restore | 取证、长任务恢复和迁移时使用。优先交付原生 OCI 的单容器检查点。Kubernetes v1.37 的 Pod 级检查点与恢复是独立的 Alpha 路径。[#42](https://github.com/nautilus-runtime/nautilus/issues/42) · [Kubernetes 发布记录](https://kubernetes.io/blog/2026/08/26/kubernetes-v1-37-release/) |
 
