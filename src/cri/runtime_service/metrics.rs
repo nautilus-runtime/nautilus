@@ -563,16 +563,20 @@ struct BackingFilesystem {
 }
 
 fn filesystem_stats(bundle: &Path) -> Option<BackingFilesystem> {
-    let bundle = Root::open(bundle).ok()?;
+    let bundle_path = bundle.canonicalize().ok()?;
+    let bundle = Root::open(&bundle_path).ok()?;
     // OverlayFS charges changes to upper. A non-overlay container owns its
     // materialized rootfs directly.
-    let directory = match bundle.open_subpath("upper", DIRECTORY) {
-        Ok(directory) => directory,
+    let (directory, layer) = match bundle.open_subpath("upper", DIRECTORY) {
+        Ok(directory) => (directory, "upper"),
         Err(error) if error.kind() == ErrorKind::OsError(Some(libc::ENOENT)) => {
-            bundle.open_subpath("rootfs", DIRECTORY).ok()?
+            (bundle.open_subpath("rootfs", DIRECTORY).ok()?, "rootfs")
         }
         Err(_) => return None,
     };
+    let layer = bundle_path.join(layer);
+    // st_dev alone cannot distinguish a bind mount of the same filesystem.
+    crate::storage::snapshot::check_unmounted(&layer).ok()?;
     let fd = directory.as_raw_fd();
     let metadata = fs::metadata(format!("/proc/self/fd/{fd}")).ok()?;
     let dev = metadata.dev();
@@ -583,12 +587,17 @@ fn filesystem_stats(bundle: &Path) -> Option<BackingFilesystem> {
         inodes: stats.files(),
         inodes_free: stats.files_available(),
         capacity: stats.blocks().checked_mul(stats.fragment_size())?,
-        usage: writable_bytes(&root, dev, Duration::from_millis(250))
-            .and_then(|bytes| bytes.checked_add(metadata.blocks().checked_mul(512)?)),
+        usage: writable_bytes(&root, dev, Duration::from_millis(250)).and_then(|bytes| {
+            crate::storage::snapshot::check_unmounted(&layer).ok()?;
+            bytes.checked_add(metadata.blocks().checked_mul(512)?)
+        }),
     })
 }
 
-fn fd_counts(pid: u32, cgroup: &Path) -> Option<(u64, u64)> {
+fn fd_counts(pid: u32, cgroup: &Path, deadline: Instant) -> Option<(u64, u64)> {
+    if Instant::now() >= deadline {
+        return None;
+    }
     let relative = cgroup.strip_prefix("/sys/fs/cgroup").ok()?;
     let membership = format!("0::/{}", relative.display());
     let process = PathBuf::from(format!("/proc/{pid}"));
@@ -602,6 +611,9 @@ fn fd_counts(pid: u32, cgroup: &Path) -> Option<(u64, u64)> {
     let mut count = 0;
     let mut sockets = 0;
     for entry in fs::read_dir(process.join("fd")).ok()? {
+        if Instant::now() >= deadline {
+            return None;
+        }
         let path = entry.ok()?.path();
         match fs::read_link(path) {
             Ok(target) => {
@@ -627,8 +639,9 @@ fn process_counts(stat: &str, cgroup: &Path) -> Option<(u64, Option<(u64, u64)>)
         .map(|line| line.parse::<u32>().ok().filter(|pid| *pid > 0))
         .collect::<Option<HashSet<_>>>()?;
     let count = pids.len() as u64;
+    let deadline = Instant::now() + Duration::from_millis(50);
     let descriptors = pids.into_iter().try_fold((0, 0), |(files, sockets), pid| {
-        let (file_count, socket_count) = fd_counts(pid, cgroup)?;
+        let (file_count, socket_count) = fd_counts(pid, cgroup, deadline)?;
         Some((files + file_count, sockets + socket_count))
     });
     Some((count, descriptors))
@@ -777,7 +790,7 @@ fn network_metrics(stat: &str, labels: &[String]) -> Vec<Metric> {
         // Match cAdvisor's interface filter for Pod network counters.
         if name.is_empty()
             || ["lo", "veth", "docker", "nerdctl"]
-                .iter()
+                .into_iter()
                 .any(|prefix| lower.starts_with(prefix))
         {
             continue;
