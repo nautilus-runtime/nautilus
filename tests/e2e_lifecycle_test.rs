@@ -268,6 +268,7 @@ async fn test_e2e_state_persistence() {
             attempt: 0,
             vm_attempt: None,
             vm_probe: false,
+            standalone: false,
             cgroup_parent: String::new(),
             id: pod_id.clone(),
             name: "persistent-test-pod".to_string(),

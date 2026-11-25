@@ -96,6 +96,9 @@ pub struct PodState {
     /// Internal startup probe; kubelet must never enumerate this sandbox.
     #[serde(default)]
     pub vm_probe: bool,
+    /// Pod created by the standalone Nautilus client on the shared CRI socket.
+    #[serde(default)]
+    pub standalone: bool,
     /// Exact CRI cgroup parent assigned by kubelet.
     #[serde(default)]
     pub cgroup_parent: String,
@@ -174,6 +177,7 @@ pub struct StateManager {
     db: Arc<RwLock<Db>>,
     pod_containers: Arc<Mutex<PodContainers>>,
     container_events: broadcast::Sender<Arc<ContainerEvent>>,
+    all_container_events: broadcast::Sender<Arc<ContainerEvent>>,
 }
 
 #[derive(Debug, Default)]
@@ -263,6 +267,7 @@ fn publish_container_events(
     db: &Db,
     pod_containers: &PodContainers,
     sender: &broadcast::Sender<Arc<ContainerEvent>>,
+    all_sender: &broadcast::Sender<Arc<ContainerEvent>>,
     prior: Option<&ContainerState>,
     state: Option<&ContainerState>,
 ) -> Result<()> {
@@ -276,6 +281,10 @@ fn publish_container_events(
         .map(|value| serde_json::from_slice(&value))
         .transpose()?;
     if pod.as_ref().is_some_and(|pod| pod.vm_probe) {
+        return Ok(());
+    }
+    let cri_visible = !pod.as_ref().is_some_and(|pod| pod.standalone);
+    if all_sender.receiver_count() == 0 && (!cri_visible || sender.receiver_count() == 0) {
         return Ok(());
     }
 
@@ -304,13 +313,17 @@ fn publish_container_events(
                 container.finish_reason.clear();
             }
         }
-        let _ = sender.send(Arc::new(ContainerEvent {
+        let event = Arc::new(ContainerEvent {
             id: changed.id.clone(),
             kind,
             created_at: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             pod: pod.clone(),
             containers: snapshot,
-        }));
+        });
+        if cri_visible {
+            let _ = sender.send(event.clone());
+        }
+        let _ = all_sender.send(event);
     }
     Ok(())
 }
@@ -331,11 +344,16 @@ impl StateManager {
             db: Arc::new(RwLock::new(db)),
             pod_containers: Arc::new(Mutex::new(pod_containers)),
             container_events: broadcast::channel(CONTAINER_EVENT_CAPACITY).0,
+            all_container_events: broadcast::channel(CONTAINER_EVENT_CAPACITY).0,
         })
     }
 
     pub(crate) fn subscribe_container_events(&self) -> broadcast::Receiver<Arc<ContainerEvent>> {
         self.container_events.subscribe()
+    }
+
+    pub(crate) fn subscribe_all_container_events(&self) -> broadcast::Receiver<Arc<ContainerEvent>> {
+        self.all_container_events.subscribe()
     }
 
     /// Generate a new unique container ID
@@ -375,6 +393,7 @@ impl StateManager {
         let db = self.db.clone().write_owned().await;
         let pod_containers = self.pod_containers.clone();
         let events = self.container_events.clone();
+        let all_container_events = self.all_container_events.clone();
         let key = format!("container:{}", id);
         let state = state.cloned();
         tokio::task::spawn_blocking(move || {
@@ -386,8 +405,8 @@ impl StateManager {
             let mut pod_containers = pod_containers.lock().unwrap();
             pod_containers.update(prior.as_ref(), state.as_ref());
             db.flush()?;
-            if events.receiver_count() != 0 {
-                let published = publish_container_events(&db, &pod_containers, &events, prior.as_ref(), state.as_ref());
+            if events.receiver_count() != 0 || all_container_events.receiver_count() != 0 {
+                let published = publish_container_events(&db, &pod_containers, &events, &all_container_events, prior.as_ref(), state.as_ref());
                 if let Err(error) = published {
                     tracing::warn!(%error, "could not read committed container event snapshot");
                 }
@@ -623,6 +642,7 @@ mod event_tests {
         let mut rx = manager.subscribe_container_events();
         let probe_pod = PodState {
             id: "probe-pod".into(),
+            standalone: false,
             name: "probe".into(),
             namespace: "system".into(),
             uid: "probe-uid".into(),

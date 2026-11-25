@@ -234,6 +234,7 @@ async fn test_state_persistence() {
             attempt: 0,
             vm_attempt: None,
             vm_probe: false,
+            standalone: false,
             cgroup_parent: String::new(),
             id: "persistent-pod".to_string(),
             name: "test-pod".to_string(),
