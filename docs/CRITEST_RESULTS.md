@@ -54,6 +54,12 @@ cgroupfs 驱动也返回了匹配的计数。强制删除负载时，首次 Remo
 
 Kubernetes v1.37.2 的 `/stats/summary` 返回可用内存、RSS 和缺页计数。每个测试容器的可用内存与工作集之和等于其 64 MiB 限额。完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 381.696 秒，结束时 CRI Pod 与容器均为零。Linux 串行 Rust 测试 122 通过、0 失败、8 项忽略，严格 Clippy 保持基线的 29 项诊断。
 
+## 2026-11-25 CRI cAdvisor 兼容扩展指标
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）验证 `2e786b8`。CRI 返回 52 个描述符，覆盖 critest v1.37.0 要求的 45 个指标名。真实 OCI 测试写入 16 MiB 后，繁忙容器的可写层用量比空闲容器多 16,777,216 字节，同时读取到 1 个进程、4 个文件描述符和 1 个 socket。Pod 网络样本过滤了 loopback 和 cAdvisor 同样排除的接口。将同设备目录绑定到测试可写层后，CRI 省略文件系统用量，仍返回进程样本。[真实 CRI 验收脚本](../tests/native_cadvisor_acceptance.py) · [cAdvisor 接口过滤](https://github.com/google/cadvisor/blob/lib/v0.60.5/lib/container/libcontainer/handler.go#L378-L404)
+
+真实 kubelet v1.37.2 的 `/metrics/cadvisor` 在一个原生 Pod 上观察到 47 个指标族。使用 Cloud Hypervisor v55.0 和 virtiofsd 1.13.2，在同一 CRI socket 上同时运行 OCI 与 VM Pod，列表和以 EOF 结束的流式 RPC 返回相同的 Pod、容器和指标集合。VM 通过 guest 采样发布基础 CPU 和内存指标。[扩展指标任务 #40](https://github.com/nautilus-runtime/nautilus/issues/40)
+
 ## 2026-11-25 独立 CLI 与 kubelet 共用 socket
 
 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）用同一 daemon 启动真实 kubelet v1.37.2 和 Nautilus CLI。标准 CRI 清单返回 Kubernetes 创建的原生 OCI 和 VM 容器，CLI 创建的 WASI 容器仅在 CLI 清单可见。经过 65 秒，独立 WASI 容器仍可读出此前已经退出的进程日志，两个 Kubernetes Pod 保持 Running。连续十次前台 `--rm` 与一次显式删除均成功。
