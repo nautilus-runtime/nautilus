@@ -31,6 +31,9 @@ pub struct ContainerState {
     /// Resource limits requested via CRI (mapped to OCI linux.resources).
     #[serde(default)]
     pub resources: Option<crate::sandbox::ResourceLimits>,
+    /// Original controls before commit. After commit, only the freezer may need restoring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_resize_pending: Vec<NativeResizeValue>,
     /// Per-container security context (CRI LinuxContainerSecurityContext).
     #[serde(default)]
     pub security: Option<crate::sandbox::ContainerSecurity>,
@@ -57,6 +60,22 @@ pub struct ContainerState {
     pub tty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmContainer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeResizeValue {
+    pub control: NativeResizeControl,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeResizeControl {
+    CpuMax,
+    CpuWeight,
+    MemoryLimit,
+    SwapLimit,
+    OomGroup,
+    Frozen,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,13 +419,24 @@ impl StateManager {
         let state = state.cloned();
         tokio::task::spawn_blocking(move || {
             let prior = match &state {
-                Some(state) => db.insert(key, serde_json::to_vec(state)?)?,
-                None => db.remove(key)?,
+                Some(state) => db.insert(&key, serde_json::to_vec(state)?)?,
+                None => db.remove(&key)?,
             };
+            if let Err(error) = db.flush() {
+                let restore = match &prior {
+                    Some(value) => db.insert(&key, value.clone()),
+                    None => db.remove(&key),
+                };
+                if let Err(rollback) = restore.and_then(|_| db.flush()) {
+                    return Err(crate::core::Error::Runtime(format!(
+                        "container state commit: {error}; database rollback failed: {rollback}"
+                    )));
+                }
+                return Err(error.into());
+            }
             let prior = prior.and_then(|value| serde_json::from_slice(&value).ok());
             let mut pod_containers = pod_containers.lock().unwrap();
             pod_containers.update(prior.as_ref(), state.as_ref());
-            db.flush()?;
             if events.receiver_count() != 0 || all_container_events.receiver_count() != 0 {
                 let published = publish_container_events(&db, &pod_containers, &events, &all_container_events, prior.as_ref(), state.as_ref());
                 if let Err(error) = published {
@@ -562,6 +592,7 @@ mod event_tests {
             log_path: None,
             sandbox_kind: if vm.is_some() { "vm" } else { "runc" }.into(),
             resources: None,
+            native_resize_pending: Vec::new(),
             security: None,
             env: HashMap::new(),
             wasi_args: Vec::new(),

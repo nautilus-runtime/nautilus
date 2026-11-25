@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 原生 OCI CPU 与内存原地调整
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118、systemd 257）验证 `48c4112`。未修改 resize 相关配置的 kubelet v1.37.2 通过 Pod `/resize` 完成 Guaranteed 和 Burstable Pod 的升配与降配。Guaranteed Pod 从 250m/128 MiB 调到 500m/256 MiB，再调到 300m/96 MiB。容器 ID、PID、启动时间和重启次数均保持原值，CRI、Kubernetes、容器和 Pod cgroup 以及 systemd scope 报告一致，调整结束后容器已解冻。
+
+分别通过 systemd 和 cgroupfs 运行直接 CRI 验收。请求将内存上限降到低于当前用量的 8 MiB，并同时修改 CPU，RPC 返回 `FailedPrecondition`，两项限制都没有变化。停止并重新启动同一容器 ID 后，新进程继承调整后的限制。故障注入在部分 CPU 控制已写入、内存更新尚未提交时终止 daemon。daemon 重启后恢复旧 cgroup 值、CRI 状态和解冻状态，随后重试成功。[资源更新任务 #41](https://github.com/nautilus-runtime/nautilus/issues/41)
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**107 通过、0 失败、35 跳过**，耗时 311.270 秒，结束时无残留 Pod 或容器。Linux 串行 Rust 测试 134 通过、0 失败、8 项忽略。严格 Clippy 的 29 项诊断与基线一致，格式检查仍涉及基线的 31 个文件。
+
 ## 2026-11-25 cgroupfs 强制删除
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）复现旧版 cgroupfs 驱动的 `RemoveContainer` 超时。报错后读取 `cgroup.events` 已显示 `populated 0`，随后的目录删除成功。修复 `6fc8333` 对 libcgroups 超时后的 `EBUSY` 增加最多一秒的等待，保留持续失败时的内核错误。[问题 #57](https://github.com/nautilus-runtime/nautilus/issues/57) · [回归探针](../tests/native_cgroup_acceptance.py)

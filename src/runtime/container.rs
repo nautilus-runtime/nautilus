@@ -1,5 +1,5 @@
 use crate::core::{Config, Error, Result, StateManager};
-use crate::core::state::{ContainerState, ContainerStatus};
+use crate::core::state::{ContainerState, ContainerStatus, NativeResizeControl};
 use crate::sandbox::{SandboxRegistry, StartOutcome, WorkloadSpec};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -252,6 +252,7 @@ impl ContainerManager {
             log_path: Some(log_file.to_string_lossy().to_string()),
             sandbox_kind: sandbox_kind.to_string(),
             resources,
+            native_resize_pending: Vec::new(),
             security,
             env,
             wasi_args: if matches!(sandbox_kind, "wasi" | "wasm") { args.clone() } else { Vec::new() },
@@ -410,6 +411,7 @@ impl ContainerManager {
             }
         }
         // Reset bookkeeping from any previous run; backends repopulate it.
+        container_state.native_resize_pending.clear();
         container_state.started_at = None;
         container_state.finished_at = None;
         container_state.exit_code = None;
@@ -453,6 +455,108 @@ impl ContainerManager {
             self.spawn_reaper(container_id.to_string(), pid);
         }
         tracing::info!(container_id = %container_id, "Container started");
+        Ok(())
+    }
+
+    pub(crate) async fn resize_native_container(
+        &self,
+        id: &str,
+        patch: crate::sandbox::ResourceLimits,
+    ) -> Result<()> {
+        // The caller holds the Pod operation guard. This lock also serializes
+        // the resource commit against the native exit reaper.
+        let mut cache = self.containers.write().await;
+        let mut previous = self.state_manager.get_container_state(id).await?
+            .ok_or_else(|| Error::Container(format!("container {id} not found")))?;
+        if previous.sandbox_kind != "runc" {
+            return Err(Error::Experimental("live resize is supported for native OCI containers".into()));
+        }
+        let pid = previous.pid.filter(|&pid| pid > 0 && matches!(
+            previous.status, ContainerStatus::Running | ContainerStatus::Paused
+        )).ok_or_else(|| Error::Precondition(format!("container {id} is not running")))?;
+        let old = previous.resources.clone().unwrap_or_default();
+        let updated = old.with_native_resize(&patch)?;
+        let backend = crate::sandbox::runc_backend::RuncBackend::new(self._config.clone());
+        let container_id = id.to_string();
+        let pending = previous.native_resize_pending.clone();
+        let (live, original) = tokio::task::spawn_blocking(move || {
+            backend.restore_resize(&container_id, pid, &pending)?;
+            let live = backend.prepare_resize(&container_id, pid, &patch)?;
+            let original = live.original_values();
+            Ok::<_, Error>((live, original))
+        }).await.map_err(|e| Error::Runtime(format!("cgroup update worker: {e}")))??;
+        if updated == old && original.is_empty() && previous.native_resize_pending.is_empty() {
+            return Ok(());
+        }
+        if !original.is_empty() {
+            previous.native_resize_pending = original;
+            self.state_manager.save_container_state(&previous).await?;
+        }
+        let (live, applied) = tokio::task::spawn_blocking(move || {
+            let applied = live.apply();
+            (live, applied)
+        }).await.map_err(|e| Error::Runtime(format!("cgroup update worker: {e}")))?;
+        let mut next = previous.clone();
+        next.native_resize_pending.retain(|value| value.control == NativeResizeControl::Frozen);
+        next.resources = Some(updated);
+        let error = match applied {
+            Ok(()) => match self.state_manager.save_container_state(&next).await {
+                Ok(()) => {
+                    cache.insert(id.to_string(), next.clone());
+                    if !next.native_resize_pending.is_empty() {
+                        let freezer = next.native_resize_pending.clone();
+                        tokio::task::spawn_blocking(move || live.restore(&freezer))
+                            .await.map_err(|e| Error::Runtime(format!("cgroup thaw worker: {e}")))??;
+                        next.native_resize_pending.clear();
+                        // The committed snapshot still permits recovery if
+                        // clearing the now-idempotent thaw record fails.
+                        if let Err(error) = self.state_manager.save_container_state(&next).await {
+                            tracing::warn!(container_id = %id, %error, "could not clear native resize thaw record");
+                        } else {
+                            cache.insert(id.to_string(), next);
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        let original = previous.native_resize_pending.clone();
+        let rollback = tokio::task::spawn_blocking(move || live.restore(&original))
+            .await.map_err(|e| Error::Runtime(format!("cgroup rollback worker: {e}")))?;
+        if let Err(rollback) = rollback {
+            return Err(Error::Runtime(format!("{error}; cgroup rollback pending: {rollback}")));
+        }
+        previous.native_resize_pending.clear();
+        self.state_manager.save_container_state(&previous).await?;
+        cache.insert(id.to_string(), previous);
+        Err(error)
+    }
+
+    pub(crate) async fn recover_native_resizes(&self) -> Result<()> {
+        for mut state in self.state_manager.list_containers().await? {
+            if state.native_resize_pending.is_empty() {
+                continue;
+            }
+            let backend = crate::sandbox::runc_backend::RuncBackend::new(self._config.clone());
+            let work = state.clone();
+            let restored = tokio::task::spawn_blocking(move || {
+                if let Some(pid) = work.pid.filter(|pid| {
+                    matches!(work.status, ContainerStatus::Running | ContainerStatus::Paused)
+                        && std::path::Path::new(&format!("/proc/{pid}")).exists()
+                }) {
+                    backend.restore_resize(&work.id, pid, &work.native_resize_pending)?;
+                }
+                Ok::<_, Error>(())
+            }).await.map_err(|e| Error::Runtime(format!("cgroup recovery worker: {e}")))?;
+            if let Err(error) = restored {
+                tracing::error!(container_id = %state.id, %error, "native resize rollback is still pending");
+                continue;
+            }
+            state.native_resize_pending.clear();
+            self.state_manager.save_container_state(&state).await?;
+        }
         Ok(())
     }
 

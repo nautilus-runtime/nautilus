@@ -16,6 +16,62 @@ use tokio::fs;
 use tokio::process::Command;
 
 use super::init_io::InitIo;
+use super::ResourceLimits;
+
+mod resize;
+
+fn set_oci_resources(spec: &mut serde_json::Value, r: &ResourceLimits) {
+    let mut cpu = serde_json::Map::new();
+    if r.cpu_shares > 0 {
+        cpu.insert("shares".into(), serde_json::json!(r.cpu_shares));
+    }
+    if r.cpu_quota != 0 {
+        cpu.insert("quota".into(), serde_json::json!(r.cpu_quota));
+    }
+    if r.cpu_period != 0 {
+        cpu.insert("period".into(), serde_json::json!(r.cpu_period));
+    }
+    if !r.cpuset_cpus.is_empty() {
+        cpu.insert("cpusetCpus".into(), serde_json::json!(r.cpuset_cpus));
+    }
+    if !r.cpuset_mems.is_empty() {
+        cpu.insert("cpusetMems".into(), serde_json::json!(r.cpuset_mems));
+    }
+    if !cpu.is_empty() {
+        spec["linux"]["resources"]["cpu"] = serde_json::Value::Object(cpu);
+    }
+    if r.memory_limit_in_bytes > 0 {
+        spec["linux"]["resources"]["memory"]["limit"] = serde_json::json!(r.memory_limit_in_bytes);
+    } else if r.memory_limit_in_bytes == -1 {
+        spec.pointer_mut("/linux/resources/memory")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|memory| memory.remove("limit"));
+    }
+    if r.native_disable_swap {
+        spec["linux"]["resources"]["unified"]["memory.swap.max"] = serde_json::json!("0");
+    }
+    if let Some(group) = r.native_oom_group {
+        spec["linux"]["resources"]["unified"]["memory.oom.group"] =
+            serde_json::json!(if group { "1" } else { "0" });
+    }
+}
+
+fn refresh_oci_resources(bundle: &Path, resources: Option<&ResourceLimits>) -> Result<()> {
+    let Some(resources) = resources.filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+    let path = bundle.join("config.json");
+    let previous: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let mut next = previous.clone();
+    set_oci_resources(&mut next, resources);
+    if next != previous {
+        let mut file = tempfile::NamedTempFile::new_in(bundle)?;
+        file.as_file().set_permissions(std::fs::metadata(&path)?.permissions())?;
+        serde_json::to_writer_pretty(file.as_file_mut(), &next)?;
+        file.persist(path).map_err(|e| e.error)?;
+    }
+    Ok(())
+}
 
 /// Lifecycle driver behind the runc sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +234,10 @@ impl RuncBackend {
     }
 
     pub(crate) fn workload_cgroup_v2(&self, id: &str, pid: u32) -> Option<PathBuf> {
+        self.workload_cgroup_v2_owner(id, pid).map(|(path, _)| path)
+    }
+
+    fn workload_cgroup_v2_owner(&self, id: &str, pid: u32) -> Option<(PathBuf, bool)> {
         if self.driver() != Driver::Libcontainer {
             return None;
         }
@@ -198,7 +258,7 @@ impl RuncBackend {
             &config.cgroup_path,
             &membership,
             container.state.use_systemd,
-        )
+        ).map(|path| (path, container.state.use_systemd))
     }
 
     /// State directory for libcontainer-managed containers.
@@ -221,6 +281,7 @@ impl RuncBackend {
         let systemd = self.config.runtime.runc.systemd_cgroup;
         let id = spec.id.clone();
         let bundle = self.bundle_dir(&spec.id);
+        let resources = spec.resources.clone();
         let tty = spec.tty;
 
         // Pipes for the init's stdout/stderr: unlike socketpairs, pipe fds can
@@ -300,6 +361,7 @@ impl RuncBackend {
                 }
             }
 
+            refresh_oci_resources(&bundle, resources.as_ref())?;
             let mut builder = ContainerBuilder::new(id.clone(), SyscallType::Linux)
                 .with_root_path(&root)
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: root path: {e}")))?
@@ -890,35 +952,7 @@ impl RuncBackend {
         // memory limit). Only set keys the caller actually constrained; runc
         // rejects nulls inside resource blocks.
         if let Some(r) = resources.filter(|r| !r.is_empty()) {
-            let mut cpu = serde_json::Map::new();
-            if r.cpu_shares > 0 {
-                cpu.insert("shares".into(), serde_json::json!(r.cpu_shares));
-            }
-            if r.cpu_quota != 0 {
-                cpu.insert("quota".into(), serde_json::json!(r.cpu_quota));
-            }
-            if r.cpu_period != 0 {
-                cpu.insert("period".into(), serde_json::json!(r.cpu_period));
-            }
-            if !r.cpuset_cpus.is_empty() {
-                cpu.insert("cpusetCpus".into(), serde_json::json!(r.cpuset_cpus));
-            }
-            if !r.cpuset_mems.is_empty() {
-                cpu.insert("cpusetMems".into(), serde_json::json!(r.cpuset_mems));
-            }
-            let mut res = serde_json::Map::new();
-            if !cpu.is_empty() {
-                res.insert("cpu".into(), serde_json::Value::Object(cpu));
-            }
-            if r.memory_limit_in_bytes > 0 {
-                res.insert(
-                    "memory".into(),
-                    serde_json::json!({ "limit": r.memory_limit_in_bytes }),
-                );
-            }
-            if !res.is_empty() {
-                spec["linux"]["resources"] = serde_json::Value::Object(res);
-            }
+            set_oci_resources(&mut spec, r);
         }
 
         std::fs::write(bundle.join("config.json"), serde_json::to_vec_pretty(&spec)?)

@@ -315,6 +315,7 @@ async fn test_e2e_state_persistence() {
             log_path: Some("/tmp/container.log".to_string()),
             sandbox_kind: "runc".to_string(),
             resources: None,
+            native_resize_pending: Vec::new(),
             security: None,
             volumes: vec![],
             labels: HashMap::new(),

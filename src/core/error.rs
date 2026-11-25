@@ -17,6 +17,9 @@ pub enum Error {
     
     #[error("Container error: {0}")]
     Container(String),
+
+    #[error("Failed precondition: {0}")]
+    Precondition(String),
     
     #[error("Pod error: {0}")]
     Pod(String),
@@ -61,6 +64,7 @@ impl From<Error> for tonic::Status {
             Error::Network(msg) => tonic::Status::unavailable(msg),
             Error::Cri(msg) => tonic::Status::internal(msg),
             Error::Container(msg) => tonic::Status::not_found(msg),
+            Error::Precondition(msg) => tonic::Status::failed_precondition(msg),
             Error::Pod(msg) => tonic::Status::not_found(msg),
             Error::Image(msg) => tonic::Status::internal(msg),
             Error::Monitoring(msg) => tonic::Status::internal(msg),
