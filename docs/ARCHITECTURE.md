@@ -53,6 +53,8 @@ nautilusd ── systemd ── Cloud Hypervisor ── Pod guest
 宿主 CNI ── Pod netns / TAP ── guest NIC
 ```
 
+WASI 容器由 daemon 内的 Wasmtime 执行。CRI 先持久化 Running，再放行该次执行。CPU 密集的 guest 由 epoch 驱动让出调度，等待 WASI 时钟或异步日志 I/O 的任务也能由 Stop 取消。daemon 重启时将上一实例留下的 Running 记录收敛为 RuntimeRestarted，以便 kubelet 按 Pod 重启策略处理。
+
 ### 技术栈(实际依赖)
 
 | 领域 | 选型 | 说明 |

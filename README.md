@@ -67,7 +67,7 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads the module from its local filesystem. WASI stdout and stderr are captured in the workload log. The WASI backend executes batch commands to completion during start.
+The daemon reads the module from its local filesystem. WASI stdout and stderr are captured in the workload log. WASI commands run in the background with `-d` and can be stopped while running.
 
 ### Run a container in a Pod VM
 
