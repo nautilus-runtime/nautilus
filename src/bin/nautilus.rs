@@ -198,7 +198,9 @@ enum Commands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if !matches!(&cli.command, CliCommand::Cri(command) if matches!(**command, Commands::Run { detach: false, .. })) {
+    let foreground = matches!(&cli.command, CliCommand::Cri(command)
+        if matches!(**command, Commands::Run { detach: false, .. }));
+    if !foreground {
         // Foreground run must still reach container cleanup when stdout closes.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
     }
@@ -213,6 +215,11 @@ fn main() -> ExitCode {
             1
         }
     };
+    if foreground {
+        // Foreground cleanup has finished. A cancelled Tokio stdio write
+        // can still be waiting on a full output pipe in the blocking pool.
+        rt.shutdown_background();
+    }
     ExitCode::from(code)
 }
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Run the live foreground CLI against an isolated Nautilus daemon."""
 import argparse
+import fcntl
 import os
 import pty
 import select
 import signal
 import subprocess
+import struct
+import tempfile
 import termios
 import time
 import uuid
@@ -41,6 +44,29 @@ def check_cleanup(runtime):
     inventory = subprocess.check_output([*cli, "ps", "-a"], timeout=30)
     assert not any(name.encode() in inventory for name in names), inventory
     print(f"{runtime}: --rm left no test containers", flush=True)
+
+
+def blocked_output_run():
+    script = r"""trap 'exit 0' TERM
+yes foreground-output | head -c 1048576
+while :; do sleep 1; done
+"""
+    with subprocess.Popen(command("runc", "blocked-output", "-i", script),
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE) as child:
+        try:
+            fd = child.stdout.fileno()
+            capacity = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+            deadline = time.monotonic() + 15
+            while struct.unpack("I", fcntl.ioctl(fd, termios.FIONREAD, bytes(4)))[0] < capacity:
+                assert child.poll() is None and time.monotonic() < deadline
+                time.sleep(.02)
+            child.send_signal(signal.SIGINT)
+            assert child.wait(timeout=20) == 130
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+    print("runc: SIGINT stopped and removed the run with a full stdout pipe", flush=True)
 
 
 def terminal_run(runtime):
@@ -116,6 +142,15 @@ exit 37
             copied.returncode, len(copied.stdout), copied.stderr,
         )
         print(f"{runtime}: {len(binary)} binary bytes round-tripped", flush=True)
+
+        if runtime == "runc":
+            with tempfile.TemporaryFile() as source:
+                source.write(b"consumed:remaining")
+                source.seek(len(b"consumed:"))
+                copied = subprocess.run(command(runtime, "file-offset", "-i", "exec cat"),
+                                        stdin=source, capture_output=True, timeout=30)
+                assert (copied.returncode, copied.stdout) == (0, b"remaining"), copied
+            blocked_output_run()
 
         quick = run(runtime, "fast", "-i", "printf fast; printf error >&2; exit 31")
         assert (quick.returncode, quick.stdout, quick.stderr) == (31, b"fast", b"error"), (

@@ -360,6 +360,8 @@ enum Input {
 
 impl Input {
     fn open() -> io::Result<Self> {
+        use std::os::fd::AsFd;
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -368,7 +370,9 @@ impl Input {
             Ok(fd) => Ok(Self::Pollable(fd)),
             // Linux epoll rejects regular files and devices like /dev/null.
             Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
-                Ok(Self::File(tokio::fs::File::from_std(file)))
+                // Duplicate the inherited file to preserve its current offset.
+                let inherited = std::io::stdin().as_fd().try_clone_to_owned()?;
+                Ok(Self::File(tokio::fs::File::from_std(inherited.into())))
             }
             Err(e) => Err(e),
         }

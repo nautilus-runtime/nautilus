@@ -53,6 +53,8 @@ The CLI follows workload output and returns the workload exit code by default. P
 Foreground OCI and VM runs can use `-i` to forward stdin, `-t` to allocate a
 pseudo-terminal, or `-it` for an interactive shell. OCI attaches through the
 default libcontainer driver. VM runs use the guest agent's init streams.
+The first Attach can replay up to 16 KiB per output stream produced before
+the connection opens. For VM startup output, use an updated guest agent.
 
 ```bash
 printf 'hello\n' | sudo nautilus run -i --rm busybox:1.36 cat

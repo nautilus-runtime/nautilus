@@ -157,8 +157,9 @@ impl InitIo {
     }
 
     pub(crate) fn finish(&self, outcome: std::result::Result<i32, String>) {
-        self.close_stdin();
         self.terminal.lock().unwrap().take();
+        let mut input = self.input.lock().unwrap();
+        input.writer.take();
         self.exit.send_replace(Some(outcome));
     }
 
@@ -362,7 +363,7 @@ mod tests {
                     stdout: true,
                     ..Default::default()
                 },
-                true,
+                false,
                 cancel,
             )
             .unwrap();
