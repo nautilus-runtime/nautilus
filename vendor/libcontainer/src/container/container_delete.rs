@@ -1,7 +1,9 @@
 use std::fs;
+use std::io;
+use std::time::{Duration, Instant};
 
-use libcgroups::common::CgroupManager;
-use libcgroups::{self};
+use libcgroups::common::{AnyManagerError, CgroupManager, WrappedIoError};
+use libcgroups::v2::manager::V2ManagerError;
 use nix::sys::signal;
 
 use super::{Container, ContainerStatus};
@@ -9,6 +11,32 @@ use crate::config::YoukiConfig;
 use crate::error::LibcontainerError;
 use crate::hooks;
 use crate::process::intel_rdt::cleanup_intel_rdt;
+
+fn finish_cgroup_removal(error: AnyManagerError) -> Result<(), AnyManagerError> {
+    let AnyManagerError::V2(V2ManagerError::WrappedIo(WrappedIoError::Other { path, err })) = error
+    else {
+        return Err(error);
+    };
+    if err.kind() != io::ErrorKind::TimedOut {
+        return Err(V2ManagerError::from(WrappedIoError::Other { path, err }).into());
+    }
+
+    // libcgroups has already issued SIGKILL. Give the kernel time to release
+    // the cgroup and preserve the actual rmdir error if it stays busy.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match fs::remove_dir(&path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.raw_os_error() == Some(libc::EBUSY) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                return Err(V2ManagerError::from(WrappedIoError::Other { path, err }).into());
+            }
+        }
+    }
+}
 
 impl Container {
     /// Deletes the container
@@ -93,7 +121,7 @@ impl Container {
                             container_name: self.id().to_string(),
                         },
                     )?;
-                    cmanager.remove().map_err(|err| {
+                    cmanager.remove().or_else(finish_cgroup_removal).map_err(|err| {
                         tracing::error!(cgroup_path = ?config.cgroup_path, "failed to remove cgroup due to: {err:?}");
                         err
                     })?;

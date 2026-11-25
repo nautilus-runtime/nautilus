@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 cgroupfs 强制删除
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）复现旧版 cgroupfs 驱动的 `RemoveContainer` 超时。报错后读取 `cgroup.events` 已显示 `populated 0`，随后的目录删除成功。修复 `6fc8333` 对 libcgroups 超时后的 `EBUSY` 增加最多一秒的等待，保留持续失败时的内核错误。[问题 #57](https://github.com/nautilus-runtime/nautilus/issues/57) · [回归探针](../tests/native_cgroup_acceptance.py)
+
+通过真实 CRI socket 连续执行 20 轮繁忙容器与空闲邻居强制删除，两者每轮首次删除均成功，所有 cgroup 目录均回收。另模拟延迟释放 cgroup，旧版在 0.166 秒报错，修复版在 0.327 秒成功。保留子 cgroup 时，修复版在 1.173 秒返回 `EBUSY`。清除子 cgroup 后重试可清理。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 301.874 秒，结束时 CRI Pod 与容器均为零。Linux 串行 Rust 测试 121 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
+
 ## 2026-11-25 原生 OCI init Attach
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）使用 Kubernetes v1.37.2 验证 `f046243`。管道模式连接 PID 1，返回首条 stdout、独立 stderr 和 stdin 输入。客户端关闭 stdin 后，init 观察到 EOF，输出仍进入 CRI 日志，`kubectl attach` 返回退出码 37。TTY 模式首次接入时读取启动输出，窗口从 24×80 调到 33×101。断开后重连同一个 init，Ctrl-C 触发 init 的信号处理并返回退出码 42。删除测试命名空间后 CRI 中没有该命名空间的 Pod sandbox 或容器。[真实 kubelet 验收脚本](../tests/kubelet_oci_attach_acceptance.py)
@@ -29,6 +37,12 @@ cgroupfs 驱动也返回了匹配的计数。强制删除负载时，首次 Remo
 在 Kubernetes v1.37.2 启用 `PodAndContainerStatsFromCRI` 后，真实 kubelet 的 `/stats/summary` 分别返回忙容器 490,809,000 ns 和空闲容器 8,649,000 ns，内存工作集相差 16,908,288 字节。Linux 串行 Rust 测试 118 通过、0 失败、8 项忽略。与原生 Attach 分支联合构建后，121 通过、0 失败、8 项忽略。联合构建严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
 
 完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 292.595 秒。结束时 CRI Pod 与容器均为零。
+
+## 2026-11-25 原生 OCI 内存、交换和压力统计
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）验证 `848deb0`。通过真实 CRI socket 将容器 RSS、主缺页和次缺页、64 MiB 限额下的可用内存、交换空间用量和 CPU／内存／I/O 压力累计时间与所属 cgroup 文件核对。Pod CPU 和工作集等于容器之和。[回归探针](../tests/native_cgroup_acceptance.py)
+
+Kubernetes v1.37.2 的 `/stats/summary` 返回可用内存、RSS 和缺页计数。每个测试容器的可用内存与工作集之和等于其 64 MiB 限额。完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 381.696 秒，结束时 CRI Pod 与容器均为零。Linux 串行 Rust 测试 122 通过、0 失败、8 项忽略，严格 Clippy 保持基线的 29 项诊断。
 
 ## 2026-11-25 独立 CLI 与 kubelet 共用 socket
 
