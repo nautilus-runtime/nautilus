@@ -215,6 +215,11 @@ impl NautilusRuntimeService {
 }
 
 impl NautilusRuntimeService {
+    pub async fn recover_workloads(&self) -> crate::core::Result<()> {
+        self.container_manager.recover_managed_workloads().await?;
+        self.recover_vm_pods().await
+    }
+
     pub async fn recover_vm_pods(&self) -> crate::core::Result<()> {
         self.pod_manager.recover_vm_pods().await?;
         self.container_manager.recover_guest_containers().await
@@ -1124,8 +1129,19 @@ impl RuntimeService for NautilusRuntimeService {
                 .map_err(Status::from)?;
         }
 
-        self.container_manager.start_container(&req.container_id).await
-            .map_err(|e| Status::internal(format!("Failed to start container: {}", e)))?;
+        let result = if matches!(before.sandbox_kind.as_str(), "wasi" | "wasm") {
+            // Finish the state/activation handoff under the Pod lock even if the RPC is cancelled.
+            let manager = self.container_manager.clone();
+            tokio::spawn(async move {
+                let _guard = _guard;
+                manager.start_container(&req.container_id).await
+            })
+            .await
+            .map_err(|e| Status::internal(format!("WASI startup task stopped: {e}")))?
+        } else {
+            self.container_manager.start_container(&req.container_id).await
+        };
+        result.map_err(|e| Status::internal(format!("Failed to start container: {e}")))?;
         
         Ok(Response::new(StartContainerResponse {}))
     }
