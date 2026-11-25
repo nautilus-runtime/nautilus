@@ -4,8 +4,8 @@ use crate::sandbox::{SandboxRegistry, StartOutcome, WorkloadSpec};
 use std::collections::HashMap;
 use std::time::Duration;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{RwLock, watch};
 
 
 fn reap_if_exited(pid: i32) -> std::io::Result<Option<i32>> {
@@ -85,6 +85,8 @@ async fn wait_for_workload(pid: i32) -> std::io::Result<i32> {
 
 mod vm;
 
+type NativeExits = Arc<Mutex<HashMap<(String, u32), watch::Receiver<()>>>>;
+
 pub(crate) struct CreateWorkload<'a> {
     pub pod_id: &'a str,
     pub name: &'a str,
@@ -110,6 +112,7 @@ pub(crate) struct CreateWorkload<'a> {
 #[derive(Clone)]
 pub struct ContainerManager {
     vm_operations: Arc<crate::runtime::OperationLocks>,
+    native_exits: NativeExits,
     _config: Arc<Config>,
     state_manager: Arc<StateManager>,
     sandbox_registry: Arc<SandboxRegistry>,
@@ -124,6 +127,7 @@ impl ContainerManager {
     ) -> Self {
         Self {
             vm_operations: Default::default(),
+            native_exits: Default::default(),
             _config: config,
             state_manager,
             sandbox_registry,
@@ -411,9 +415,6 @@ impl ContainerManager {
         container_state.exit_code = None;
         container_state.pid = None;
 
-        // Persist the transient state so concurrent starts observe a sane view.
-        self.state_manager.save_container_state(&container_state).await?;
-
         let backend = self.backend_for(&container_state)?;
         let spec = self.workload_spec_with_net(&container_state).await?;
         let managed = match backend.start(&spec).await? {
@@ -436,9 +437,9 @@ impl ContainerManager {
             }
         };
 
-        self.state_manager.save_container_state(&container_state).await?;
         {
             let mut containers = self.containers.write().await;
+            self.state_manager.save_container_state(&container_state).await?;
             containers.insert(container_id.to_string(), container_state.clone());
         }
 
@@ -448,17 +449,10 @@ impl ContainerManager {
         }
 
         self.publish_rules(&container_state).await;
-
-        tracing::info!(container_id = %container_id, "Container started");
-
-        // Exit reaper: without it a short-lived OCI workload stays "Running"
-        // forever (no one waits its pid) and docker-style flows — `run --rm`,
-        // `ps` showing Exited(n), prune — never observe completion.
-        if container_state.status == ContainerStatus::Running {
-            if let Some(pid) = container_state.pid.filter(|p| *p > 0) {
-                self.spawn_reaper(container_id.to_string(), pid);
-            }
+        if let Some(pid) = container_state.pid.filter(|p| *p > 0) {
+            self.spawn_reaper(container_id.to_string(), pid);
         }
+        tracing::info!(container_id = %container_id, "Container started");
         Ok(())
     }
 
@@ -513,11 +507,16 @@ impl ContainerManager {
     fn spawn_reaper(&self, container_id: String, pid: u32) {
         let state_manager = self.state_manager.clone();
         let cache = self.containers.clone();
+        let exits = self.native_exits.clone();
+        let key = (container_id.clone(), pid);
+        let (done, receiver) = watch::channel(());
+        exits.lock().unwrap().insert(key.clone(), receiver);
         tokio::spawn(async move {
             let code = match wait_for_workload(pid as i32).await {
                 Ok(code) => code,
                 Err(error) => {
                     tracing::error!(%container_id, %pid, %error, "could not watch workload exit");
+                    exits.lock().unwrap().remove(&key);
                     return;
                 }
             };
@@ -546,11 +545,17 @@ impl ContainerManager {
                     s.finished_at = Some(chrono::Utc::now());
                     s.exit_code = Some(code);
                     if !reason.is_empty() { s.finish_reason = reason; }
-                    let _ = state_manager.save_container_state(&s).await;
-                    tracing::info!(container_id = %container_id, exit_code = code, reason = %s.finish_reason, "workload exited");
-                    cache.insert(container_id, s);
+                    match state_manager.save_container_state(&s).await {
+                        Ok(()) => {
+                            tracing::info!(container_id = %container_id, exit_code = code, reason = %s.finish_reason, "workload exited");
+                            cache.insert(container_id, s);
+                        }
+                        Err(error) => tracing::error!(%container_id, %error, "could not record workload exit"),
+                    }
                 }
             }
+            exits.lock().unwrap().remove(&key);
+            drop(done);
         });
     }
 
@@ -626,7 +631,7 @@ impl ContainerManager {
     }
 
     pub async fn stop_container(&self, container_id: &str, timeout: Option<u64>) -> Result<()> {
-        let mut container_state = self.get_container_state(container_id).await?
+        let container_state = self.get_container_state(container_id).await?
             .ok_or_else(|| Error::Container(format!("Container {} not found", container_id)))?;
 
         if container_state.sandbox_kind == "vm" {
@@ -652,17 +657,29 @@ impl ContainerManager {
         let backend = self.backend_for(&container_state)?;
         let grace = Duration::from_secs(timeout.unwrap_or(0));
         let exit_code = backend.stop(container_id, grace).await?;
+        if exit_code.is_none() {
+            if let Some(pid) = container_state.pid {
+                let exit = self.native_exits.lock().unwrap().get(&(container_id.to_string(), pid)).cloned();
+                if let Some(mut exit) = exit {
+                    // The backend confirms termination, while waitpid supplies the actual exit code.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), exit.changed())
+                        .await
+                        .map_err(|_| Error::Runtime(format!(
+                            "waiting for the exit status of container {container_id}"
+                        )))?;
+                }
+            }
+        }
         // The exit watcher may already have recorded the actual status.
         let mut cache = self.containers.write().await;
-        if let Some(observed) = self.state_manager.get_container_state(container_id).await? {
-            container_state = observed;
-        }
-        if container_state.status == ContainerStatus::Running {
-            container_state.status = ContainerStatus::Stopped;
-            container_state.finished_at = Some(chrono::Utc::now());
-            container_state.exit_code = exit_code.or(Some(-1));
-            self.state_manager.save_container_state(&container_state).await?;
-            cache.insert(container_id.to_string(), container_state);
+        if let Some(mut observed) = self.state_manager.get_container_state(container_id).await? {
+            if observed.status == ContainerStatus::Running {
+                observed.status = ContainerStatus::Stopped;
+                observed.finished_at = Some(chrono::Utc::now());
+                observed.exit_code = exit_code.or(Some(-1));
+                self.state_manager.save_container_state(&observed).await?;
+                cache.insert(container_id.to_string(), observed);
+            }
         }
         drop(cache);
 
@@ -686,9 +703,7 @@ impl ContainerManager {
 
         // CRI allows removing a running container; runtime force-stops it.
         if container_state.status == ContainerStatus::Running {
-            let backend = self.backend_for(&container_state)?;
-            backend.stop(container_id, Duration::ZERO).await?;
-            crate::network::publish::remove(container_id).await;
+            self.stop_container(container_id, None).await?;
         }
 
         let backend = self.backend_for(&container_state)?;
@@ -730,17 +745,16 @@ impl ContainerManager {
             }
         }
 
-        // If not in cache, load from state manager
-        if let Some(state) = self.state_manager.get_container_state(container_id).await? {
-            // Cache it for future use
-            {
-                let mut containers = self.containers.write().await;
-                containers.insert(container_id.to_string(), state.clone());
-            }
-            Ok(Some(state))
-        } else {
-            Ok(None)
+        // Do not fill a cold cache with a record another operation has replaced or deleted.
+        let mut containers = self.containers.write().await;
+        if let Some(state) = containers.get(container_id) {
+            return Ok(Some(state.clone()));
         }
+        let state = self.state_manager.get_container_state(container_id).await?;
+        if let Some(state) = &state {
+            containers.insert(container_id.to_string(), state.clone());
+        }
+        Ok(state)
     }
 
     /// List all containers
