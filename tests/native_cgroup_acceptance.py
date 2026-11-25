@@ -57,6 +57,7 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
     }))
     pod = ""
     containers = []
+    groups = set()
     try:
         pod = cri("runp", "--runtime", "runc", str(pod_spec))
         workloads = {
@@ -70,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
                 "metadata": {"name": name},
                 "image": {"image": args.image},
                 "command": ["/bin/sh", "-c", cmd],
-                "linux": {},
+                "linux": {"resources": {"memory_limit_in_bytes": 67108864}},
             }))
             container = cri("create", pod, str(container_spec), str(pod_spec))
             containers.append(container)
@@ -82,8 +83,26 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
             lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
             member = next(line.removeprefix("0::/") for line in lines if line.startswith("0::/"))
             group = Path("/sys/fs/cgroup") / member
+            groups.add(group)
             cpu = lambda: keyed_counter(group / "cpu.stat", "usage_usec") * 1000
+            def memory_stat():
+                return {k: int(v) for k, v in (line.split() for line in
+                        (group / "memory.stat").read_text().splitlines())}
+
+            def pressure():
+                readings = {}
+                for name in ("cpu", "memory", "io"):
+                    path = group / f"{name}.pressure"
+                    if path.exists():
+                        for line in path.read_text().splitlines():
+                            kind, *fields = line.split()
+                            total = next(word for word in fields if word.startswith("total="))
+                            readings[name, kind] = int(total.removeprefix("total=")) * 1000
+                return readings
+
             before = cpu()
+            before_stat = memory_stat()
+            before_pressure = pressure()
             sample = container_stats(container)
             after = cpu()
             usage = counter(sample, "memory", "usageBytes")
@@ -95,6 +114,32 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
             # Kernel counters can change while the process is running.
             assert abs(working_set - expected) < 1 << 20, (working_set, expected)
             assert 0 <= working_set <= usage, (working_set, usage)
+            after_stat = memory_stat()
+            if {"anon", "swapcached"} <= after_stat.keys():
+                rss = counter(sample, "memory", "rssBytes")
+                assert abs(rss - after_stat["anon"] - after_stat["swapcached"]) < 1 << 20
+            minor = counter(sample, "memory", "pageFaults")
+            major = counter(sample, "memory", "majorPageFaults")
+            for values, minimum, maximum in [
+                (minor, before_stat["pgfault"] - before_stat["pgmajfault"],
+                    after_stat["pgfault"] - after_stat["pgmajfault"]),
+                (major, before_stat["pgmajfault"], after_stat["pgmajfault"]),
+            ]:
+                assert minimum <= values <= maximum, (minimum, values, maximum)
+            assert counter(sample, "memory", "availableBytes") == 67108864 - working_set
+
+            swap_file = group / "memory.swap.current"
+            if swap_file.exists():
+                swap = counter(sample, "swap", "swapUsageBytes")
+                assert swap == int(swap_file.read_text()), (swap, swap_file.read_text())
+
+            after_pressure = pressure()
+            for (resource, kind), start in before_pressure.items():
+                values = sample[resource]["psi"]
+                entry = values.get(kind, values.get(kind.capitalize()))
+                assert entry is not None, (resource, kind, values)
+                total = int(entry["total"] if "total" in entry else entry.get("Total", 0))
+                assert start <= total <= after_pressure[resource, kind]
             return (measured, working_set, pid, group)
 
         busy, idle = containers
@@ -120,18 +165,26 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
             assert counter(stats, group, field) == sum(counter(s, group, field) for s in reported)
         print(f"PASS native cgroup v2: busy CPU +{busy_ns} ns, init +{init_consumed} ns, "
               f"idle +{idle_ns} ns; working sets {busy_last[1]} and {idle_last[1]} bytes; "
-              f"Pod CPU and working set equal the container sums")
+              f"Pod CPU and working set equal container sums, detailed memory, swap and PSI match kernel files")
     finally:
+        cleanup_error = None
         for container in containers:
-            # cgroupfs can report a transient busy scope after SIGKILL.
-            for attempt in range(5):
+            try:
+                cri("rm", "-f", container)
+            except subprocess.CalledProcessError as error:
+                # Clean up the fixture but fail if the first removal failed.
+                cleanup_error = cleanup_error or error
+                time.sleep(1)
                 try:
                     cri("rm", "-f", container)
-                    break
                 except subprocess.CalledProcessError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(1)
+                    pass
         if pod:
-            cri("stopp", pod)
-            cri("rmp", pod)
+            for operation in ("stopp", "rmp"):
+                try:
+                    cri(operation, pod)
+                except subprocess.CalledProcessError as error:
+                    cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise cleanup_error
+        assert all(not group.exists() for group in groups), groups
