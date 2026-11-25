@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 OCI 镜像元数据校验
+
+在 pro6000 的独立 Debian 13 节点（Linux 6.12.118）以 OCI WASI 联合构建验证，共用的 CRI ImageService 从 TLS Registry 拉取多架构镜像。分别篡改 registry 返回的 manifest digest、index 所选子 manifest 和 config JSON，三种拉取均被拒绝。使用 SHA-512 校验 config descriptor 的镜像仍以配置原始字节的 SHA-256 作为 CRI ImageID，kubelet v1.37.2 用该镜像成功启动 WASI 命令。
+
+联合构建在同一 Unix socket 同时测试 Runtime 和 Image 端点。完整 `critest` v1.37.0 为 105 通过、0 失败、37 跳过，耗时 294.798 秒，结束时 Pod 与容器列表均为空。
+
 ## 2026-11-25 WASI 异步生命周期
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118）验证。忙循环和等待 WASI 时钟的模块均在仍然运行时返回容器 ID，随后从 CRI 停止并得到退出码 137。重复停止成功。前台输出和 Ctrl-C 后 `--rm` 回收通过。强制终止 daemon 后，重启在同一状态库中将原实例标为 `RuntimeRestarted`，最后 CRI Pod 和容器列表均为空。
