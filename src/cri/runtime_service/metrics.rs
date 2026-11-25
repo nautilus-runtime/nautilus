@@ -773,7 +773,13 @@ fn network_metrics(stat: &str, labels: &[String]) -> Vec<Metric> {
             continue;
         };
         let name = name.trim();
-        if name.is_empty() {
+        let lower = name.to_ascii_lowercase();
+        // Match cAdvisor's interface filter for Pod network counters.
+        if name.is_empty()
+            || ["lo", "veth", "docker", "nerdctl"]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+        {
             continue;
         }
         let counters: Vec<_> = counters.split_ascii_whitespace().collect();
@@ -1015,7 +1021,7 @@ mod tests {
     #[test]
     fn pod_network_stats_keep_interface_and_rx_tx_fields() {
         let series = network_metrics(
-            "Inter-| Receive | Transmit\n  eth0: 1 2 3 4 0 0 0 0  11 12 13 14 0 0 0 0\n",
+            "Inter-| Receive | Transmit\n+             eth0: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n+             Lo: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n+             Veth1: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n",
             &LABELS.map(String::from),
         );
         assert_eq!(series.len(), 8);
