@@ -277,7 +277,8 @@ debug 日志级别下 libcontainer 内部行可能泄入 exec 流输出(生产 I
 - grpc-timeout 三层强制(预算下限 + tokio 定时器 + Instant 回检)
 - exec_sync 超时下沉 backend(WNOHANG + SIGKILL + reap,不泄漏进程)
 - 资源统计:container_stats / list_container_stats / pod_sandbox_stats
-  (/proc 进程级计账);`scripts/measure_memory.sh` 内存测量
+  (原生 libcontainer 容器优先读取自身 cgroup v2 的 CPU 累计时间与内存工作集，
+  缺少 cgroup 计数时回退到 `/proc` 进程统计);`scripts/measure_memory.sh` 内存测量
 
 ## 6. 验证体系
 
