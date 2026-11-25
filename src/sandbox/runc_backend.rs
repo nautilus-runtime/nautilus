@@ -30,19 +30,22 @@ enum Driver {
 // The saved libcontainer config owns this triplet for the lifetime of the
 // container. Validate the complete slice hierarchy reported by libcgroups.
 fn owns_systemd_scope(container: &Container, scope: &Path) -> bool {
-    let Ok(config) = container.spec() else {
-        return false;
-    };
-    let Some(triplet) = config.cgroup_path.to_str() else {
+    container
+        .spec()
+        .is_ok_and(|config| matches_systemd_scope(container.id(), &config.cgroup_path, scope))
+}
+
+fn matches_systemd_scope(id: &str, configured: &Path, scope: &Path) -> bool {
+    let Some(triplet) = configured.to_str() else {
         return false;
     };
     let Some((slice, unit)) = triplet.split_once(':') else {
         return false;
     };
-    let Some((prefix, id)) = unit.split_once(':') else {
+    let Some((prefix, configured_id)) = unit.split_once(':') else {
         return false;
     };
-    if id != container.id() {
+    if configured_id != id {
         return false;
     }
     let expected_slice = match (slice, prefix) {
@@ -66,6 +69,39 @@ fn owns_systemd_scope(container: &Container, scope: &Path) -> bool {
         .and_then(|name| crate::vm::resources::parent_slice(name).ok().flatten())
         .as_deref()
         == Some(expected_slice)
+}
+
+fn cgroup_v2_relative(path: &Path) -> Option<&Path> {
+    let relative = path.strip_prefix("/").ok()?;
+    (!relative.as_os_str().is_empty()
+        && relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))))
+    .then_some(relative)
+}
+
+fn owned_cgroup_v2(
+    id: &str,
+    configured: &Path,
+    membership: &str,
+    systemd: bool,
+) -> Option<PathBuf> {
+    let root = Path::new("/sys/fs/cgroup");
+    let member = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let member = root.join(cgroup_v2_relative(Path::new(member))?);
+    if systemd {
+        return member
+            .ancestors()
+            .find(|scope| matches_systemd_scope(id, configured, scope))
+            .map(Path::to_owned);
+    }
+
+    let relative = cgroup_v2_relative(configured)?;
+    let scope = root.join(relative);
+    (relative.file_name() == Some(std::ffi::OsStr::new(id)) && member.starts_with(&scope))
+        .then_some(scope)
 }
 
 // The init can exit between libcontainer's liveness check and its next
@@ -140,6 +176,30 @@ impl RuncBackend {
             "exec" => Driver::Exec,
             _ => Driver::Libcontainer,
         }
+    }
+
+    pub(crate) fn workload_cgroup_v2(&self, id: &str, pid: u32) -> Option<PathBuf> {
+        if self.driver() != Driver::Libcontainer {
+            return None;
+        }
+        let root = self.config.runtime.runc.root.join(id);
+        let state = OciState::load(&root).ok()?;
+        if state.id != id
+            || state.pid != Some(i32::try_from(pid).ok()?)
+            || state.bundle != self.bundle_dir(id).canonicalize().ok()?
+            || !matches!(state.status, OciStatus::Running | OciStatus::Paused)
+        {
+            return None;
+        }
+        let container = Container { state, root };
+        let config = container.spec().ok()?;
+        let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        owned_cgroup_v2(
+            id,
+            &config.cgroup_path,
+            &membership,
+            container.state.use_systemd,
+        )
     }
 
     /// State directory for libcontainer-managed containers.
@@ -1775,6 +1835,66 @@ mod stop_tests {
         )
         .unwrap();
         assert!(!owns_systemd_scope(&container, &scope));
+    }
+
+    #[test]
+    fn unified_systemd_stats_use_the_owned_scope_for_nested_init() {
+        let config = Path::new("kubepods-burstable.slice:nautilus:init");
+        let scope = "/kubepods.slice/kubepods-burstable.slice/nautilus-init.scope";
+        assert_eq!(
+            owned_cgroup_v2("init", config, &format!("0::{scope}/nested\n"), true),
+            Some(Path::new("/sys/fs/cgroup").join(scope.trim_start_matches('/')))
+        );
+        for member in [
+            "0::/kubepods-burstable.slice/nautilus-init.scope",
+            "0::/kubepods.slice/kubepods-burstable.slice/nautilus-peer.scope",
+            "0::/kubepods.slice/kubepods-burstable.slice/nautilus-init.scope/../other",
+            "3:cpu:/kubepods.slice/kubepods-burstable.slice/nautilus-init.scope",
+            "0::/",
+        ] {
+            assert_eq!(
+                owned_cgroup_v2("init", config, member, true),
+                None,
+                "{member}"
+            );
+        }
+        let member = "0::/system.slice/youki-init.scope";
+        assert_eq!(
+            owned_cgroup_v2("init", Path::new(":youki:init"), member, true),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/system.slice/youki-init.scope"
+            ))
+        );
+    }
+
+    #[test]
+    fn unified_cgroupfs_stats_require_the_saved_container_path() {
+        let config = Path::new("/kubepods/pod01/init");
+        for member in [
+            "2:cpuset:/other\n0::/kubepods/pod01/init\n",
+            "0::/kubepods/pod01/init/nested",
+        ] {
+            assert_eq!(
+                owned_cgroup_v2("init", config, member, false),
+                Some(PathBuf::from("/sys/fs/cgroup/kubepods/pod01/init"))
+            );
+        }
+        for member in [
+            "0::/kubepods/pod01/init-peer",
+            "0::/kubepods/pod02/init",
+            "0::/kubepods/pod01",
+            "0::/kubepods/pod01/init/..",
+        ] {
+            assert_eq!(
+                owned_cgroup_v2("init", config, member, false),
+                None,
+                "{member}"
+            );
+        }
+        assert_eq!(
+            owned_cgroup_v2("peer", config, "0::/kubepods/pod01/init", false),
+            None
+        );
     }
 
     #[tokio::test]

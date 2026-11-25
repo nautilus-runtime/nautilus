@@ -20,6 +20,16 @@
 
 首轮 `critest` v1.37.0 的安全上下文用例因公开 Registry CDN 拉取超时失败。预拉取该用例镜像后，对同一候选版本和 socket 重跑未过滤的 Runtime 与 Image 套件，105 通过、0 失败、37 跳过，耗时 264.137 秒，结束时 CRI Pod 和容器数均为零。Linux 串行 Rust 测试为 114 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
 
+## 2026-11-25 原生 OCI cgroup v2 用量
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）用真实 CRI socket 验证 `fde4793`。systemd 驱动下，运行负载的子进程增加约 1.53 秒 CPU 时间。其 init 和同 Pod 的空闲容器 CPU 增量均为 0。两容器工作集为 17,125,376 和 167,936 字节。CPU 与内存采样均与宿主 cgroup 文件核对，Pod 的计数等于两容器之和。
+
+cgroupfs 驱动也返回了匹配的计数。强制删除负载时，首次 RemoveContainer 收到 cgroup 回收超时。基线构建也复现了该现象。两次均经重试清理全部测试 Pod 与容器。[真实 CRI 验收脚本](../tests/native_cgroup_acceptance.py) · [跟踪问题 #57](https://github.com/nautilus-runtime/nautilus/issues/57)
+
+在 Kubernetes v1.37.2 启用 `PodAndContainerStatsFromCRI` 后，真实 kubelet 的 `/stats/summary` 分别返回忙容器 490,809,000 ns 和空闲容器 8,649,000 ns，内存工作集相差 16,908,288 字节。Linux 串行 Rust 测试 118 通过、0 失败、8 项忽略。与原生 Attach 分支联合构建后，121 通过、0 失败、8 项忽略。联合构建严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 292.595 秒。结束时 CRI Pod 与容器均为零。
+
 ## 2026-11-25 独立 CLI 与 kubelet 共用 socket
 
 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）用同一 daemon 启动真实 kubelet v1.37.2 和 Nautilus CLI。标准 CRI 清单返回 Kubernetes 创建的原生 OCI 和 VM 容器，CLI 创建的 WASI 容器仅在 CLI 清单可见。经过 65 秒，独立 WASI 容器仍可读出此前已经退出的进程日志，两个 Kubernetes Pod 保持 Running。连续十次前台 `--rm` 与一次显式删除均成功。

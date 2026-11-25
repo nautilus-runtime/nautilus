@@ -414,14 +414,10 @@ impl NautilusRuntimeService {
         Ok(())
     }
 
-    /// Process-level accounting via /proc — no cgroup-path coupling, works for
-    /// any backend that reports a pid. (cgroup-native stats land with the
-    /// metrics pipeline.)
     async fn stats_response(
         &self,
         container_id: &str,
     ) -> Result<crate::proto::runtime::v1::ContainerStats, Status> {
-        use crate::proto::runtime::v1 as rt;
         let c = self
             .container_manager
             .get_container_state(container_id)
@@ -429,62 +425,13 @@ impl NautilusRuntimeService {
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("container {} not found", container_id)))?;
 
-        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         if c.sandbox_kind == "vm" {
             return self.guest_container_stats(&c).await;
         }
-        let (cpu_ns, mem_bytes) = match c.pid {
-            Some(pid) if pid > 0 => {
-                let stat = tokio::fs::read_to_string(format!("/proc/{}/stat", pid))
-                    .await
-                    .map_err(|_| {
-                        Status::internal("container process not readable (exited?)")
-                    })?;
-                // Fields after comm (which may contain spaces) split from the
-                // last ')' onward: field 14=utime 15=stime in clock ticks.
-                let tail = stat.rsplit(')').next().unwrap_or_default();
-                let f: Vec<&str> = tail.split_whitespace().collect();
-                let ticks_per_sec = 100f64; // sysconf(_SC_CLK_TCK), Linux default
-                let utime: f64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                let stime: f64 = f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                let rss_pages: u64 = f
-                    .get(21)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                (
-                    ((utime + stime) / ticks_per_sec * 1e9) as u64,
-                    rss_pages * 4096,
-                )
-            }
-            _ => return Err(Status::failed_precondition("container is not running")),
-        };
-
-        Ok(rt::ContainerStats {
-            attributes: Some(stats::container_attributes(&c)),
-            cpu: Some(rt::CpuUsage {
-                timestamp: now,
-                usage_core_nano_seconds: Some(rt::UInt64Value { value: cpu_ns }),
-                usage_nano_cores: None,
-                psi: None,
-            }),
-            memory: Some(rt::MemoryUsage {
-                timestamp: now,
-                working_set_bytes: Some(rt::UInt64Value { value: mem_bytes }),
-                available_bytes: None,
-                usage_bytes: None,
-                rss_bytes: None,
-                page_faults: None,
-                major_page_faults: None,
-                psi: None,
-            }),
-            writable_layer: None,
-            swap: None,
-            io: None,
-        })
+        self.local_container_stats(&c).await
     }
 
-    /// Aggregate pod stats: sums cpu/memory of the sandbox's live containers
-    /// (same /proc-based accounting as `stats_response`).
+    /// Native pod CPU and memory totals sum the sandbox's live containers.
     async fn pod_stats_response(
         &self,
         pod_id: &str,
