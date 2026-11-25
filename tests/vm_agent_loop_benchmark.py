@@ -551,7 +551,28 @@ def run(args, report):
             if errors:
                 log({"event": "cleanup_error", "errors": [str(e) for e in errors]})
                 raise ExceptionGroup("final cleanup failed", errors)
-            log({"event": "cleanup", "remaining_cri_objects": 0, "resource_delta": []})
+            cleanup = {"event": "cleanup", "remaining_cri_objects": 0, "resource_delta": []}
+            if daemon is not None:
+                final_pid = int(
+                    command(
+                        ["systemctl", "show", args.daemon_unit, "-p", "MainPID", "--value"]
+                    )
+                )
+                if final_pid != main_pid:
+                    raise RuntimeError("daemon PID changed during the benchmark")
+                final_pss = service_memory(args.daemon_unit)["pss_bytes"]
+                growth = final_pss - daemon["idle"]["pss_bytes"]
+                cleanup["daemon_pss_bytes"] = final_pss
+                cleanup["daemon_pss_growth_bytes"] = growth
+            log(cleanup)
+            growth = cleanup.get("daemon_pss_growth_bytes")
+            if growth is not None and args.max_daemon_pss_growth_mib is not None:
+                budget = args.max_daemon_pss_growth_mib << 20
+                if growth > budget:
+                    raise RuntimeError(
+                        f"daemon PSS grew {growth / (1 << 20):.1f} MiB after cleanup "
+                        f"(limit {args.max_daemon_pss_growth_mib} MiB)"
+                    )
     log({"event": "complete", "run": label, "waves": sum(plan.values())})
 
 
@@ -569,8 +590,8 @@ def summarize(records):
         != ["environment", *(["wave"] * len(planned)), "cleanup", "complete"]
         or records[-1]
         != {"event": "complete", "run": env["run"], "waves": len(planned)}
-        or records[-2]
-        != {"event": "cleanup", "remaining_cri_objects": 0, "resource_delta": []}
+        or records[-2].get("remaining_cri_objects") != 0
+        or records[-2].get("resource_delta") != []
         or measured != planned
     ):
         raise SystemExit("incomplete, failed, or unexpected benchmark wave / cleanup")
@@ -650,6 +671,11 @@ def main():
     p.add_argument(
         "--daemon-unit", help="collect the daemon binary SHA-256 and idle service PSS"
     )
+    p.add_argument(
+        "--max-daemon-pss-growth-mib",
+        type=int,
+        help="fail if daemon PSS after cleanup exceeds startup PSS by this amount",
+    )
     p.add_argument("--levels", type=int, nargs="+", default=[1, 2, 4, 8])
     p.add_argument("--singles", type=int, default=20)
     p.add_argument("--waves", type=int, default=3)
@@ -660,6 +686,10 @@ def main():
     p.add_argument("--model", default="nautilus-bench")
     args = p.parse_args()
     if not args.summarize:
+        if args.max_daemon_pss_growth_mib is not None and (
+            args.max_daemon_pss_growth_mib < 0 or not args.daemon_unit
+        ):
+            p.error("a nonnegative daemon PSS budget requires --daemon-unit")
         if (
             not args.config
             or not args.ipam_dir

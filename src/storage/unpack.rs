@@ -1,12 +1,12 @@
 //! Apply OCI layers relative to an open rootfs directory.
 
 use crate::core::{Error, Result};
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use pathrs::{error::ErrorKind, flags::OpenFlags, InodeType, Root};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{File, Permissions};
-use std::io::Read;
+use std::io::{BufRead, Cursor, Read, Seek};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::{
     ffi::OsStrExt,
@@ -16,9 +16,17 @@ use std::path::{Component, Path, PathBuf};
 use tar::Entry;
 
 pub fn apply_layer(rootfs: &Path, blob: &[u8], media_type: &str) -> Result<()> {
+    apply_layer_from(rootfs, Cursor::new(blob), media_type)
+}
+
+pub(crate) fn apply_layer_from(
+    rootfs: &Path,
+    mut blob: impl BufRead + Seek,
+    media_type: &str,
+) -> Result<()> {
     let root = Root::open(rootfs)?;
     // Whiteouts apply only to lower layers, regardless of their tar entry order.
-    for entry in archive(blob, media_type)?.entries()? {
+    for entry in archive(&mut blob, media_type)?.entries()? {
         let entry = entry?;
         let name = sanitize_path(&entry.path()?)?;
         if let Some(target) = whiteout(&name)? {
@@ -29,8 +37,9 @@ pub fn apply_layer(rootfs: &Path, blob: &[u8], media_type: &str) -> Result<()> {
             }
         }
     }
+    blob.rewind()?;
     let mut directories = BTreeMap::new();
-    for entry in archive(blob, media_type)?.entries()? {
+    for entry in archive(&mut blob, media_type)?.entries()? {
         let entry = entry?;
         let name = sanitize_path(&entry.path()?)?;
         if whiteout(&name)?.is_some() {
@@ -68,12 +77,15 @@ pub fn apply_layer(rootfs: &Path, blob: &[u8], media_type: &str) -> Result<()> {
     Ok(())
 }
 
-fn archive<'a>(blob: &'a [u8], media_type: &str) -> Result<tar::Archive<Box<dyn Read + 'a>>> {
+fn archive<'a>(
+    blob: &'a mut impl BufRead,
+    media_type: &str,
+) -> Result<tar::Archive<Box<dyn Read + 'a>>> {
     let reader: Box<dyn Read> = if media_type.contains("+gzip") || media_type.ends_with("tar.gzip")
     {
         Box::new(GzDecoder::new(blob))
     } else if media_type.contains("+zstd") || media_type.contains("tar.zstd") {
-        Box::new(zstd::Decoder::new(blob)?)
+        Box::new(zstd::Decoder::with_buffer(blob)?)
     } else if media_type.contains("tar") {
         Box::new(blob)
     } else {
@@ -273,11 +285,8 @@ mod tests {
 
     #[test]
     fn layer_links_and_whiteouts_use_image_paths() {
-        let root = tempfile::tempdir().unwrap();
-        let data = root.path().join("data");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::write(data.join("old"), b"previous").unwrap();
-        std::fs::write(root.path().join("obsolete"), b"previous").unwrap();
+        use std::io::{BufReader, Write};
+
         let mut tar = tar::Builder::new(Vec::new());
         let mut append = |path: &str, kind: tar::EntryType, target: Option<&str>, bytes: &[u8]| {
             let mut header = tar::Header::new_gnu();
@@ -296,19 +305,37 @@ mod tests {
         append("same", tar::EntryType::Link, Some("view/current"), b"");
         append("data/.wh..wh..opq", tar::EntryType::Regular, None, b"");
         append(".wh.obsolete", tar::EntryType::Regular, None, b"");
-        apply_layer(
-            root.path(),
-            &tar.into_inner().unwrap(),
-            "application/vnd.oci.image.layer.v1.tar",
-        )
-        .unwrap();
-        assert!(!data.join("old").exists());
-        assert!(!root.path().join("obsolete").exists());
-        assert_eq!(std::fs::read(data.join("current")).unwrap(), b"current");
-        assert_eq!(
-            data.join("current").metadata().unwrap().ino(),
-            root.path().join("same").metadata().unwrap().ino()
-        );
+        let tar = tar.into_inner().unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&tar).unwrap();
+        let zstd = zstd::stream::encode_all(tar.as_slice(), 1).unwrap();
+
+        for (suffix, bytes) in [
+            ("tar", tar),
+            ("tar+gzip", gzip.finish().unwrap()),
+            ("tar+zstd", zstd),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::write(data.join("old"), b"previous").unwrap();
+            std::fs::write(root.path().join("obsolete"), b"previous").unwrap();
+            let mut archive = tempfile::NamedTempFile::new().unwrap();
+            archive.write_all(&bytes).unwrap();
+            apply_layer_from(
+                root.path(),
+                BufReader::new(archive.reopen().unwrap()),
+                &format!("application/vnd.oci.image.layer.v1.{suffix}"),
+            )
+            .unwrap();
+            assert!(!data.join("old").exists());
+            assert!(!root.path().join("obsolete").exists());
+            assert_eq!(std::fs::read(data.join("current")).unwrap(), b"current");
+            assert_eq!(
+                data.join("current").metadata().unwrap().ino(),
+                root.path().join("same").metadata().unwrap().ino()
+            );
+        }
     }
     #[test]
     fn layer_retains_owners_and_directory_mode() {

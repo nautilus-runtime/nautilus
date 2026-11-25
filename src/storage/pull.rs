@@ -14,6 +14,8 @@ use oci_distribution::manifest::{
 };
 use oci_distribution::{secrets::RegistryAuth, Client, Reference};
 use sha2::{Digest, Sha256, Sha512};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -531,7 +533,8 @@ impl CachedImage {
 
     fn unpack(&self, dst: &Path, image_dir: &Path) -> Result<()> {
         for (path, media_type) in &self.blobs {
-            crate::storage::unpack::apply_layer(dst, &std::fs::read(path)?, media_type)?;
+            let blob = BufReader::with_capacity(64 * 1024, File::open(path)?);
+            crate::storage::unpack::apply_layer_from(dst, blob, media_type)?;
         }
         let meta = serde_json::json!({
             "image_id": self.image_id,
