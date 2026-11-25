@@ -64,7 +64,7 @@ Kubernetes v1.37.2 的 `/stats/summary` 返回可用内存、RSS 和缺页计数
 
 ## 2026-11-25 Pod VM guest CPU 与内存扩展指标
 
-在 pro6000 隔离 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0、virtiofsd 1.13.2）验证 `3cf1b82`。使用新 guest agent 启动真实 VM。容器 CPU 配额为 500m，负载运行后 CFS 限流周期从 11 增加到 31，同 Pod 空闲容器没有相同增量。写入 16 MiB tmpfs 后，CRI 返回增长的内存缓存计数。普通列表和以 EOF 结束的流式列表均返回对应的 Pod 和容器指标。运行时重启验收通过。[VM CRI 验收](../tests/vm_cri_workloads_test.rs) · [跟踪任务 #40](https://github.com/nautilus-runtime/nautilus/issues/40)
+在 pro6000 隔离 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0、virtiofsd 1.13.2）验证 `3cf1b82`。使用新 guest agent 启动真实 VM。容器 CPU 配额为 500m，负载运行后 CFS 限流周期从 11 增加到 31，同 Pod 空闲容器没有相同增量。写入 16 MiB tmpfs 后，CRI 返回增长的内存缓存计数。普通列表和以 EOF 结束的流式列表均返回对应的 Pod 和容器指标。运行时重启验收通过。附带的 `crictl exec -i` 联验首轮退出 1，同一候选重试与原基线均通过。[VM CRI 验收](../tests/vm_cri_workloads_test.rs) · [跟踪任务 #40](https://github.com/nautilus-runtime/nautilus/issues/40)
 
 完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**107 通过、0 失败、35 跳过**，耗时 306.849 秒，结束时没有 CRI Pod 或容器。Linux 串行 Rust 测试 130 通过、0 失败、8 项忽略，guest Go 测试通过。严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
 
