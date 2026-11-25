@@ -205,6 +205,7 @@ struct VmReadiness {
     recheck: tokio::sync::Notify,
 }
 
+#[derive(Clone)]
 pub struct NautilusRuntimeService {
     _config: Arc<Config>,
     _state_manager: Arc<StateManager>,
@@ -554,21 +555,12 @@ impl NautilusRuntimeService {
 
 }
 
-#[tonic::async_trait]
-impl RuntimeService for NautilusRuntimeService {
-    async fn version(
+impl NautilusRuntimeService {
+    async fn run_sandbox(
         &self,
-        _request: Request<VersionRequest>,
-    ) -> Result<Response<VersionResponse>, Status> {
-        version::version(_request).await
-    }
-
-    async fn run_pod_sandbox(
-        &self,
-        request: Request<RunPodSandboxRequest>,
+        req: RunPodSandboxRequest,
+        standalone: bool,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
-        let standalone = includes_standalone(&request);
-        let req = request.into_inner();
         let config = req.config.ok_or_else(|| {
             Status::invalid_argument("Pod sandbox config is required")
         })?;
@@ -795,6 +787,46 @@ impl RuntimeService for NautilusRuntimeService {
         Ok(Response::new(RunPodSandboxResponse {
             pod_sandbox_id: pod_id,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl RuntimeService for NautilusRuntimeService {
+    async fn version(
+        &self,
+        _request: Request<VersionRequest>,
+    ) -> Result<Response<VersionResponse>, Status> {
+        version::version(_request).await
+    }
+
+    async fn run_pod_sandbox(
+        &self,
+        request: Request<RunPodSandboxRequest>,
+    ) -> Result<Response<RunPodSandboxResponse>, Status> {
+        let standalone = includes_standalone(&request);
+        let req = request.into_inner();
+        if !standalone {
+            return self.run_sandbox(req, false).await;
+        }
+
+        // A standalone request has no kubelet to reclaim its unclaimed sandbox.
+        let runtime = self.clone();
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = runtime.run_sandbox(req, true).await;
+            if let Err(Ok(response)) = reply.send(result) {
+                let id = response.into_inner().pod_sandbox_id;
+                if let Err(error) = runtime
+                    .remove_pod_sandbox(Request::new(RemovePodSandboxRequest {
+                        pod_sandbox_id: id.clone(),
+                    }))
+                    .await
+                {
+                    tracing::warn!(pod_id = %id, %error, "unclaimed standalone sandbox retained for cleanup");
+                }
+            }
+        });
+        receive.await.map_err(|_| Status::internal("sandbox setup task stopped"))?
     }
 
     async fn stop_pod_sandbox(
@@ -1300,16 +1332,15 @@ impl RuntimeService for NautilusRuntimeService {
         let include = includes_standalone(&request);
         let req = request.into_inner();
         
-        let containers = self.container_manager.observed_containers().await
-            .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
+        let mut containers = self.container_manager.list_containers().await.map_err(Status::from)?;
+        // Look up ownership after capturing the current container list.
         let hidden = self.hidden_standalone_pods(include).await?;
+        containers.retain(|container| !hidden.contains(&container.pod_id));
+        let containers = self.container_manager.observed_containers(containers).await.map_err(Status::from)?;
         
         let mut filtered_containers = Vec::new();
         
         for container in containers {
-            if hidden.contains(&container.pod_id) {
-                continue;
-            }
             let container_status = match container.status {
                 ContainerStatus::Created => runtime::v1::ContainerState::ContainerCreated,
                 ContainerStatus::Running => runtime::v1::ContainerState::ContainerRunning,
@@ -1655,19 +1686,19 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        let include = includes_standalone(&request);
-        let receiver = self._state_manager.subscribe_container_events();
-        let stream = futures::stream::unfold(Some((receiver, self.images.clone())), move |session| async move {
+        let receiver = if includes_standalone(&request) {
+            self._state_manager.subscribe_all_container_events()
+        } else {
+            self._state_manager.subscribe_container_events()
+        };
+        let stream = futures::stream::unfold(Some((receiver, self.images.clone())), |session| async {
             let (mut receiver, images) = session?;
-            let event = loop {
-                match receiver.recv().await {
-                    Ok(event) if include || !event.pod.as_ref().is_some_and(|pod| pod.standalone) => break event,
-                    Ok(_) => {}
-                    Err(RecvError::Closed) => return None,
-                    Err(RecvError::Lagged(skipped)) => {
-                        let error = Status::resource_exhausted(format!("container event subscriber missed {skipped} events"));
-                        return Some((Err(error), None));
-                    }
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(RecvError::Closed) => return None,
+                Err(RecvError::Lagged(skipped)) => {
+                    let error = Status::resource_exhausted(format!("container event subscriber missed {skipped} events"));
+                    return Some((Err(error), None));
                 }
             };
             let mut containers_statuses = Vec::with_capacity(event.containers.len());

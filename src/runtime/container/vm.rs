@@ -197,9 +197,8 @@ impl ContainerManager {
         }
     }
 
-    pub(crate) async fn observed_containers(&self) -> Result<Vec<ContainerState>> {
+    pub(crate) async fn observed_containers(&self, records: Vec<ContainerState>) -> Result<Vec<ContainerState>> {
         use futures::TryStreamExt;
-        let records = self.state_manager.list_containers().await?;
         stream::iter(records)
             .map(|state| async move {
                 if state
