@@ -139,6 +139,7 @@ Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 
 - CPU 累计值将 `cpu.stat usage_usec` 换算成纳秒。第二次采样与前一次至少相隔一秒时，agent 用单调时钟间隔计算平均 nanocores；更密集的请求沿用最近一次已测速率。
 - 使用量为 `memory.current`。工作集为使用量减 `memory.stat inactive_file`，下限为零。RSS 取匿名内存 `anon` 加内核提供的 `swapcached`；随附的 initramfs 不启用 swap，旧内核无该字段时交换缓存为零。次缺页为 `pgfault - pgmajfault`，下限为零，主缺页取 `pgmajfault`。有限的 `memory.max` 减工作集得到可用内存。无限额时省略可用内存。I/O、PSI、网络等可选字段待独立采样后提供。[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 - 验收通过真实 daemon 的四个 CRI 统计 RPC，令同一 Pod 的一个容器写入 16 MiB tmpfs 并计算摘要，另一个容器休眠。核对两者 CPU 增量、内存差异、Pod 汇总、列表的 ID 与标签组合筛选，以及另一个 guest 断连期间的可用性。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
+- 扩展指标从同一采样读取 user/system CPU、CFS 周期和限流、内存缓存/匿名页/内核内存/映射文件及缺页计数。Pod 和容器各自报告本级 CFS 限流，Pod 计数不累加子 cgroup 的限流。验收令设定 CPU 配额的 VM 容器运行 CPU 密集任务，检查其限流计数增加、空闲邻居计数稳定、Pod 样本包含 tmpfs 对应缓存。两种 CRI 指标列表从同一来源采样。旧 agent 提供基础 CPU 和内存指标。块 I/O、文件系统、网络及进程指标继续在 [#40](https://github.com/nautilus-runtime/nautilus/issues/40) 跟踪。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
 
 ## 独立 CLI 工作负载和 kubelet
 

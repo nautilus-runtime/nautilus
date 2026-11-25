@@ -1,6 +1,7 @@
 //! Framed, launch-bound workload protocol served by the Nautilus guest agent.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -87,6 +88,8 @@ pub(crate) struct Sample {
     pub rss_bytes: u64,
     pub page_faults: u64,
     pub major_page_faults: u64,
+    #[serde(default)]
+    pub cgroup_counters: HashMap<String, HashMap<String, u64>>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +114,7 @@ pub(crate) struct Reply {
     pub next_offset: Option<i64>,
     pub stats: Option<Sample>,
     #[serde(default)]
-    pub containers: std::collections::HashMap<String, Sample>,
+    pub containers: HashMap<String, Sample>,
 }
 
 impl Reply {

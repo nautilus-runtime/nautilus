@@ -15,15 +15,16 @@ const podCgroup = "/sys/fs/cgroup/nautilus"
 
 // A sample contains only counters from the selected cgroup and its descendants.
 type sample struct {
-	Timestamp   int64   `json:"timestamp"`
-	CPU         uint64  `json:"cpuUsageNanos"`
-	NanoCores   *uint64 `json:"usageNanoCores,omitempty"`
-	Usage       uint64  `json:"memoryUsageBytes"`
-	WorkingSet  uint64  `json:"workingSetBytes"`
-	Available   *uint64 `json:"availableBytes,omitempty"`
-	RSS         uint64  `json:"rssBytes"`
-	Faults      uint64  `json:"pageFaults"`
-	MajorFaults uint64  `json:"majorPageFaults"`
+	Timestamp      int64                        `json:"timestamp"`
+	CPU            uint64                       `json:"cpuUsageNanos"`
+	NanoCores      *uint64                      `json:"usageNanoCores,omitempty"`
+	Usage          uint64                       `json:"memoryUsageBytes"`
+	WorkingSet     uint64                       `json:"workingSetBytes"`
+	Available      *uint64                      `json:"availableBytes,omitempty"`
+	RSS            uint64                       `json:"rssBytes"`
+	Faults         uint64                       `json:"pageFaults"`
+	MajorFaults    uint64                       `json:"majorPageFaults"`
+	CgroupCounters map[string]map[string]uint64 `json:"cgroupCounters,omitempty"`
 }
 
 func counters(path string, names ...string) (map[string]uint64, error) {
@@ -53,6 +54,16 @@ func difference(total, part uint64) uint64 {
 		return 0
 	}
 	return total - part
+}
+
+func selectedCounters(values map[string]uint64, keys ...string) map[string]uint64 {
+	selected := make(map[string]uint64, len(keys))
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			selected[key] = value
+		}
+	}
+	return selected
 }
 
 func readSample(dir string) (sample, error) {
@@ -86,6 +97,10 @@ func readSample(dir string) (sample, error) {
 	s.RSS = rss
 	s.MajorFaults = mem["pgmajfault"]
 	s.Faults = difference(mem["pgfault"], s.MajorFaults)
+	s.CgroupCounters = map[string]map[string]uint64{
+		"cpu.stat":    selectedCounters(cpu, "user_usec", "system_usec", "nr_periods", "nr_throttled", "throttled_usec"),
+		"memory.stat": selectedCounters(mem, "file", "anon", "kernel", "file_mapped", "pgfault", "pgmajfault"),
+	}
 	maximum, err := os.ReadFile(filepath.Join(dir, "memory.max"))
 	if err != nil {
 		return s, err
