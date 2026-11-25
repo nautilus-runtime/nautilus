@@ -1545,17 +1545,36 @@ impl RuntimeService for NautilusRuntimeService {
                 req.container_id, c.status
             )));
         }
-        if c.sandbox_kind == "vm" && (req.tty && req.stderr || !(req.stdin || req.stdout || req.stderr)) {
-            return Err(Status::invalid_argument("invalid VM attach stream selection"));
+        if req.tty && req.stderr || !(req.stdin || req.stdout || req.stderr) {
+            return Err(Status::invalid_argument("invalid attach stream selection"));
         }
+        let native_attach = match c.sandbox_kind.as_str() {
+            "vm" => None,
+            "runc" if self._config.runtime.runc.driver != "exec" => {
+                if c.status != ContainerStatus::Running {
+                    return Err(Status::failed_precondition("attach requires a running OCI container"));
+                }
+                if req.tty != c.tty || req.stdin && !c.open_stdin {
+                    return Err(Status::invalid_argument("attach streams do not match container stdin or TTY configuration"));
+                }
+                let init = c.pid
+                    .and_then(|pid| crate::sandbox::runc_backend::init_io(&c.id, pid))
+                    .ok_or_else(|| Status::failed_precondition("daemon has no streams for this OCI init instance"))?;
+                Some(Arc::downgrade(&init))
+            }
+            _ => return Err(Status::unimplemented("init attach is unavailable for this runtime handler")),
+        };
         let url = crate::cri::streaming::attach_url(
             self.container_manager.clone(),
             self._state_manager.clone(),
             req.container_id,
-            req.tty,
-            req.stdin,
-            req.stdout,
-            req.stderr,
+            crate::vm::workload::StreamOptions {
+                tty: req.tty,
+                stdin: req.stdin,
+                stdout: req.stdout,
+                stderr: req.stderr,
+            },
+            native_attach,
         )
         .await
         .map_err(Status::from)?;

@@ -320,6 +320,8 @@ async fn test_e2e_state_persistence() {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             open_stdin: false,
+            stdin_once: false,
+            tty: false,
             vm: None,
         };
         

@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
 
+mod init_io;
+pub(crate) use init_io::InitIo;
+
 /// Lifecycle driver behind the runc sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Driver {
@@ -159,6 +162,7 @@ impl RuncBackend {
         let systemd = self.config.runtime.runc.systemd_cgroup;
         let id = spec.id.clone();
         let bundle = self.bundle_dir(&spec.id);
+        let tty = spec.tty;
 
         // Pipes for the init's stdout/stderr: unlike socketpairs, pipe fds can
         // be RE-OPENED by the workload via /proc/self/fd (apache/nginx style
@@ -187,13 +191,11 @@ impl RuncBackend {
         let c_out_fd = c_out;
         let c_err_fd = c_err;
 
-        // CRI stdin=true: hand the init a pipe whose write half the daemon
-        // parks, so stdin-reading workloads block for input instead of
-        // EOF-exiting the moment they start (this is what keeps an attach
-        // target shell alive until a client actually attaches).
+        // Keep the pipe open before the first attach so readers can wait for
+        // interactive input. Terminal workloads use the PTY master instead.
         let mut stdin_hold: Option<std::os::fd::OwnedFd> = None;
         let mut c_in_fd: Option<std::os::fd::OwnedFd> = None;
-        if spec.open_stdin {
+        if spec.open_stdin && !tty {
             use nix::fcntl::OFlag;
             use std::os::fd::FromRawFd;
             let (r, w) = nix::unistd::pipe2(OFlag::O_CLOEXEC)
@@ -204,7 +206,7 @@ impl RuncBackend {
 
         let log_file = spec.output_dir.join(&spec.log_relpath);
 
-        let (pid, scope_mem_events, oom_baseline) = {
+        let (pid, scope_mem_events, oom_baseline, terminal) = {
             let id = id.clone();
             tokio::task::spawn_blocking(move || crate::storage::snapshot::with_view(&bundle, || -> Result<_> {
             let lc = |e: libcontainer::error::LibcontainerError| {
@@ -247,11 +249,16 @@ impl RuncBackend {
             if let Some(fd) = c_in_fd {
                 builder = builder.with_stdin(fd);
             }
-            let (mut container, _pty) = builder
+            let (mut container, terminal) = builder
                 .as_init(bundle.clone())
+                .with_detach(!tty)
                 .with_systemd(systemd)
                 .build()
                 .map_err(|e| Error::Runtime(format!("libcontainer {id}: create: {e}")))?;
+            if tty && terminal.is_none() {
+                container.delete(true).map_err(lc)?;
+                return Err(Error::Runtime(format!("libcontainer {id}: missing init PTY")));
+            }
             // The created init is already in its cgroup, but cannot execute user
             // code until start(). Capture its own path and the parent counter now.
             let pid = container.pid().map(|p| p.as_raw() as u32).unwrap_or(0);
@@ -267,31 +274,40 @@ impl RuncBackend {
                 Error::Runtime(format!("libcontainer {id}: start: {e}"))
             })?;
             container.refresh_status().map_err(lc)?;
-            // Park the open-stdin write half now that the container is
-            // actually running; a failed start must not leave a holder behind.
-            if let Some(hold) = stdin_hold {
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
-                open_stdins().lock().unwrap().insert(id.clone(), tx);
-                std::thread::spawn(move || {
-                    let w = std::fs::File::from(hold);
-                    // No data is ever written: the goal is an OPEN, idle
-                    // stdin. Releasing happens when close_container_stdin
-                    // drops the sender (stop/remove).
-                    let _ = rx.recv();
-                    drop(w);
-                });
-            }
             // AppArmor is applied by libcontainer's init process from the spec
             // profile before the workload execve; no host-side
             // attr write needed here.
-            Ok((pid, scope, baseline))
+            Ok((pid, scope, baseline, terminal))
             }))
             .await
             .map_err(|e| Error::Runtime(format!("libcontainer worker join failed: {e}")))?
         }?;
 
-        Self::spawn_output_logger(p_out, &log_file, "stdout");
-        Self::spawn_output_logger(p_err, &log_file, "stderr");
+        let terminal = terminal.map(|fd| Arc::new(std::fs::File::from(fd)));
+        let stdin = if spec.open_stdin && tty {
+            terminal.clone()
+        } else {
+            stdin_hold.map(|fd| Arc::new(std::fs::File::from(fd)))
+        };
+        let io = Arc::new(InitIo::new(pid, stdin, terminal.clone(), spec.stdin_once));
+        if let Some(terminal) = terminal {
+            Self::spawn_output_logger(terminal, &log_file, "stdout", io.clone());
+            io.stderr.finish();
+        } else {
+            Self::spawn_output_logger(
+                Arc::new(std::fs::File::from(p_out)),
+                &log_file,
+                "stdout",
+                io.clone(),
+            );
+            Self::spawn_output_logger(
+                Arc::new(std::fs::File::from(p_err)),
+                &log_file,
+                "stderr",
+                io.clone(),
+            );
+        }
+        init_ios().lock().unwrap().insert(id, io);
 
         // The persistent Pod parent also accounts for OOMs from containers
         // whose scopes are removed before the watcher can observe their exit.
@@ -329,9 +345,10 @@ impl RuncBackend {
     /// the path (ReopenContainerLog / rotation) are picked up on the next line
     /// instead of writing into an unlinked inode.
     fn spawn_output_logger(
-        pipe: std::os::fd::OwnedFd,
+        pipe: Arc<std::fs::File>,
         log_file: &std::path::Path,
         stream: &'static str,
+        io: Arc<InitIo>,
     ) {
         let log_file = log_file.to_path_buf();
         tracing::info!(stream, file = %log_file.display(), "output logger spawned");
@@ -344,7 +361,8 @@ impl RuncBackend {
         std::thread::spawn(move || {
             use std::io::Read;
 
-            let mut pipe = std::fs::File::from(pipe);
+            let mut pipe = &*pipe;
+            let output = if stream == "stdout" { &io.stdout } else { &io.stderr };
             let mut buf = [0u8; 8192];
             let mut pending: Vec<u8> = Vec::new();
             loop {
@@ -355,7 +373,10 @@ impl RuncBackend {
                     // is silently dropped.
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
-                    Ok(n) => pending.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        output.send(&buf[..n]);
+                        pending.extend_from_slice(&buf[..n]);
+                    }
                 }
                 // Flush every complete line; hold the partial tail back.
                 while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
@@ -366,6 +387,7 @@ impl RuncBackend {
             if !pending.is_empty() {
                 Self::write_log_line(&log_file, stream, &pending);
             }
+            output.finish();
         });
     }
 
@@ -572,6 +594,7 @@ impl RuncBackend {
         ipc_ns: Option<&str>,
         pid_ns: Option<&str>,
         security: Option<&crate::sandbox::ContainerSecurity>,
+        tty: bool,
     ) -> Result<()> {
         // The workload is exec'd DIRECTLY (no shell wrapper): it is pid 1 of
         // the container (CRI semantics — ContainerPID conformance requires
@@ -686,7 +709,7 @@ impl RuncBackend {
         let mut spec = serde_json::json!({
             "ociVersion": "1.0.2",
             "process": {
-                "terminal": false,
+                "terminal": tty,
                 "user": {"uid": uid, "gid": gid},
                 "args": proc_args,
                 "env": env_full,
@@ -871,20 +894,30 @@ fn oom_hits() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
 /// stdin pipe write-half open (through the holder thread) so stdin-reading
 /// workloads (attach shells) block instead of EOF-exiting before a client
 /// attaches. Dropping the sender closes the pipe.
-fn open_stdins()
--> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<()>>> {
-    static M: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<()>>>,
-    > = std::sync::OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+type InitIoMap = std::sync::Mutex<std::collections::HashMap<String, Arc<InitIo>>>;
+
+fn init_ios() -> &'static InitIoMap {
+    static IOS: std::sync::OnceLock<InitIoMap> = std::sync::OnceLock::new();
+    IOS.get_or_init(InitIoMap::default)
 }
 
-/// Close a container's parked open stdin (idempotent; no-op when the
-/// container never requested CRI stdin).
+pub(crate) fn init_io(container_id: &str, pid: u32) -> Option<Arc<InitIo>> {
+    init_ios()
+        .lock()
+        .unwrap()
+        .get(container_id)
+        .filter(|io| io.pid == pid)
+        .cloned()
+}
+
 pub fn close_container_stdin(container_id: &str) {
-    if let Some(tx) = open_stdins().lock().unwrap().remove(container_id) {
-        drop(tx);
+    if let Some(io) = init_ios().lock().unwrap().get(container_id) {
+        io.close_stdin();
     }
+}
+
+pub(crate) fn remove_init_io(container_id: &str) {
+    init_ios().lock().unwrap().remove(container_id);
 }
 
 /// Parse the `oom_kill` counter out of a cgroup v2 `memory.events`.
@@ -1005,6 +1038,7 @@ impl RuncBackend {
             spec.ipc_ns.as_deref(),
             spec.pid_ns.as_deref(),
             spec.security.as_ref(),
+            spec.tty,
         )
         })).await.map_err(|e| Error::Runtime(format!("prepare rootfs view: {e}")))??;
         tracing::info!(container_id = %id, image = %image, "runc bundle prepared");
@@ -1023,6 +1057,9 @@ impl SandboxBackend for RuncBackend {
     }
 
     async fn prepare_image(&self, spec: &WorkloadSpec) -> Result<String> {
+        if spec.tty && self.driver() == Driver::Exec {
+            return Err(Error::Runtime("native init TTY requires the libcontainer driver".into()));
+        }
         let bundle = self.bundle_dir(&spec.id);
         crate::storage::snapshot::begin(&bundle)?;
         let result = async {

@@ -28,6 +28,7 @@
 
 use crate::core::state::StateManager;
 use crate::runtime::container::ContainerManager;
+use crate::sandbox::runc_backend::InitIo;
 use crate::vm::workload::{Operation, PortOptions, StreamOptions};
 use bytes::Bytes;
 use http::HeaderMap;
@@ -37,7 +38,7 @@ use spdystream_rs::server::{parse_upgrade_request, send_upgrade_response_with_pr
 use spdystream_rs::stream::Stream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, OnceCell};
 
@@ -45,8 +46,7 @@ use tokio::sync::{mpsc, oneshot, watch, OnceCell};
 #[derive(Clone, Debug)]
 pub enum SessionKind {
     Exec,
-    /// VM sessions use the existing init console. The native backend keeps
-    /// its historical attach shell for file-backed workload stdio.
+    /// Connect to the original workload's stdio.
     Attach,
     PortForward,
 }
@@ -65,6 +65,7 @@ pub struct Session {
     pub stdin: bool,
     pub stdout: bool,
     pub stderr: bool,
+    native_attach: Option<Weak<InitIo>>,
 }
 
 static SESSIONS: Mutex<Option<HashMap<String, Session>>> = Mutex::new(None);
@@ -210,7 +211,8 @@ async fn handle_conn(
         conn.wait_closed().await;
         ctx.closed.send_replace(true);
         tracing::info!(mode = mode_of(&session.kind), "streaming session closed");
-        if let Some(Ok(h)) = ctx.exec_process.get() {
+        let handle = ctx.exec_process.get().filter(|_| matches!(session.kind, SessionKind::Exec));
+        if let Some(Ok(h)) = handle {
             let pid = h.pid.load(Ordering::Acquire);
             if pid > 0 {
                 tracing::info!(pid, "streaming: killing exec process on disconnect");
@@ -325,8 +327,7 @@ async fn ensure_exec(
         .clone()
 }
 
-/// Spawn the container process behind an exec/attach session: one process per
-/// connection, socketpair stdio, reaped by the backend's blocking worker.
+/// Start an exec process or connect to the existing workload's stdio.
 async fn spawn_exec(
     session: &Session,
     exec: &ContainerManager,
@@ -337,13 +338,18 @@ async fn spawn_exec(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "container no longer exists".to_owned())?;
-    let (streams, resize, lifetime) = if container.sandbox_kind == "vm" {
-        let options = StreamOptions {
-            stdin: session.stdin,
-            stdout: session.stdout,
-            stderr: session.stderr,
-            tty: session.tty,
-        };
+    let options = StreamOptions {
+        stdin: session.stdin,
+        stdout: session.stdout,
+        stderr: session.stderr,
+        tty: session.tty,
+    };
+    let (streams, resize, lifetime) = if let Some(init) = &session.native_attach {
+        let init = init.upgrade()
+            .ok_or_else(|| "attach target instance is no longer available".to_owned())?;
+        let (streams, resize) = init.attach(options, closed).map_err(|e| e.to_string())?;
+        (streams, resize, None)
+    } else if container.sandbox_kind == "vm" {
         let op = match session.kind {
             SessionKind::Exec => Operation::ExecStream {
                 argv: &session.cmd,
@@ -357,13 +363,15 @@ async fn spawn_exec(
             .await
             .map_err(|e| e.to_string())?;
         (guest.io, guest.resize, Some(guest.lifetime))
-    } else {
+    } else if matches!(session.kind, SessionKind::Exec) {
         let streams = exec
             .exec_stream(&session.container_id, &session.cmd, &[], None)
             .await
             .map_err(|e| e.to_string())?;
 
         (streams, None, None)
+    } else {
+        return Err("attach target has no init streams".into());
     };
     Ok(Arc::new(ExecHandle {
         _guest_lifetime: lifetime,
@@ -457,8 +465,6 @@ async fn handle_exec_stream(
                         if chunk.is_empty() {
                             continue;
                         }
-                        // Dropping `tx` (on client EOF below) closes the
-                        // process's stdin via the writer thread.
                         if tx.send(chunk.to_vec()).await.is_err() {
                             break;
                         }
@@ -473,11 +479,7 @@ async fn handle_exec_stream(
                     }
                 }
             }
-            // Dropping `tx` EOFs the process stdin. That is the session-end
-            // contract for BOTH exec and attach: client-go's executor only
-            // returns once stdout/stderr EOF, which for a shell means its
-            // stdin must close. (Keeping stdin open parks the session
-            // forever.)
+            // Backend stdin ownership determines how client EOF is delivered.
         }
         "stdout" | "stderr" => {
             let handle = match ensure_exec(&ctx, &session, &exec).await {
@@ -500,19 +502,24 @@ async fn handle_exec_stream(
                 let _ = s.reset(RstStatus::RefusedStream).await;
                 return;
             };
-            while let Some(chunk) = q.recv().await {
-                if s.write_data(Bytes::from(chunk), false).await.is_err() {
-                    break;
+            let mut closed = ctx.closed.subscribe();
+            let send_output = async {
+                while let Some(chunk) = q.recv().await {
+                    if s.write_data(Bytes::from(chunk), false).await.is_err() {
+                        return;
+                    }
                 }
+                let _ = s.write_data(Bytes::new(), true).await;
+            };
+            tokio::select! {
+                _ = closed.wait_for(|closed| *closed) => {}
+                _ = send_output => {}
             }
-            tracing::debug!(stream_id = s.stream_id, %stream_type, "output channel closed, sending FIN");
-            let _ = s.write_data(Bytes::new(), true).await;
         }
-        // The VM guest resizes the original PTY.
         "resize" if session.tty => {
             if let Ok(handle) = ensure_exec(&ctx, &session, &exec).await {
                 if let Some(tx) = &handle.resize {
-                    guest_resize(&s, tx).await;
+                    stream_resize(&s, tx).await;
                 } else {
                     while let Ok(Some(_)) = s.read_data().await {}
                 }
@@ -526,7 +533,7 @@ async fn handle_exec_stream(
 
 /// The Kubernetes resize stream is a sequence of JSON objects. SPDY DATA
 /// frames may split one object or contain several.
-async fn guest_resize(s: &Stream, tx: &mpsc::Sender<(u16, u16)>) {
+async fn stream_resize(s: &Stream, tx: &mpsc::Sender<(u16, u16)>) {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Size {
@@ -750,32 +757,32 @@ pub async fn exec_url(
         stdin,
         stdout,
         stderr,
+        native_attach: None,
     };
     let token = register(session);
     Ok(url_for(port, "exec", &token))
 }
 
 /// Register an attach session for the target container.
-pub async fn attach_url(
+pub(crate) async fn attach_url(
     exec: Arc<ContainerManager>,
     state: Arc<StateManager>,
     container_id: String,
-    tty: bool,
-    stdin: bool,
-    stdout: bool,
-    stderr: bool,
+    options: StreamOptions,
+    native_attach: Option<Weak<InitIo>>,
 ) -> Result<String, crate::core::error::Error> {
     let port = ensure_started(exec.clone(), state).await?;
     let session = Session {
         kind: SessionKind::Attach,
         container_id,
         pod_id: String::new(),
-        cmd: vec!["/bin/sh".to_string()],
+        cmd: Vec::new(),
         ports: Vec::new(),
-        tty,
-        stdin,
-        stdout,
-        stderr,
+        tty: options.tty,
+        stdin: options.stdin,
+        stdout: options.stdout,
+        stderr: options.stderr,
+        native_attach,
     };
     let token = register(session);
     Ok(url_for(port, "attach", &token))
@@ -799,6 +806,7 @@ pub async fn port_forward_url(
         stdin: false,
         stdout: false,
         stderr: false,
+        native_attach: None,
     };
     let token = register(session);
     Ok(url_for(port, "portforward", &token))

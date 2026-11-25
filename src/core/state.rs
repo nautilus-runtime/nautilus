@@ -48,11 +48,13 @@ pub struct ContainerState {
     /// CRI ContainerStatus.reason (e.g. "OOMKilled").
     #[serde(default)]
     pub finish_reason: String,
-    /// CRI ContainerConfig.stdin: the init's stdin must stay OPEN (daemon-held
-    /// pipe) so stdin-oriented workloads (attach shells) don't EOF-exit
-    /// before a client attaches.
+    /// Keep init stdin open before the first attach.
     #[serde(default)]
     pub open_stdin: bool,
+    #[serde(default)]
+    pub stdin_once: bool,
+    #[serde(default)]
+    pub tty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmContainer>,
 }
@@ -568,6 +570,8 @@ mod event_tests {
             volumes: Vec::new(),
             finish_reason: String::new(),
             open_stdin: false,
+            stdin_once: false,
+            tty: false,
             vm,
         }
     }
