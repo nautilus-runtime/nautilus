@@ -635,6 +635,12 @@ async fn cmd_run(
         }),
         ..Default::default()
     };
+    let mut interrupt = if detach {
+        None
+    } else {
+        Some(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| e.to_string())?)
+    };
     let pod_id = r
         .run_pod_sandbox(Request::new(RunPodSandboxRequest {
             config: Some(pod),
@@ -689,31 +695,36 @@ async fn cmd_run(
             return Err("daemon returned an empty container id".into());
         }
         created_id = Some(id.clone());
-        r.start_container(Request::new(StartContainerRequest { container_id: id.clone() }))
-            .await.map_err(status)?;
-        started = true;
-        if detach {
-            println!("{id}");
-            Ok(0)
-        } else {
-            if is_wasi {
-                return follow_workload(r, &id, false, false).await;
-            }
+        let launch = r.start_container(Request::new(StartContainerRequest { container_id: id.clone() }));
+        let reply = if let Some(interrupt) = interrupt.as_mut() {
             tokio::select! {
-                result = follow_workload(r, &id, true, !is_vm) => result,
-                result = tokio::signal::ctrl_c() => {
-                    result.map_err(|e| e.to_string())?;
+                biased;
+                _ = interrupt.recv() => return Ok(130),
+                reply = launch => reply,
+            }
+        } else {
+            launch.await
+        };
+        reply.map_err(status)?;
+        started = true;
+        if let Some(interrupt) = interrupt.as_mut() {
+            tokio::select! {
+                result = follow_workload(r, &id, !is_wasi, !is_vm && !is_wasi) => result,
+                _ = interrupt.recv() => {
                     r.stop_container(Request::new(StopContainerRequest {
                         container_id: id.clone(),
-                        timeout: 10,
+                        timeout: if is_wasi { 0 } else { 10 },
                     })).await.map_err(status)?;
                     Ok(130)
                 }
             }
+        } else {
+            println!("{id}");
+            Ok(0)
         }
     }.await;
     if rm || !started {
-        let condition = if workload.is_ok() { Some("exited") } else { None };
+        let condition = if started && workload.is_ok() { Some("exited") } else { None };
         let cleanup = remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await;
         return match (workload, cleanup) {
             (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup of sandbox {pod_id} failed: {cleanup}")),

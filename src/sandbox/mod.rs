@@ -169,14 +169,17 @@ pub struct VolumeMount {
 }
 
 /// Result of starting a workload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum StartOutcome {
     /// Long-running workload: OS pid while it keeps running.
     Detached { pid: u32 },
     /// Guest-owned process, observed using its authenticated agent.
     Guest,
-    /// Batch workload that already ran to completion inside `start`.
-    Finished { exit_code: i32 },
+    /// In-process workload held until its Running state is committed.
+    Managed {
+        activate: tokio::sync::oneshot::Sender<()>,
+        finished: tokio::sync::watch::Receiver<Option<i32>>,
+    },
 }
 
 /// Live stdio handles for a streaming CRI exec/attach session.
