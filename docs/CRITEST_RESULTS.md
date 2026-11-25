@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 原生 OCI init Attach
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）使用 Kubernetes v1.37.2 验证 `f046243`。管道模式连接 PID 1，返回首条 stdout、独立 stderr 和 stdin 输入。客户端关闭 stdin 后，init 观察到 EOF，输出仍进入 CRI 日志，`kubectl attach` 返回退出码 37。TTY 模式首次接入时读取启动输出，窗口从 24×80 调到 33×101。断开后重连同一个 init，Ctrl-C 触发 init 的信号处理并返回退出码 42。删除测试命名空间后 CRI 中没有该命名空间的 Pod sandbox 或容器。[真实 kubelet 验收脚本](../tests/kubelet_oci_attach_acceptance.py)
+
+通过真实 CRI socket，在确认另一容器已经退出后再调用 Attach，仍收到首条输出和工作负载退出码 37。Linux 串行 Rust 测试 117 通过、0 失败、8 项忽略，覆盖有界启动输出、任一通道过载时释放整个会话和快速退出。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 297.094 秒。结束时 CRI Pod 与容器均为零。
+
 ## 2026-11-25 后台工作负载自动回收
 
 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `nautilus run -d --rm`。OCI、Registry WASI 和 VM 均返回容器 ID，并在执行结束后回收容器及其隐式 Pod。VM 执行期间可见的宿主日志目录随后删除。CLI 对旧 daemon 在创建资源前拒绝此选项。
