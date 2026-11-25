@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 OCI 镜像层流式解包
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）验证 Release 构建 `b5f9af9`。同一 21 层镜像依次运行 4、8、16 并发 Pod VM，全部 28 个 Pod 清理后，daemon PSS 由原版的 447.4 MiB 降到 62.9 MiB。96 MiB 的单波 PSS 增量预算在原版返回失败，在修复版通过。[分配器诊断及前后对照](VM_AGENT_LOOP.md#daemon-解包内存复验)
+
+Cloud Hypervisor v55.0、virtiofsd 1.13.2 和真实 CRI 的 VM 工作负载与 daemon 恢复场景通过。附带的可选 `crictl` 交互用例在原版与修复版均复现失败。Linux 串行 Rust 测试 134 通过、0 失败、8 项忽略，覆盖 tar、gzip 和 zstd 的文件读取、whiteout 与硬链接。严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**107 通过、0 失败、35 跳过**，耗时 314.576 秒，结束时无残留 Pod 或容器。
+
 ## 2026-11-25 原生 OCI CPU 与内存原地调整
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118、systemd 257）验证 `48c4112`。未修改 resize 相关配置的 kubelet v1.37.2 通过 Pod `/resize` 完成 Guaranteed 和 Burstable Pod 的升配与降配。Guaranteed Pod 从 250m/128 MiB 调到 500m/256 MiB，再调到 300m/96 MiB。容器 ID、PID、启动时间和重启次数均保持原值，CRI、Kubernetes、容器和 Pod cgroup 以及 systemd scope 报告一致，调整结束后容器已解冻。
