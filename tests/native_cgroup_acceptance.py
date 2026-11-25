@@ -124,18 +124,24 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
               f"idle +{idle_ns} ns; working sets {busy_last[1]} and {idle_last[1]} bytes; "
               f"Pod CPU and working set equal the container sums")
     finally:
-        first_remove_error = None
+        cleanup_error = None
         for container in containers:
             try:
                 cri("rm", "-f", container)
             except subprocess.CalledProcessError as error:
                 # Clean up the fixture but fail if the first removal failed.
-                first_remove_error = first_remove_error or error
+                cleanup_error = cleanup_error or error
                 time.sleep(1)
-                cri("rm", "-f", container)
+                try:
+                    cri("rm", "-f", container)
+                except subprocess.CalledProcessError:
+                    pass
         if pod:
-            cri("stopp", pod)
-            cri("rmp", pod)
+            for operation in ("stopp", "rmp"):
+                try:
+                    cri(operation, pod)
+                except subprocess.CalledProcessError as error:
+                    cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise cleanup_error
         assert all(not group.exists() for group in groups), groups
-        if first_remove_error is not None:
-            raise first_remove_error
