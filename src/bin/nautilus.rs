@@ -649,10 +649,10 @@ async fn cmd_run(
         }
     }
 
-    let namespaces = is_vm.then(|| NamespaceOption {
+    let private_pid_namespace = NamespaceOption {
         pid: NamespaceMode::Container as i32,
         ..Default::default()
-    });
+    };
     let auto_remove_annotations: std::collections::HashMap<String, String> = auto_remove
         .then(|| [(nautilus::cri::AUTO_REMOVE_ANNOTATION.to_string(), "true".to_string())].into_iter().collect())
         .unwrap_or_default();
@@ -666,9 +666,9 @@ async fn cmd_run(
         }),
         labels: [(CTL_LABEL.to_string(), "true".to_string())].into_iter().collect(),
         annotations: auto_remove_annotations.clone(),
-        linux: namespaces.clone().map(|options| LinuxPodSandboxConfig {
+        linux: is_vm.then(|| LinuxPodSandboxConfig {
             security_context: Some(LinuxSandboxSecurityContext {
-                namespace_options: Some(options),
+                namespace_options: Some(private_pid_namespace.clone()),
                 ..Default::default()
             }),
             resources: Some(resources.clone()),
@@ -723,8 +723,8 @@ async fn cmd_run(
         annotations: auto_remove_annotations,
         linux: Some(LinuxContainerConfig {
             resources: Some(resources),
-            security_context: namespaces.map(|options| LinuxContainerSecurityContext {
-                namespace_options: Some(options),
+            security_context: (is_vm || attach.enabled()).then(|| LinuxContainerSecurityContext {
+                namespace_options: Some(private_pid_namespace),
                 ..Default::default()
             }),
             ..Default::default()
