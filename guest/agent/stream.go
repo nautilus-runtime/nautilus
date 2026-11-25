@@ -225,7 +225,7 @@ func (s *server) stream(f *os.File, q request) {
 		if q.Op == "execStream" {
 			res = c.runExec(ctx, q.Argv, o.TTY, o.Stdin, func(p *processIO) error { return ack(p.inputFor(o, true)) }, w.writer(channelOutput, o.Stdout), w.writer(channelErrorOutput, o.Stderr))
 		} else {
-			res = c.attachInit(ctx, w, o, exitedAttach, ack)
+			res = c.attachInit(ctx, w, o, ack)
 		}
 	}
 	if !acknowledged {

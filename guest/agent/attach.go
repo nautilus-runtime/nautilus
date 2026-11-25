@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type attachHub struct {
@@ -47,7 +50,7 @@ func (w attachmentWriter) Write(b []byte) (int, error) {
 	}
 	return len(b), nil
 }
-func (c *container) attachInit(ctx context.Context, w *streamWire, o *streamOptions, exited bool, ack func(streamInput) error) response {
+func (c *container) attachInit(ctx context.Context, w *streamWire, o *streamOptions, ack func(streamInput) error) response {
 	h := &c.attach
 	observer := make(chan packet, 16)
 	h.Lock()
@@ -67,12 +70,20 @@ func (c *container) attachInit(ctx context.Context, w *streamWire, o *streamOpti
 	h.Unlock()
 	defer func() { h.Lock(); delete(h.observers, observer); h.Unlock() }()
 	input := c.io.inputFor(o, c.p.StdinOnce)
-	if exited {
-		// Drain retained output and exit status even if the client sends
-		// its initial stdin or terminal size after the workload has exited.
-		input = streamInput{write: func([]byte) error { return nil }, eof: func() error { return nil },
-			resize: func(uint16, uint16) error { return nil }}
-	} else if o.Stdin && c.p.StdinOnce {
+	if write := input.write; write != nil {
+		input.write = func(b []byte) error {
+			return c.applyAttachInput(ctx, func() error { return write(b) })
+		}
+	}
+	if eof := input.eof; eof != nil {
+		input.eof = func() error { return c.applyAttachInput(ctx, eof) }
+	}
+	if resize := input.resize; resize != nil {
+		input.resize = func(width, height uint16) error {
+			return c.applyAttachInput(ctx, func() error { return resize(width, height) })
+		}
+	}
+	if o.Stdin && c.p.StdinOnce {
 		defer c.io.closeInput()
 	}
 	if err := ack(input); err != nil {
@@ -109,4 +120,39 @@ func (c *container) attachInit(ctx context.Context, w *streamWire, o *streamOpti
 			}
 		}
 	}
+}
+
+func (c *container) applyAttachInput(ctx context.Context, apply func() error) error {
+	select {
+	case <-c.initExited:
+		return nil
+	default:
+	}
+	err := apply()
+	switch {
+	case errors.Is(err, errStdinClosed), errors.Is(err, errNoTerminal):
+		// Final descriptor cleanup only happens after Wait4 publishes exit.
+		select {
+		case <-c.initExited:
+			return nil
+		default:
+		}
+	case errors.Is(err, unix.EPIPE), errors.Is(err, unix.EIO):
+		// A pipe or PTY can lose its peer just before Wait4 reports exit.
+		// Keep an actual I/O error if the init is still running.
+		timer := time.NewTimer(250 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-c.initExited:
+			return nil
+		case <-timer.C:
+			select {
+			case <-c.initExited:
+				return nil
+			default:
+			}
+		case <-ctx.Done():
+		}
+	}
+	return err
 }
