@@ -5,7 +5,6 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
 const QUEUE_DEPTH: usize = 16;
@@ -123,17 +122,9 @@ impl InitIo {
         Self::with_writer(pid, writer, terminal, stdin_once)
     }
 
-    pub(super) fn for_wasi(stdin: bool, stdin_once: bool) -> (Self, Option<DuplexStream>) {
+    pub(super) fn for_wasi(stdin: bool, stdin_once: bool) -> (Self, Option<mpsc::Receiver<Bytes>>) {
         let (writer, reader) = if stdin {
-            let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE_DEPTH);
-            let (reader, mut writer) = tokio::io::duplex(ATTACH_CHUNK_BYTES);
-            tokio::spawn(async move {
-                while let Some(bytes) = rx.recv().await {
-                    if writer.write_all(&bytes).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            let (tx, reader) = mpsc::channel(QUEUE_DEPTH);
             (Some(tx), Some(reader))
         } else {
             (None, None)

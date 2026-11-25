@@ -9,6 +9,7 @@ use crate::core::{Config, Error, Result};
 use crate::sandbox::init_io::{InitIo, ATTACH_CHUNK_BYTES};
 use crate::sandbox::{SandboxBackend, SandboxKind, StartOutcome, WorkloadSpec};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -17,13 +18,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio::sync::{oneshot, watch};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::{Engine, ExternType, InstancePre, Linker, Module, Store};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 use wasmtime_wasi::{
-    pipe::{AsyncReadStream, AsyncWriteStream},
-    AsyncStdinStream, AsyncStdoutStream, WasiCtxBuilder,
+    pipe::AsyncWriteStream, AsyncStdoutStream, HostInputStream, StdinStream, StreamError,
+    Subscribe, WasiCtxBuilder,
 };
 
 pub struct WasmBackend {
@@ -41,9 +42,57 @@ struct Job {
 
 struct WasiStdio {
     io: Arc<InitIo>,
-    stdin: Option<DuplexStream>,
+    stdin: Option<mpsc::Receiver<Vec<u8>>>,
     log: PathBuf,
     packaged: bool,
+}
+
+#[derive(Clone)]
+struct WasiStdin(Arc<tokio::sync::Mutex<WasiInput>>);
+
+struct WasiInput {
+    reader: mpsc::Receiver<Vec<u8>>,
+    pending: Bytes,
+}
+
+impl StdinStream for WasiStdin {
+    fn stream(&self) -> Box<dyn HostInputStream> {
+        Box::new(self.clone())
+    }
+
+    fn isatty(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+impl HostInputStream for WasiStdin {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        let mut input = self
+            .0
+            .try_lock()
+            .map_err(|_| StreamError::trap("concurrent WASI stdin reads"))?;
+        if input.pending.is_empty() {
+            match input.reader.try_recv() {
+                Ok(bytes) => input.pending = bytes.into(),
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(Bytes::new()),
+                // Receiver disconnect stays observable on every subsequent read.
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(StreamError::Closed),
+            }
+        }
+        let size = size.min(input.pending.len());
+        Ok(input.pending.split_to(size))
+    }
+}
+
+#[async_trait]
+impl Subscribe for WasiStdin {
+    async fn ready(&mut self) {
+        let mut input = self.0.lock().await;
+        if input.pending.is_empty() {
+            input.pending = input.reader.recv().await.unwrap_or_default().into();
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -413,7 +462,10 @@ impl WasmBackend {
             packaged,
         } = stdio;
         if let Some(stdin) = stdin {
-            builder.stdin(AsyncStdinStream::new(AsyncReadStream::new(stdin)));
+            builder.stdin(WasiStdin(Arc::new(tokio::sync::Mutex::new(WasiInput {
+                reader: stdin,
+                pending: Bytes::new(),
+            }))));
         }
         if packaged {
             let log_writer = |path, channel| CriLogWriter {
