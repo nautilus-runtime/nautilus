@@ -123,7 +123,15 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
               f"Pod CPU and working set equal the container sums")
     finally:
         for container in containers:
-            cri("rm", "-f", container)
+            # cgroupfs can report a transient busy scope after SIGKILL.
+            for attempt in range(5):
+                try:
+                    cri("rm", "-f", container)
+                    break
+                except subprocess.CalledProcessError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(1)
         if pod:
             cri("stopp", pod)
             cri("rmp", pod)
