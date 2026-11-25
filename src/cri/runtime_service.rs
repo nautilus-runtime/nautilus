@@ -152,29 +152,32 @@ fn container_status(c: StoredContainer, image_id: String) -> runtime::v1::Contai
             })
             .collect(),
         log_path: c.log_path.unwrap_or_default(),
-        resources: c.resources.as_ref().filter(|_| c.sandbox_kind == "runc").map(|r| {
-            let mut unified = HashMap::new();
-            if r.native_disable_swap {
-                unified.insert("memory.swap.max".into(), "0".into());
-            }
-            if let Some(group) = r.native_oom_group {
-                unified.insert("memory.oom.group".into(), if group { "1" } else { "0" }.into());
-            }
-            runtime::v1::ContainerResources {
-            linux: Some(runtime::v1::LinuxContainerResources {
-                cpu_period: r.cpu_period,
-                cpu_quota: r.cpu_quota,
-                cpu_shares: r.cpu_shares,
-                cpuset_cpus: r.cpuset_cpus.clone(),
-                cpuset_mems: r.cpuset_mems.clone(),
-                memory_limit_in_bytes: r.memory_limit_in_bytes,
-                oom_score_adj: i64::from(r.oom_score_adj),
-                unified,
-                ..Default::default()
+        resources: c
+            .resources
+            .as_ref()
+            .filter(|_| c.sandbox_kind == "runc")
+            .map(|r| {
+                let mut unified = HashMap::new();
+                if r.native_disable_swap {
+                    unified.insert("memory.swap.max".into(), "0".into());
+                }
+                if let Some(group) = r.native_oom_group {
+                    unified.insert("memory.oom.group".into(), if group { "1" } else { "0" }.into());
+                }
+                runtime::v1::ContainerResources {
+                    linux: Some(runtime::v1::LinuxContainerResources {
+                        cpu_period: r.cpu_period,
+                        cpu_quota: r.cpu_quota,
+                        cpu_shares: r.cpu_shares,
+                        cpuset_cpus: r.cpuset_cpus.clone(),
+                        cpuset_mems: r.cpuset_mems.clone(),
+                        memory_limit_in_bytes: r.memory_limit_in_bytes,
+                        unified,
+                        ..Default::default()
+                    }),
+                    windows: None,
+                }
             }),
-            windows: None,
-            }
-        }),
         image_id,
         user: None,
         stop_signal: 0, // SIGTERM (proto enum 0); not configurable yet
@@ -476,21 +479,28 @@ impl NautilusRuntimeService {
         let mut containers = Vec::new();
         let mut cpu_total = 0u64;
         let mut mem_total = 0u64;
+        let mut mem_usage = Some(0u64);
         for cid in &pod.containers {
-            if let Ok(s) = self.stats_response(cid).await {
-                if let Some(cpu) = &s.cpu {
-                    if let Some(u) = &cpu.usage_core_nano_seconds {
-                        cpu_total += u.value;
+            match self.stats_response(cid).await {
+                Ok(s) => {
+                    if let Some(u) = s.cpu.as_ref().and_then(|cpu| cpu.usage_core_nano_seconds.as_ref()) {
+                        cpu_total = cpu_total.saturating_add(u.value);
                     }
-                }
-                if let Some(mem) = &s.memory {
-                    if let Some(w) = &mem.working_set_bytes {
-                        mem_total += w.value;
+                    if let Some(w) = s.memory.as_ref().and_then(|mem| mem.working_set_bytes.as_ref()) {
+                        mem_total = mem_total.saturating_add(w.value);
                     }
+                    mem_usage = mem_usage
+                        .zip(s.memory.as_ref().and_then(|mem| mem.usage_bytes.as_ref()))
+                        .map(|(total, usage)| total.saturating_add(usage.value));
+                    containers.push(s);
                 }
-                containers.push(s);
+                Err(status) if matches!(status.code(), tonic::Code::NotFound | tonic::Code::FailedPrecondition) => {}
+                Err(_) => mem_usage = None,
             }
         }
+        // Kubelet checks total usage before shrinking a Pod's memory limit.
+        // Publish it only when every active runtime sample supplied a value.
+        let mem_usage = mem_usage.filter(|_| !containers.is_empty());
 
         Ok(rt::PodSandboxStats {
             attributes: Some(stats::pod_attributes(&pod)),
@@ -505,7 +515,7 @@ impl NautilusRuntimeService {
                     timestamp: now,
                     working_set_bytes: Some(rt::UInt64Value { value: mem_total }),
                     available_bytes: None,
-                    usage_bytes: None,
+                    usage_bytes: mem_usage.map(|value| rt::UInt64Value { value }),
                     rss_bytes: None,
                     page_faults: None,
                     major_page_faults: None,

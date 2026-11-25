@@ -3,7 +3,6 @@ use crate::core::state::{NativeResizeControl as Control, NativeResizeValue};
 use crate::core::{Error, Result};
 use crate::sandbox::ResourceLimits;
 use pathrs::{flags::OpenFlags, Root};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -295,11 +294,11 @@ impl LiveResize {
             }
         }
         if read_control(&self.group, name)? != value {
-            let file = self.group.open_subpath(
+            let mut file = self.group.open_subpath(
                 name,
                 OpenFlags::O_WRONLY | OpenFlags::O_TRUNC | OpenFlags::O_NONBLOCK,
             )?;
-            File::from(file).write_all(value.as_bytes())?;
+            file.write_all(value.as_bytes())?;
         }
         let observed = read_control(&self.group, name)?;
         if observed != value {
@@ -313,7 +312,9 @@ impl LiveResize {
 
 fn read_control(group: &Root, name: &str) -> Result<String> {
     let mut contents = String::new();
-    File::from(group.open_subpath(name, OpenFlags::O_RDONLY)?).read_to_string(&mut contents)?;
+    group
+        .open_subpath(name, OpenFlags::O_RDONLY)?
+        .read_to_string(&mut contents)?;
     Ok(contents.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
