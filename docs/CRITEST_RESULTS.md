@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 独立 CLI 与 kubelet 共用 socket
+
+在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）用同一 daemon 启动真实 kubelet v1.37.2 和 Nautilus CLI。标准 CRI 清单返回 Kubernetes 创建的原生 OCI 和 VM 容器，CLI 创建的 WASI 容器仅在 CLI 清单可见。经过 65 秒，独立 WASI 容器仍可读出此前已经退出的进程日志，两个 Kubernetes Pod 保持 Running。连续十次前台 `--rm` 与一次显式删除均成功。
+
+包含 CLI 所有权和后台回收候选的联合构建运行完整 `critest` v1.37.0，同一 Unix socket 同时作为 Runtime 和 Image 端点。105 通过、0 失败、37 跳过，耗时 294.146 秒，结束时 CRI Pod 和容器数均为零。独立测试该所有权变更的 Linux Rust 串行套件为 113 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
+
 ## 2026-11-25 CRI 容器生命周期事件（GetContainerEvents）
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `GetContainerEvents`。双并发 CRI 订阅端分别验证了 OCI（退出码 37）、WASI（退出码 29）、Pod VM（退出码 35）、强制删除运行中 OCI 容器与 Pod VM 级联停删五种路径，均按 `CREATED -> STARTED -> STOPPED -> DELETED` 顺序送达且携带对应 Pod 状态与同 Pod 容器快照（删除事件排除已删容器），重复 Stop/Remove 不产生重复事件，新订阅重连不回放历史事件。另一次验证直接终止运行中 VM 的 VMM，两路订阅在发起停删前均收到 STOPPED，快照将不可取得退出码的容器标为 UNKNOWN。结束时 CRI Pod 与容器数归零。
