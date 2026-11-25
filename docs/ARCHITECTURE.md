@@ -218,6 +218,7 @@ hostNetwork 为 pod 级字段,容器强制继承(跳过 netns/CNI/port-publish)�
 
 - 原生 OCI Attach 的 token 绑定现有 init 实例。首个输出客户端最多回读每个通道最早的 16 KiB，随后接收实时输出。stdin 同时由一个客户端使用。断开连接释放其写入权，`stdinOnce` 同时关闭 pipe 写端或向 canonical PTY 发送 EOF 字符。
 - 原生 OCI Attach 要求默认的 libcontainer 驱动，且 init 由当前 daemon 启动。原生 Exec 单独使用 tenant 进程，仍使用非终端 stdio。
+- WASI Preview 1 Attach 连接当前执行实例的异步管道。启用 stdin 后，模块可在连接前等待输入，`stdinOnce` 在客户端结束输入时交付 EOF。Attach 分开转发 stdout 和 stderr，并保留本地模块的原始日志及 OCI 打包模块的 CRI 日志格式。Stop 可以取消正在等待输入的任务。
 
 ### 4.7 安全
 
