@@ -169,8 +169,6 @@ fn container_status(c: StoredContainer, image_id: String) -> runtime::v1::Contai
                         cpu_period: r.cpu_period,
                         cpu_quota: r.cpu_quota,
                         cpu_shares: r.cpu_shares,
-                        cpuset_cpus: r.cpuset_cpus.clone(),
-                        cpuset_mems: r.cpuset_mems.clone(),
                         memory_limit_in_bytes: r.memory_limit_in_bytes,
                         unified,
                         ..Default::default()
