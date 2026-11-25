@@ -322,7 +322,7 @@ async fn ensure_exec(
     exec: &ContainerManager,
 ) -> Result<Arc<ExecHandle>, String> {
     ctx.exec_process
-        .get_or_init(|| spawn_exec(session, exec, ctx.closed.subscribe()))
+        .get_or_init(|| spawn_exec(session, exec, ctx.closed.clone()))
         .await
         .clone()
 }
@@ -331,7 +331,7 @@ async fn ensure_exec(
 async fn spawn_exec(
     session: &Session,
     exec: &ContainerManager,
-    closed: watch::Receiver<bool>,
+    closed: watch::Sender<bool>,
 ) -> Result<Arc<ExecHandle>, String> {
     let container = exec
         .get_container_state(&session.container_id)
@@ -347,7 +347,8 @@ async fn spawn_exec(
     let (streams, resize, lifetime) = if let Some(init) = &session.native_attach {
         let init = init.upgrade()
             .ok_or_else(|| "attach target instance is no longer available".to_owned())?;
-        let (streams, resize) = init.attach(options, closed).map_err(|e| e.to_string())?;
+        let stopped = container.status == crate::core::state::ContainerStatus::Stopped;
+        let (streams, resize) = init.attach(options, stopped, closed).map_err(|e| e.to_string())?;
         (streams, resize, None)
     } else if container.sandbox_kind == "vm" {
         let op = match session.kind {
@@ -359,7 +360,7 @@ async fn spawn_exec(
             SessionKind::PortForward => return Err("unexpected port-forward session".into()),
         };
         let guest = exec
-            .guest_stream(&container.pod_id, &container.id, op, options, closed)
+            .guest_stream(&container.pod_id, &container.id, op, options, closed.subscribe())
             .await
             .map_err(|e| e.to_string())?;
         (guest.io, guest.resize, Some(guest.lifetime))
@@ -459,25 +460,17 @@ async fn handle_exec_stream(
                 let _ = s.reset(RstStatus::RefusedStream).await;
                 return;
             };
-            loop {
-                match s.read_data().await {
-                    Ok(Some(chunk)) => {
-                        if chunk.is_empty() {
-                            continue;
-                        }
-                        if tx.send(chunk.to_vec()).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::info!(stream_id = s.stream_id, "streaming stdin: client FIN");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::info!(stream_id = s.stream_id, error = %e, "streaming stdin: read error");
+            let mut closed = ctx.closed.subscribe();
+            let receive_input = async {
+                while let Ok(Some(chunk)) = s.read_data().await {
+                    if !chunk.is_empty() && tx.send(chunk.to_vec()).await.is_err() {
                         break;
                     }
                 }
+            };
+            tokio::select! {
+                _ = closed.wait_for(|closed| *closed) => {}
+                _ = receive_input => {}
             }
             // Backend stdin ownership determines how client EOF is delivered.
         }
@@ -509,12 +502,12 @@ async fn handle_exec_stream(
                         return;
                     }
                 }
-                let _ = s.write_data(Bytes::new(), true).await;
             };
             tokio::select! {
                 _ = closed.wait_for(|closed| *closed) => {}
                 _ = send_output => {}
             }
+            let _ = s.write_data(Bytes::new(), true).await;
         }
         "resize" if session.tty => {
             if let Ok(handle) = ensure_exec(&ctx, &session, &exec).await {

@@ -68,6 +68,14 @@ impl Output {
         output.finished = true;
         output.subscribers.clear();
     }
+
+    fn unsubscribe(&self, session: &mpsc::Sender<()>) {
+        self.0
+            .lock()
+            .unwrap()
+            .subscribers
+            .retain(|(_, subscriber)| !subscriber.same_channel(session));
+    }
 }
 
 #[derive(Default)]
@@ -137,11 +145,13 @@ impl InitIo {
     pub(crate) fn attach(
         self: Arc<Self>,
         options: StreamOptions,
-        mut closed: watch::Receiver<bool>,
+        stopped: bool,
+        cancel: watch::Sender<bool>,
     ) -> Result<(ExecStreams, Option<Resize>)> {
         let terminal = self.terminal.lock().unwrap().clone();
+        let mut closed = cancel.subscribe();
         let stdin = if options.stdin {
-            Some(self.attach_stdin(closed.clone())?)
+            Some(self.attach_stdin(stopped, closed.clone())?)
         } else {
             None
         };
@@ -173,13 +183,19 @@ impl InitIo {
                 biased;
                 Some(()) = lagged_rx.recv() => {
                     let _ = done.send(Err(Error::Runtime("attach client did not drain output".into())));
+                    cancel.send_replace(true);
+                    self.stdout.unsubscribe(&lagged);
+                    self.stderr.unsubscribe(&lagged);
                 }
                 outcome = native_exit.wait_for(Option::is_some) => {
                     if let Ok(outcome) = outcome {
                         let _ = done.send(outcome.clone().unwrap().map_err(Error::Runtime));
                     }
                 }
-                _ = closed.wait_for(|closed| *closed) => {}
+                _ = closed.wait_for(|closed| *closed) => {
+                    self.stdout.unsubscribe(&lagged);
+                    self.stderr.unsubscribe(&lagged);
+                }
             }
         });
         Ok((
@@ -196,9 +212,15 @@ impl InitIo {
 
     fn attach_stdin(
         self: &Arc<Self>,
+        stopped: bool,
         mut closed: watch::Receiver<bool>,
     ) -> Result<mpsc::Sender<Bytes>> {
         let mut input = self.input.lock().unwrap();
+        if stopped || self.exit.borrow().is_some() {
+            // A short-lived init may exit before the client opens its streams.
+            // Accept the stdin stream while the client drains output and exit.
+            return Ok(mpsc::channel(1).0);
+        }
         if input.attached {
             return Err(Error::Runtime(
                 "container stdin already has an attach client".into(),
@@ -280,5 +302,53 @@ mod tests {
         assert_eq!(failures.recv().await, Some(()));
         output.finish();
         assert!(second.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn overflowing_stdout_releases_the_whole_attach_session() {
+        let init = Arc::new(InitIo::new(42, None, None, false));
+        let (cancel, mut closed) = watch::channel(false);
+        let (mut streams, _) = init
+            .clone()
+            .attach(
+                StreamOptions {
+                    stdout: true,
+                    stderr: true,
+                    ..Default::default()
+                },
+                false,
+                cancel,
+            )
+            .unwrap();
+        for _ in 0..=QUEUE_DEPTH {
+            init.stdout.send(b"stdout");
+        }
+        assert!(streams.exit.await.unwrap().is_err());
+        assert!(closed.wait_for(|closed| *closed).await.is_ok());
+        assert!(streams.stderr.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_to_a_fast_exit_can_drain_output_and_status() {
+        let init = Arc::new(InitIo::new(42, None, None, true));
+        init.stdout.send(b"first line");
+        init.stdout.finish();
+        init.finish(Ok(37));
+        let (cancel, _) = watch::channel(false);
+        let (mut streams, _) = init
+            .attach(
+                StreamOptions {
+                    stdin: true,
+                    stdout: true,
+                    ..Default::default()
+                },
+                true,
+                cancel,
+            )
+            .unwrap();
+        assert!(streams.stdin.unwrap().is_closed());
+        assert_eq!(streams.stdout.recv().await.unwrap(), b"first line");
+        assert!(streams.stdout.recv().await.is_none());
+        assert_eq!(streams.exit.await.unwrap().unwrap(), 37);
     }
 }

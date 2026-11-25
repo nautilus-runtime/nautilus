@@ -1551,9 +1551,6 @@ impl RuntimeService for NautilusRuntimeService {
         let native_attach = match c.sandbox_kind.as_str() {
             "vm" => None,
             "runc" if self._config.runtime.runc.driver != "exec" => {
-                if c.status != ContainerStatus::Running {
-                    return Err(Status::failed_precondition("attach requires a running OCI container"));
-                }
                 if req.tty != c.tty || req.stdin && !c.open_stdin {
                     return Err(Status::invalid_argument("attach streams do not match container stdin or TTY configuration"));
                 }
