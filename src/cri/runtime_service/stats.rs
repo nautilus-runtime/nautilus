@@ -6,6 +6,7 @@ use crate::sandbox::runc_backend::RuncBackend;
 use crate::vm::workload::{Operation, Reply, Sample};
 use pathrs::{flags::OpenFlags, Root};
 use std::io::{self, Read};
+use std::path::Path;
 use tonic::Status;
 
 pub(super) fn container_attributes(c: &ContainerState) -> rt::ContainerAttributes {
@@ -91,13 +92,14 @@ fn cgroup_usage(group: &Root, timestamp: i64) -> (Option<u64>, Option<rt::Memory
         .and_then(|micros| micros.checked_mul(1000));
     let memory = read("memory.current")
         .and_then(|current| current.trim().parse::<u64>().ok())
-        .zip(read("memory.stat").and_then(|stat| stat_value(&stat, "inactive_file")))
-        .map(|(usage, inactive_file)| rt::MemoryUsage {
+        .map(|usage| rt::MemoryUsage {
             timestamp,
             usage_bytes: Some(rt::UInt64Value { value: usage }),
-            working_set_bytes: Some(rt::UInt64Value {
-                value: usage.saturating_sub(inactive_file),
-            }),
+            working_set_bytes: read("memory.stat")
+                .and_then(|stat| stat_value(&stat, "inactive_file"))
+                .map(|inactive_file| rt::UInt64Value {
+                    value: usage.saturating_sub(inactive_file),
+                }),
             ..Default::default()
         });
     (cpu, memory)
@@ -125,48 +127,53 @@ impl NautilusRuntimeService {
         &self,
         c: &ContainerState,
     ) -> Result<rt::ContainerStats, Status> {
+        if !matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused) {
+            return Err(Status::failed_precondition("container is not running"));
+        }
         let pid = c
             .pid
             .filter(|&pid| pid > 0)
             .ok_or_else(|| Status::failed_precondition("container is not running"))?;
         let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let (cpu, memory) = if c.sandbox_kind == "runc"
-            && matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused)
-        {
+        let cgroup = if c.sandbox_kind == "runc" && self._config.runtime.runc.driver != "exec" {
             let backend = RuncBackend::new(self._config.clone());
             let id = c.id.clone();
             tokio::task::spawn_blocking(move || {
-                backend
+                if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
+                    return Ok(None);
+                }
+                let group = backend
                     .workload_cgroup_v2(&id, pid)
                     .and_then(|path| Root::open(path).ok())
-                    .map(|group| cgroup_usage(&group, timestamp))
-                    .unwrap_or_default()
+                    .ok_or_else(|| Status::unavailable("owned container cgroup is not readable"))?;
+                Ok::<_, Status>(Some(cgroup_usage(&group, timestamp)))
             })
             .await
-            .unwrap_or_default()
+            .map_err(|e| Status::internal(format!("container stats worker: {e}")))??
         } else {
-            (None, None)
+            None
         };
-        let (cpu, memory) = match (cpu, memory) {
-            (Some(cpu), Some(memory)) => (cpu, memory),
-            (cpu, memory) => {
+        let (cpu, memory) = match cgroup {
+            // Init-only CPU may be lower than the previous cgroup sample.
+            Some((cpu, memory)) => (cpu, memory),
+            None => {
                 let (cpu_ns, rss_bytes) = process_usage(pid).await?;
-                let memory = memory.unwrap_or_else(|| rt::MemoryUsage {
+                let memory = rt::MemoryUsage {
                     timestamp,
                     working_set_bytes: Some(rt::UInt64Value { value: rss_bytes }),
                     ..Default::default()
-                });
-                (cpu.unwrap_or(cpu_ns), memory)
+                };
+                (Some(cpu_ns), Some(memory))
             }
         };
         Ok(rt::ContainerStats {
             attributes: Some(container_attributes(c)),
-            cpu: Some(rt::CpuUsage {
+            cpu: cpu.map(|value| rt::CpuUsage {
                 timestamp,
-                usage_core_nano_seconds: Some(rt::UInt64Value { value: cpu }),
+                usage_core_nano_seconds: Some(rt::UInt64Value { value }),
                 ..Default::default()
             }),
-            memory: Some(memory),
+            memory,
             ..Default::default()
         })
     }
@@ -286,7 +293,9 @@ mod tests {
         fs::write(dir.path().join("memory.current"), "20480\n").unwrap();
         let (cpu, memory) = cgroup_usage(&group, 1);
         assert_eq!(cpu, Some(0));
-        assert!(memory.is_none());
+        let memory = memory.unwrap();
+        assert_eq!(memory.usage_bytes.unwrap().value, 20480);
+        assert!(memory.working_set_bytes.is_none());
 
         fs::write(
             dir.path().join("cpu.stat"),
