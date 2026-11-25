@@ -15,8 +15,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
 
-mod init_io;
-pub(crate) use init_io::InitIo;
+use super::init_io::InitIo;
 
 /// Lifecycle driver behind the runc sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

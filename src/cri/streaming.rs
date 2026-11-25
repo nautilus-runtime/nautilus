@@ -28,7 +28,7 @@
 
 use crate::core::state::StateManager;
 use crate::runtime::container::ContainerManager;
-use crate::sandbox::runc_backend::InitIo;
+use crate::sandbox::init_io::{InitIo, ATTACH_CHUNK_BYTES};
 use crate::vm::workload::{Operation, PortOptions, StreamOptions};
 use bytes::Bytes;
 use http::HeaderMap;
@@ -65,7 +65,7 @@ pub struct Session {
     pub stdin: bool,
     pub stdout: bool,
     pub stderr: bool,
-    native_attach: Option<Weak<InitIo>>,
+    local_attach: Option<Weak<InitIo>>,
 }
 
 static SESSIONS: Mutex<Option<HashMap<String, Session>>> = Mutex::new(None);
@@ -347,7 +347,7 @@ async fn spawn_exec(
         stderr: session.stderr,
         tty: session.tty,
     };
-    let (streams, resize, lifetime) = if let Some(init) = &session.native_attach {
+    let (streams, resize, lifetime) = if let Some(init) = &session.local_attach {
         let init = init
             .upgrade()
             .ok_or_else(|| "attach target instance is no longer available".to_owned())?;
@@ -475,8 +475,10 @@ async fn handle_exec_stream(
             let mut closed = ctx.closed.subscribe();
             let receive_input = async {
                 while let Ok(Some(chunk)) = s.read_data().await {
-                    if !chunk.is_empty() && tx.send(chunk.to_vec()).await.is_err() {
-                        break;
+                    for piece in chunk.chunks(ATTACH_CHUNK_BYTES) {
+                        if tx.send(piece.to_vec()).await.is_err() {
+                            return;
+                        }
                     }
                 }
             };
@@ -762,7 +764,7 @@ pub async fn exec_url(
         stdin,
         stdout,
         stderr,
-        native_attach: None,
+        local_attach: None,
     };
     let token = register(session);
     Ok(url_for(port, "exec", &token))
@@ -774,7 +776,7 @@ pub(crate) async fn attach_url(
     state: Arc<StateManager>,
     container_id: String,
     options: StreamOptions,
-    native_attach: Option<Weak<InitIo>>,
+    local_attach: Option<Weak<InitIo>>,
 ) -> Result<String, crate::core::error::Error> {
     let port = ensure_started(exec.clone(), state).await?;
     let session = Session {
@@ -787,7 +789,7 @@ pub(crate) async fn attach_url(
         stdin: options.stdin,
         stdout: options.stdout,
         stderr: options.stderr,
-        native_attach,
+        local_attach,
     };
     let token = register(session);
     Ok(url_for(port, "attach", &token))
@@ -811,7 +813,7 @@ pub async fn port_forward_url(
         stdin: false,
         stdout: false,
         stderr: false,
-        native_attach: None,
+        local_attach: None,
     };
     let token = register(session);
     Ok(url_for(port, "portforward", &token))

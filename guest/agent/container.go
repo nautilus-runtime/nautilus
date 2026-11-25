@@ -37,6 +37,7 @@ type container struct {
 	cpu              cpuHistory
 	p                process
 	pidfd            int
+	initExited       chan struct{} // Wait4 observed exit; output can still be draining
 	done             chan struct{}
 	exited           status // published by closing done
 	log              *os.File
@@ -140,6 +141,7 @@ func (c *container) create() error {
 		return err
 	}
 	c.done = make(chan struct{})
+	c.initExited = make(chan struct{})
 	c.s = status{State: "created", Created: time.Now().UnixNano()}
 	go func() {
 		var ws unix.WaitStatus
@@ -160,6 +162,7 @@ func (c *container) create() error {
 			code = 128 + int(ws.Signal())
 		}
 		c.exited = status{ExitCode: code, Finished: time.Now().UnixNano()}
+		close(c.initExited)
 		streams.Wait()
 		pio.close()
 		close(c.done)

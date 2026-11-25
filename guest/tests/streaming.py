@@ -120,6 +120,23 @@ def run(connect, frame, read_exact, identity, uid, bundle, ok, first):
     assert ok("status", cid)["exitCode"] == 28
     ok("remove", cid)
 
+    # An init that exits before Attach keeps its first output and exit status.
+    cid = uid()
+    bundle(cid, "printf first-stdout; printf first-stderr >&2; exit 37")
+    ok("create", cid)
+    ok("start", cid)
+    deadline = time.monotonic() + 5
+    while ok("status", cid)["state"] != "exited":
+        assert time.monotonic() < deadline
+        time.sleep(0.025)
+    with open_stream("attach", cid, {"stdout": True, "stderr": True}) as sock:
+        assert recv(sock) == (1, b"first-stdout")
+        assert recv(sock) == (2, b"first-stderr")
+        assert recv(sock) == (6, struct.pack(">i", 37))
+    with open_stream("attach", cid, {"stdout": True, "stderr": True}) as sock:
+        assert recv(sock) == (6, struct.pack(">i", 37))
+    ok("remove", cid)
+
     # Malformed or unauthorized records terminate only the individual session.
     open_stream("portForward", first, {"port": 18080}, success=False).close()
     open_stream("attach", first, {"stdin": True}, success=False).close()

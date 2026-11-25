@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 const QUEUE_DEPTH: usize = 16;
 const STARTUP_BYTES: usize = 16 * 1024;
+pub(crate) const ATTACH_CHUNK_BYTES: usize = 16 * 1024;
 
 type Bytes = Vec<u8>;
 type Resize = mpsc::Sender<(u16, u16)>;
@@ -84,7 +85,7 @@ struct Input {
     attached: bool,
 }
 
-/// Daemon-owned stdio for one native OCI init instance.
+/// Daemon-owned stdio for one locally managed workload instance.
 pub(crate) struct InitIo {
     pub(super) pid: u32,
     pub(super) stdout: Output,
@@ -118,6 +119,25 @@ impl InitIo {
             });
             tx
         });
+        Self::with_writer(pid, writer, terminal, stdin_once)
+    }
+
+    pub(super) fn for_wasi(stdin: bool, stdin_once: bool) -> (Self, Option<mpsc::Receiver<Bytes>>) {
+        let (writer, reader) = if stdin {
+            let (tx, reader) = mpsc::channel(QUEUE_DEPTH);
+            (Some(tx), Some(reader))
+        } else {
+            (None, None)
+        };
+        (Self::with_writer(0, writer, None, stdin_once), reader)
+    }
+
+    fn with_writer(
+        pid: u32,
+        writer: Option<mpsc::Sender<Bytes>>,
+        terminal: Option<Arc<File>>,
+        stdin_once: bool,
+    ) -> Self {
         Self {
             pid,
             stdout: Output::new(),
@@ -137,8 +157,9 @@ impl InitIo {
     }
 
     pub(crate) fn finish(&self, outcome: std::result::Result<i32, String>) {
-        self.close_stdin();
         self.terminal.lock().unwrap().take();
+        let mut input = self.input.lock().unwrap();
+        input.writer.take();
         self.exit.send_replace(Some(outcome));
     }
 
@@ -177,7 +198,7 @@ impl InitIo {
             tx
         });
         let (done, exit) = oneshot::channel();
-        let mut native_exit = self.exit.subscribe();
+        let mut workload_exit = self.exit.subscribe();
         tokio::spawn(async move {
             tokio::select! {
                 biased;
@@ -187,7 +208,7 @@ impl InitIo {
                     self.stdout.unsubscribe(&lagged);
                     self.stderr.unsubscribe(&lagged);
                 }
-                outcome = native_exit.wait_for(Option::is_some) => {
+                outcome = workload_exit.wait_for(Option::is_some) => {
                     if let Ok(outcome) = outcome {
                         let _ = done.send(outcome.clone().unwrap().map_err(Error::Runtime));
                     }
@@ -342,7 +363,7 @@ mod tests {
                     stdout: true,
                     ..Default::default()
                 },
-                true,
+                false,
                 cancel,
             )
             .unwrap();
