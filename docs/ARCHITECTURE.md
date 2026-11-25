@@ -276,7 +276,8 @@ hostNetwork 为 pod 级字段,容器强制继承(跳过 netns/CNI/port-publish)�
 - grpc-timeout 三层强制(预算下限 + tokio 定时器 + Instant 回检)
 - exec_sync 超时下沉 backend(WNOHANG + SIGKILL + reap,不泄漏进程)
 - 资源统计:container_stats / list_container_stats / pod_sandbox_stats
-  (原生 libcontainer 容器读取所属 cgroup v2 的 CPU 累计时间与内存工作集。
+  (原生 libcontainer 容器读取所属 cgroup v2 的累计 CPU 时间、内存工作集、RSS、缺页次数与 swap。
+  CPU、内存和 I/O 压力来自同一 cgroup 的 PSI，未提供的计数不填充。
   其他后端和 cgroup v1 节点沿用 `/proc` 进程统计);`scripts/measure_memory.sh` 内存测量
 
 ## 6. 验证体系
