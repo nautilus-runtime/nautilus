@@ -260,6 +260,8 @@ impl ContainerManager {
             volumes,
             finish_reason: String::new(),
             open_stdin,
+            stdin_once,
+            tty,
             vm,
         };
 
@@ -267,8 +269,6 @@ impl ContainerManager {
         let mut spec = self.workload_spec_with_net(&container_state).await?;
         spec.working_dir = working_dir.to_owned();
         spec.strict_groups = strict_groups;
-        spec.tty = tty;
-        spec.stdin_once = stdin_once;
         spec.entrypoint = command;
         spec.args = args;
         spec.log_relpath = log_relpath;
@@ -308,8 +308,8 @@ impl ContainerManager {
             entrypoint: Vec::new(),
             working_dir: String::new(),
             strict_groups: false,
-            tty: false,
-            stdin_once: false,
+            tty: state.tty,
+            stdin_once: state.stdin_once,
             env: state.env.clone(),
             // Host-side capture directory; RuncBackend bind-mounts it into the
             // container at /.nautilus-log. When the CRI log path points into
@@ -508,6 +508,7 @@ impl ContainerManager {
         let state_manager = self.state_manager.clone();
         let cache = self.containers.clone();
         let exits = self.native_exits.clone();
+        let init_io = crate::sandbox::runc_backend::init_io(&container_id, pid);
         let key = (container_id.clone(), pid);
         let (done, receiver) = watch::channel(());
         exits.lock().unwrap().insert(key.clone(), receiver);
@@ -516,6 +517,9 @@ impl ContainerManager {
                 Ok(code) => code,
                 Err(error) => {
                     tracing::error!(%container_id, %pid, %error, "could not watch workload exit");
+                    if let Some(io) = init_io {
+                        io.finish(Err(error.to_string()));
+                    }
                     exits.lock().unwrap().remove(&key);
                     return;
                 }
@@ -553,6 +557,9 @@ impl ContainerManager {
                         Err(error) => tracing::error!(%container_id, %error, "could not record workload exit"),
                     }
                 }
+            }
+            if let Some(io) = init_io {
+                io.finish(Ok(code));
             }
             exits.lock().unwrap().remove(&key);
             drop(done);
@@ -729,7 +736,7 @@ impl ContainerManager {
         }
 
         crate::network::publish::remove(container_id).await;
-        crate::sandbox::runc_backend::close_container_stdin(container_id);
+        crate::sandbox::runc_backend::remove_init_io(container_id);
 
         tracing::info!(container_id = %container_id, "Container removed");
         Ok(())
