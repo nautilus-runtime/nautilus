@@ -1,3 +1,4 @@
+mod auto_remove;
 mod stats;
 
 use super::list_stream::{batches, ListStream};
@@ -1645,7 +1646,7 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn status(
         &self,
-        _request: Request<StatusRequest>,
+        request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         use crate::proto::runtime::v1 as rt;
         let cond = |t: &str| rt::RuntimeCondition {
@@ -1671,7 +1672,11 @@ impl RuntimeService for NautilusRuntimeService {
             }),
             runtime_handlers: handlers,
             features: None,
-            info: Default::default(),
+            info: if request.into_inner().verbose {
+                [(super::AUTO_REMOVE_ANNOTATION.to_owned(), "true".to_owned())].into_iter().collect()
+            } else {
+                Default::default()
+            },
         }))
     }
 
@@ -2035,6 +2040,32 @@ mod container_event_tests {
             .await.unwrap().into_inner().containers;
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().any(|item| item.id == local));
+    }
+
+    #[tokio::test]
+    async fn detached_auto_removal_reclaims_only_the_opted_in_sandbox() {
+        let (_tmp, service, module) = setup();
+        service.start_auto_removal().await;
+        let mut requested = wasi_pod_request();
+        requested.config.as_mut().unwrap().annotations.insert(
+            super::super::AUTO_REMOVE_ANNOTATION.into(), "true".into(),
+        );
+        let regular = service.run_pod_sandbox(Request::new(requested.clone()))
+            .await.unwrap().into_inner().pod_sandbox_id;
+        let automatic = service.run_pod_sandbox(standalone_request(requested))
+            .await.unwrap().into_inner().pod_sandbox_id;
+        for pod in [&regular, &automatic] {
+            let id = create_wasi(&service, pod, &module, "quick-exit").await;
+            service.start_container(Request::new(StartContainerRequest { container_id: id }))
+                .await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.pod_manager.get_pod_state(&automatic).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(service.container_manager.list_containers_in_pod(&automatic).await.unwrap().is_empty());
+        assert!(service.pod_manager.get_pod_state(&regular).await.unwrap().is_some());
     }
 
     #[tokio::test]
