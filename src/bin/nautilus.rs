@@ -562,10 +562,7 @@ async fn cmd_run(
 ) -> Result<u8, String> {
     let is_vm = runtime == "vm";
     let is_wasi = matches!(runtime.as_str(), "wasm" | "wasi");
-    if attach.enabled() && !matches!(runtime.as_str(), "" | "runc" | "vm") {
-        return Err("interactive run requires the runc or vm runtime".into());
-    }
-    attach.validate()?;
+    attach.validate(&runtime)?;
     let auto_remove = detach && rm;
     if is_vm && !publish.is_empty() {
         return Err("the VM runtime does not support --publish".into());
@@ -723,7 +720,7 @@ async fn cmd_run(
         annotations: auto_remove_annotations,
         linux: Some(LinuxContainerConfig {
             resources: Some(resources),
-            security_context: (is_vm || attach.enabled()).then(|| LinuxContainerSecurityContext {
+            security_context: (is_vm || (!is_wasi && attach.enabled())).then(|| LinuxContainerSecurityContext {
                 namespace_options: Some(private_pid_namespace),
                 ..Default::default()
             }),
@@ -793,7 +790,23 @@ async fn cmd_run(
     }.await;
     if !started || (rm && !detach) {
         let condition = if started && workload.is_ok() { Some("exited") } else { None };
-        let cleanup = remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await;
+        let cleanup = if is_wasi && attach.enabled() && condition == Some("exited") {
+            // The Attach result can arrive before the managed exit is stored.
+            // Retry the conditional removal so a live instance is never stopped here.
+            let cleanup = async {
+                loop {
+                    if remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await? {
+                        return Ok(true);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+                .await
+                .unwrap_or_else(|_| Err(format!("timed out waiting to remove WASI sandbox {pod_id}")))
+        } else {
+            remove_implicit_workload(r, created_id.as_deref(), &pod_id, condition).await
+        };
         return match (workload, cleanup) {
             (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup of sandbox {pod_id} failed: {cleanup}")),
             (result, Ok(_)) => result,

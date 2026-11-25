@@ -30,7 +30,16 @@ impl Options {
         self.stdin || self.tty
     }
 
-    pub fn validate(self) -> Result<(), String> {
+    pub fn validate(self, runtime: &str) -> Result<(), String> {
+        if self.enabled() {
+            match runtime {
+                "wasi" | "wasm" if self.tty => {
+                    return Err("WASI supports piped stdin but does not support a TTY".into());
+                }
+                "" | "runc" | "vm" | "wasi" | "wasm" => {}
+                _ => return Err("interactive run requires the runc, vm, or wasi runtime".into()),
+            }
+        }
         if self.stdin && self.tty && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
             return Err("the input device is not a terminal".into());
         }
@@ -408,6 +417,28 @@ impl Drop for RawTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wasi_accepts_pipe_input_and_rejects_tty_before_opening_a_terminal() {
+        assert!(Options {
+            stdin: true,
+            tty: false
+        }
+        .validate("wasi")
+        .is_ok());
+        assert!(Options {
+            stdin: true,
+            tty: false
+        }
+        .validate("wasm")
+        .is_ok());
+        for stdin in [false, true] {
+            assert_eq!(
+                Options { stdin, tty: true }.validate("wasi").unwrap_err(),
+                "WASI supports piped stdin but does not support a TTY",
+            );
+        }
+    }
 
     #[tokio::test]
     async fn drains_both_outputs_after_the_exit_status() {
