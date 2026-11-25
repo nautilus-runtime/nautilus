@@ -57,6 +57,7 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
     }))
     pod = ""
     containers = []
+    groups = set()
     try:
         pod = cri("runp", "--runtime", "runc", str(pod_spec))
         workloads = {
@@ -82,6 +83,7 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
             lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
             member = next(line.removeprefix("0::/") for line in lines if line.startswith("0::/"))
             group = Path("/sys/fs/cgroup") / member
+            groups.add(group)
             cpu = lambda: keyed_counter(group / "cpu.stat", "usage_usec") * 1000
             before = cpu()
             sample = container_stats(container)
@@ -122,16 +124,18 @@ with tempfile.TemporaryDirectory(prefix="nt-cgroup-") as tmp:
               f"idle +{idle_ns} ns; working sets {busy_last[1]} and {idle_last[1]} bytes; "
               f"Pod CPU and working set equal the container sums")
     finally:
+        first_remove_error = None
         for container in containers:
-            # cgroupfs can report a transient busy scope after SIGKILL.
-            for attempt in range(5):
-                try:
-                    cri("rm", "-f", container)
-                    break
-                except subprocess.CalledProcessError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(1)
+            try:
+                cri("rm", "-f", container)
+            except subprocess.CalledProcessError as error:
+                # Clean up the fixture but fail if the first removal failed.
+                first_remove_error = first_remove_error or error
+                time.sleep(1)
+                cri("rm", "-f", container)
         if pod:
             cri("stopp", pod)
             cri("rmp", pod)
+        assert all(not group.exists() for group in groups), groups
+        if first_remove_error is not None:
+            raise first_remove_error
