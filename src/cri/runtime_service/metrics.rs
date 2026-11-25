@@ -849,8 +849,8 @@ fn base_metrics(
     .collect()
 }
 
-fn guest_cgroup_metrics(sample: &Sample, labels: &[String]) -> Result<Vec<Metric>, Status> {
-    let (cpu, memory) = stats::readings(sample).map_err(Status::data_loss)?;
+fn guest_cgroup_metrics(sample: &Sample, labels: &[String]) -> Result<Vec<Metric>, &'static str> {
+    let (cpu, memory) = stats::readings(sample)?;
     let mut metrics = base_metrics(Some(cpu), Some(memory), labels);
     let counter = |file: &str, key: &str| sample.cgroup_counters.get(file)?.get(key).copied();
     for family in FAMILIES {
@@ -910,7 +910,8 @@ impl NautilusRuntimeService {
             let mut container_metrics = Vec::new();
             for container in containers {
                 if let Some(sample) = samples.remove(&container.id) {
-                    let metrics = guest_cgroup_metrics(&sample, &labels(pod, Some(&container)))?;
+                    let metrics = guest_cgroup_metrics(&sample, &labels(pod, Some(&container)))
+                        .map_err(Status::data_loss)?;
                     container_metrics.push(ContainerMetrics {
                         container_id: container.id,
                         metrics,
@@ -919,7 +920,8 @@ impl NautilusRuntimeService {
             }
             return Ok(PodSandboxMetrics {
                 pod_sandbox_id: pod.id.clone(),
-                metrics: guest_cgroup_metrics(&sample, &labels(pod, None))?,
+                metrics: guest_cgroup_metrics(&sample, &labels(pod, None))
+                    .map_err(Status::data_loss)?,
                 container_metrics,
             });
         }
