@@ -6,11 +6,11 @@
 
 ## 2026-11-25 CRI 容器生命周期事件（GetContainerEvents）
 
-在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `GetContainerEvents`。双并发 CRI 订阅端分别验证了 OCI（退出码 37）、WASI（退出码 29）、Pod VM（退出码 35）、强制删除运行中 OCI 容器与 Pod VM 级联停删五种路径，均按 `CREATED -> STARTED -> STOPPED -> DELETED` 顺序送达且携带对应 Pod 状态与同 Pod 容器快照（删除事件排除已删容器），重复 Stop/Remove 不产生重复事件，新订阅重连不回放历史事件，结束时 CRI Pod 与容器数归零。
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `GetContainerEvents`。双并发 CRI 订阅端分别验证了 OCI（退出码 37）、WASI（退出码 29）、Pod VM（退出码 35）、强制删除运行中 OCI 容器与 Pod VM 级联停删五种路径，均按 `CREATED -> STARTED -> STOPPED -> DELETED` 顺序送达且携带对应 Pod 状态与同 Pod 容器快照（删除事件排除已删容器），重复 Stop/Remove 不产生重复事件，新订阅重连不回放历史事件。另一次验证直接终止运行中 VM 的 VMM，两路订阅在发起停删前均收到 STOPPED，快照将不可取得退出码的容器标为 UNKNOWN。结束时 CRI Pod 与容器数归零。
 
 真实 Kubernetes v1.37.2 kubelet 启用 `--feature-gates=EventedPLEG=true` 后，`/configz` 报告 `EventedPLEG=true`，`/metrics` 报告 `kubelet_evented_pleg_connection_success_count 1` 与 `kubelet_evented_pleg_connection_error_count 0`；OCI（exit 37）、Cloud Hypervisor v55.0 Pod VM（exit 35）、TLS Registry 打包 WASI（exit 0）以及运行中删除的 OCI Pod 均触发 `Evented PLEG: requested pod relist after container termination` 并匹配对应 Pod UID 与容器 ID。
 
-完整未过滤 `critest` v1.37.0 对隔离 daemon 的同一 Unix socket 同时测试 Runtime 和 Image 端点，**105 通过、0 失败、37 跳过**，耗时 274.594 秒，结束时 CRI Pod 与容器数均为零。Linux 离线串行 Rust 测试 104 通过、0 失败、8 项默认忽略（另含 4 项事件状态机与滞后订阅单测）；严格 Clippy 报告与基线相同的 29 项诊断。
+完整未过滤 `critest` v1.37.0 对隔离 daemon 的同一 Unix socket 同时测试 Runtime 和 Image 端点，**105 通过、0 失败、37 跳过**，耗时 308.946 秒，结束时 CRI Pod 与容器数均为零。首次复验因测试节点上两个 bridge 使用同一子网，四项联网用例超时。改用独立子网后整套通过。Linux 离线串行 Rust 测试 112 通过、0 失败、8 项默认忽略，含 4 项事件状态机与滞后订阅单测。全库格式检查报告 31 个文件有差异，严格 Clippy 报告与基线相同的 29 项诊断。
 
 ## 2026-11-25 OCI 镜像中的 WASI 命令
 
