@@ -1,5 +1,5 @@
 use super::{stats, NautilusRuntimeService};
-use crate::core::state::{ContainerState, PodState};
+use crate::core::state::{ContainerState, PodState, PodStatus};
 use crate::proto::runtime::v1::{
     ContainerMetrics, CpuUsage, MemoryUsage, Metric, MetricDescriptor, MetricType,
     PodSandboxMetrics, UInt64Value,
@@ -7,6 +7,9 @@ use crate::proto::runtime::v1::{
 use futures::StreamExt;
 use pathrs::Root;
 use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use tonic::Status;
 
 const LABELS: [&str; 5] = ["id", "namespace", "pod", "container", "image"];
@@ -23,6 +26,7 @@ enum Source {
     CpuShares,
     BlockBytes,
     BlockIo(&'static str),
+    Network(usize),
     WorkingSet,
     Faults,
     LastSeen,
@@ -71,8 +75,8 @@ impl Family {
 
 use MetricType::{Counter, Gauge};
 use Source::{
-    BlockBytes, BlockIo, CpuMax, CpuShares, Faults, Field, LastSeen, Number, Pressure, Seconds,
-    Started, WorkingSet,
+    BlockBytes, BlockIo, CpuMax, CpuShares, Faults, Field, LastSeen, Network, Number, Pressure,
+    Seconds, Started, WorkingSet,
 };
 
 const CPU_USAGE: Family = Family::new(
@@ -309,6 +313,62 @@ const FAMILIES: &[Family] = &[
         BlockIo("wios"),
     )
     .labels(&["device"]),
+    Family::new(
+        "container_network_receive_bytes_total",
+        "Cumulative bytes received by the pod interface.",
+        Counter,
+        Network(0),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_receive_packets_total",
+        "Cumulative packets received by the pod interface.",
+        Counter,
+        Network(1),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_receive_errors_total",
+        "Cumulative receive errors on the pod interface.",
+        Counter,
+        Network(2),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_receive_packets_dropped_total",
+        "Cumulative receive packet drops on the pod interface.",
+        Counter,
+        Network(3),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_transmit_bytes_total",
+        "Cumulative bytes transmitted by the pod interface.",
+        Counter,
+        Network(8),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_transmit_packets_total",
+        "Cumulative packets transmitted by the pod interface.",
+        Counter,
+        Network(9),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_transmit_errors_total",
+        "Cumulative transmit errors on the pod interface.",
+        Counter,
+        Network(10),
+    )
+    .labels(&["interface"]),
+    Family::new(
+        "container_network_transmit_packets_dropped_total",
+        "Cumulative transmit packet drops on the pod interface.",
+        Counter,
+        Network(11),
+    )
+    .labels(&["interface"]),
 ];
 
 pub(super) fn descriptors() -> Vec<MetricDescriptor> {
@@ -471,6 +531,7 @@ fn native_metrics(group: &Root, labels: &[String], started: Option<u64>) -> Vec<
                 .map(|(usage, inactive)| usage.saturating_sub(inactive)),
             LastSeen => now,
             Started => started,
+            Network(_) => None,
             Faults | BlockIo(_) | BlockBytes => {
                 unreachable!("multi-series values are emitted separately")
             }
@@ -485,6 +546,42 @@ fn native_metrics(group: &Root, labels: &[String], started: Option<u64>) -> Vec<
         }
     }
     result
+}
+
+fn network_metrics(stat: &str, labels: &[String]) -> Vec<Metric> {
+    let mut result = Vec::new();
+    for line in stat.lines() {
+        let Some((name, counters)) = line.rsplit_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let counters: Vec<_> = counters.split_ascii_whitespace().collect();
+        for family in FAMILIES {
+            if let Network(index) = family.source {
+                if let Some(value) = counters.get(index).and_then(|v| v.parse().ok()) {
+                    result.push(family.metric(labels, &[name], value));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn pod_network_stat(pid: i32, owned_netns: &Path) -> Option<String> {
+    let pid_netns = PathBuf::from(format!("/proc/{pid}/ns/net"));
+    let identity = |path: &Path| {
+        let m = fs::metadata(path).ok()?;
+        Some((m.dev(), m.ino()))
+    };
+    let expected = identity(owned_netns)?;
+    if identity(&pid_netns)? != expected {
+        return None;
+    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/net/dev")).ok()?;
+    (identity(&pid_netns)? == expected && identity(owned_netns)? == expected).then_some(stat)
 }
 
 fn base_metrics(
@@ -515,6 +612,26 @@ fn base_metrics(
 }
 
 impl NautilusRuntimeService {
+    async fn native_pod_network_metrics(&self, pod: &PodState) -> Vec<Metric> {
+        let Some(pid) = pod.netns_holder_pid.filter(|pid| *pid > 0) else {
+            return Vec::new();
+        };
+        let owned_path = self._config.network.netns_dir.join(&pod.id);
+        if pod.status != PodStatus::Running
+            || pod.network_namespace.as_deref().map(Path::new) != Some(owned_path.as_path())
+        {
+            return Vec::new();
+        }
+        let labels = labels(pod, None);
+        tokio::task::spawn_blocking(move || {
+            pod_network_stat(pid, &owned_path)
+                .map(|stat| network_metrics(&stat, &labels))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     pub(super) async fn collect_pod_metrics(
         &self,
         pod: &PodState,
@@ -582,7 +699,7 @@ impl NautilusRuntimeService {
             .await;
         Ok(PodSandboxMetrics {
             pod_sandbox_id: pod.id.clone(),
-            metrics: Vec::new(),
+            metrics: self.native_pod_network_metrics(pod).await,
             container_metrics,
         })
     }
@@ -659,5 +776,33 @@ mod tests {
             ["pgfault", "hierarchy"]
         );
         assert_eq!(faults[1].value.as_ref().unwrap().value, 2);
+    }
+
+    #[test]
+    fn pod_network_stats_keep_interface_and_rx_tx_fields() {
+        let series = network_metrics(
+            "Inter-| Receive | Transmit\n  eth0: 1 2 3 4 0 0 0 0  11 12 13 14 0 0 0 0\n",
+            &LABELS.map(String::from),
+        );
+        assert_eq!(series.len(), 8);
+        for metric in &series {
+            assert_eq!(&metric.label_values[LABELS.len()..], ["eth0"]);
+        }
+        let value = |name| {
+            series
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .value
+        };
+        assert_eq!(value("container_network_receive_errors_total"), 3);
+        assert_eq!(value("container_network_transmit_bytes_total"), 11);
+        assert_eq!(
+            value("container_network_transmit_packets_dropped_total"),
+            14
+        );
     }
 }
