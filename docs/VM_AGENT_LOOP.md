@@ -71,6 +71,8 @@
 
 基准报告记录清理后的 daemon PSS 与增长量。给 `--daemon-unit` 同时传入 `--max-daemon-pss-growth-mib` 可启用回归预算。单波 8 并发用同一镜像和 96 MiB 预算验证，旧版增长 206.8 MiB，修复版增长 33.1 MiB。此数据来自 OCI 层与 CRI 生命周期对照，容量上限和长稳验证仍待单独测量。[回归基准](../tests/vm_agent_loop_benchmark.py)
 
+进一步在同一镜像上重复原有规模，两版各完成 32 波、110 个 Pod 和 1,100 次热 ExecSync。一次旧版的 16 路同时清理出现长时间阻塞，经重启测试 daemon 后回收了残留 Pod。完成的配对复验仍以最多 16 路并发启动，将两版的清理并发统一为 4。清场后 daemon PSS 从旧版的 705.0 MiB 降到修复版的 71.9 MiB，两轮均无残留 Pod 或容器。
+
 ## 镜像内的 Pi CLI
 
 同一个 21 层 harness 镜像包含 Node.js v22.22.0 和 Pi v1.5.2。镜像内脚本在首次会话让 Pi 使用 `read` 读取刚生成的随机标识，再用同一会话的历史让 Pi 使用 `write` 将标识写入另一文件。脚本核对两个文件的内容、两次工具成功事件与两轮最终 assistant 状态。Release 构建从创建 PodSandbox 到观察到 Pi 容器以退出码 0 结束耗时 11.45 秒。两轮均收到了成功的最终 assistant 状态，并读写了正确的随机值。开发构建上先前的独立实测为 20.87 秒，两种构建各测一次。[Pi 会话脚本](../tests/vm_agent_loop_pi.sh)
