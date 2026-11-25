@@ -207,7 +207,9 @@ func (s *server) stream(f *os.File, q request) {
 			return
 		}
 		c.mu.Lock()
-		if c.current().State != "running" {
+		current := c.current()
+		exitedAttach := q.Op == "attach" && current.State == "exited" && current.Started != 0
+		if current.State != "running" && !exitedAttach {
 			c.mu.Unlock()
 			reply(fail("conflict", "container is not running"))
 			return
@@ -223,7 +225,7 @@ func (s *server) stream(f *os.File, q request) {
 		if q.Op == "execStream" {
 			res = c.runExec(ctx, q.Argv, o.TTY, o.Stdin, func(p *processIO) error { return ack(p.inputFor(o, true)) }, w.writer(channelOutput, o.Stdout), w.writer(channelErrorOutput, o.Stderr))
 		} else {
-			res = c.attachInit(ctx, w, o, ack)
+			res = c.attachInit(ctx, w, o, exitedAttach, ack)
 		}
 	}
 	if !acknowledged {

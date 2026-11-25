@@ -9,6 +9,7 @@
 
 use clap::{Parser, Subcommand};
 use nautilus::proto::runtime::v1::{
+    AttachRequest,
     image_service_client::ImageServiceClient,
     runtime_service_client::RuntimeServiceClient,
     ContainerConfig, ContainerMetadata, ContainerState, ContainerStatsRequest,
@@ -29,6 +30,9 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Request, Status};
 use tower::service_fn;
+
+#[path = "nautilus/attach.rs"]
+mod attach;
 
 const DEFAULT_SOCKET: &str = "/run/nautilus/nautilus.sock";
 /// Marker label on every sandbox/ctl container so tooling can tell them apart.
@@ -114,6 +118,12 @@ enum Commands {
         /// Start in the background and print the container ID
         #[arg(short, long)]
         detach: bool,
+        /// Forward local stdin to the container
+        #[arg(short = 'i', long, conflicts_with = "detach")]
+        interactive: bool,
+        /// Allocate a pseudo-terminal for the container
+        #[arg(short = 't', long, conflicts_with = "detach")]
+        tty: bool,
         /// Remove the container and sandbox after the command exits
         #[arg(long)]
         rm: bool,
@@ -274,13 +284,16 @@ async fn dispatch(cli: Cli) -> Result<u8, String> {
             entrypoint,
             workdir,
             detach,
+            interactive,
+            tty,
             rm,
             image,
             command,
         } => {
             return cmd_run(
                 &mut r, &mut i, name, env, label, publish, memory, cpus, cpuset_cpus,
-                runtime, entrypoint, workdir, detach, rm, image, command,
+                runtime, entrypoint, workdir, detach, attach::Options { stdin: interactive, tty },
+                rm, image, command,
             )
             .await;
         }
@@ -542,12 +555,17 @@ async fn cmd_run(
     entrypoint: Option<String>,
     workdir: Option<String>,
     detach: bool,
+    attach: attach::Options,
     rm: bool,
     image: String,
     command: Vec<String>,
 ) -> Result<u8, String> {
     let is_vm = runtime == "vm";
     let is_wasi = matches!(runtime.as_str(), "wasm" | "wasi");
+    if attach.enabled() && !matches!(runtime.as_str(), "" | "runc" | "vm") {
+        return Err("interactive run requires the runc or vm runtime".into());
+    }
+    attach.validate()?;
     let auto_remove = detach && rm;
     if is_vm && !publish.is_empty() {
         return Err("the VM runtime does not support --publish".into());
@@ -664,6 +682,11 @@ async fn cmd_run(
         Some(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .map_err(|e| e.to_string())?)
     };
+    // Restore the terminal and run the normal stop/remove path when the
+    // foreground client also receives a signal from outside the PTY.
+    let mut terminate = attach.enabled()
+        .then(|| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()))
+        .transpose().map_err(|e| e.to_string())?;
     let pod_id = r
         .run_pod_sandbox(Request::new(RunPodSandboxRequest {
             config: Some(pod),
@@ -693,6 +716,9 @@ async fn cmd_run(
             })
             .collect(),
         working_dir: workdir.unwrap_or_default(),
+        stdin: attach.stdin,
+        stdin_once: attach.stdin,
+        tty: attach.tty,
         labels: labels.into_iter().collect(),
         annotations: auto_remove_annotations,
         linux: Some(LinuxContainerConfig {
@@ -723,7 +749,7 @@ async fn cmd_run(
         let reply = if let Some(interrupt) = interrupt.as_mut() {
             tokio::select! {
                 biased;
-                _ = interrupt.recv() => return Ok(130),
+                code = wait_run_signal(interrupt, &mut terminate) => return Ok(code),
                 reply = launch => reply,
             }
         } else {
@@ -733,13 +759,31 @@ async fn cmd_run(
         started = true;
         if let Some(interrupt) = interrupt.as_mut() {
             tokio::select! {
-                result = follow_workload(r, &id, !is_local_module, !is_vm && !is_wasi) => result,
-                _ = interrupt.recv() => {
+                result = async {
+                    if attach.enabled() {
+                        let response = r.attach(AttachRequest {
+                            container_id: id.clone(),
+                            stdin: attach.stdin,
+                            stdout: true,
+                            stderr: !attach.tty,
+                            tty: attach.tty,
+                        }).await.map_err(status)?.into_inner();
+                        let code = attach::stream(&response.url, attach).await?;
+                        if rm && is_vm {
+                            // Observe the guest exit before conditional removal.
+                            container_status(r, &id).await?;
+                        }
+                        Ok(code)
+                    } else {
+                        follow_workload(r, &id, !is_local_module, !is_vm && !is_wasi).await
+                    }
+                } => result,
+                code = wait_run_signal(interrupt, &mut terminate) => {
                     r.stop_container(Request::new(StopContainerRequest {
                         container_id: id.clone(),
                         timeout: if is_wasi { 0 } else { 10 },
                     })).await.map_err(status)?;
-                    Ok(130)
+                    Ok(code)
                 }
             }
         } else {
@@ -757,6 +801,16 @@ async fn cmd_run(
         };
     }
     workload
+}
+
+async fn wait_run_signal(
+    interrupt: &mut tokio::signal::unix::Signal,
+    terminate: &mut Option<tokio::signal::unix::Signal>,
+) -> u8 {
+    tokio::select! {
+        _ = interrupt.recv() => 130,
+        _ = async { terminate.as_mut().unwrap().recv().await }, if terminate.is_some() => 143,
+    }
 }
 
 async fn follow_workload(

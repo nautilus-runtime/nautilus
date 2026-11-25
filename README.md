@@ -50,6 +50,15 @@ Nautilus pulls the image on first use and follows the command output. With `--rm
 
 The CLI follows workload output and returns the workload exit code by default. Pass `-d` to start in the background and print the container ID.
 
+Foreground OCI and VM runs can use `-i` to forward stdin, `-t` to allocate a
+pseudo-terminal, or `-it` for an interactive shell. OCI attaches through the
+default libcontainer driver. VM runs use the guest agent's init streams.
+
+```bash
+printf 'hello\n' | sudo nautilus run -i --rm busybox:1.36 cat
+sudo nautilus run -it --rm --runtime vm busybox:1.36 sh
+```
+
 ```sh
 sudo nautilus run -d --name demo busybox:1.36 sh -c 'while true; do echo tick; sleep 2; done'
 sudo nautilus ps
