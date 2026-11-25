@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 WASI 异步生命周期
+
+在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118）验证。忙循环和等待 WASI 时钟的模块均在仍然运行时返回容器 ID，随后从 CRI 停止并得到退出码 137。重复停止成功。前台输出和 Ctrl-C 后 `--rm` 回收通过。强制终止 daemon 后，重启在同一状态库中将原实例标为 `RuntimeRestarted`，最后 CRI Pod 和容器列表均为空。
+
+完整 `critest` v1.37.0 使用同一 Unix socket 的 Runtime 和 Image 端点，105 通过、0 失败、37 跳过，耗时 687.680 秒。随后将入口点检查保留在 Start 调用以恢复 Create 的旧语义。该修订通过 Linux 单元测试。
+
 ## 2026-11-25 OCI、WASI 和 VM CLI
 
 在 pro6000 的独立 Debian 13 嵌套 KVM 节点（Linux 6.12.118、Cloud Hypervisor v55.0）使用真实 daemon 验证。OCI 与 VM 的前台命令分别返回独立 stdout、stderr 与退出码 37。WASI 本地模块收到参数并返回输出与退出码 29。无输出的 OCI 命令、`-d` 后执行 `exec`、前台收到 Ctrl-C 后退出 130，以及 `--rm` 回收隐式 Pod 均通过。
