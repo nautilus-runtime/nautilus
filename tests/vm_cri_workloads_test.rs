@@ -564,6 +564,76 @@ async fn guest_stats(
     Ok(())
 }
 
+async fn guest_cgroup_metrics(cli: &mut Runtime, pod: &str, busy: &str, idle: &str) -> Result<()> {
+    const THROTTLED: &str = "container_cpu_cfs_throttled_periods_total";
+    let throttled = |metrics: &PodSandboxMetrics, id: &str| -> Option<u64> {
+        metrics
+            .container_metrics
+            .iter()
+            .find(|c| c.container_id == id)?
+            .metrics
+            .iter()
+            .find(|m| m.name == THROTTLED)?
+            .value
+            .as_ref()
+            .map(|v| v.value)
+    };
+    let all = cli
+        .list_pod_sandbox_metrics(ListPodSandboxMetricsRequest {})
+        .await?
+        .into_inner()
+        .pod_metrics;
+    let baseline = all
+        .iter()
+        .find(|entry| entry.pod_sandbox_id == pod)
+        .context("missing VM metrics")?;
+    let before = throttled(baseline, busy).context("missing guest CPU throttling counter")?;
+    let idle_before = throttled(baseline, idle);
+
+    exec(cli, busy, "/bin/busybox sh -c 'while :; do :; done' & worker=$!; /bin/busybox sleep 2; kill \"$worker\"; wait \"$worker\" || :").await?;
+    let all = cli
+        .list_pod_sandbox_metrics(ListPodSandboxMetricsRequest {})
+        .await?
+        .into_inner()
+        .pod_metrics;
+    let sampled = all
+        .iter()
+        .find(|entry| entry.pod_sandbox_id == pod)
+        .context("missing loaded VM metrics")?;
+    let after =
+        throttled(sampled, busy).context("missing guest CPU throttling counter under load")?;
+    ensure!(
+        after > before,
+        "limited guest container did not throttle: {before} -> {after}"
+    );
+    ensure!(
+        throttled(sampled, idle) == idle_before,
+        "idle guest container throttled"
+    );
+    ensure!(sampled
+        .metrics
+        .iter()
+        .any(|m| m.name == "container_memory_cache"
+            && m.value.as_ref().is_some_and(|v| v.value >= 16 << 20)));
+
+    let mut stream = cli
+        .stream_pod_sandbox_metrics(StreamPodSandboxMetricsRequest {})
+        .await?
+        .into_inner();
+    let mut seen = false;
+    while let Some(batch) = stream.message().await? {
+        for entry in batch.pod_sandbox_metrics {
+            if entry.pod_sandbox_id == pod {
+                ensure!(!seen && throttled(&entry, busy).is_some_and(|value| value >= after));
+                seen = true;
+            }
+        }
+    }
+    ensure!(seen, "metrics stream omitted the VM Pod");
+    eprintln!("guest CFS throttled periods: {before} -> {after}");
+    Ok(())
+}
+
 async fn scenario(
     root: &Path,
     image: &str,
@@ -593,6 +663,11 @@ async fn scenario(
     let init="echo init-out; echo init-err >&2; while test ! -e finish; do /bin/busybox sleep .1; done; exit 37";
     let mut first_work = workload("first", image, init);
     first_work.metadata.as_mut().unwrap().attempt = 2;
+    first_work.linux.as_mut().unwrap().resources = Some(LinuxContainerResources {
+        cpu_period: 100_000,
+        cpu_quota: 50_000,
+        ..Default::default()
+    });
     let mut unsupported = first_work.clone();
     unsupported
         .linux
@@ -704,6 +779,7 @@ async fn scenario(
         );
     }
     guest_stats(cli, &id, &other, &a, &b).await?;
+    guest_cgroup_metrics(cli, &id, &a, &b).await?;
     ensure!(
         exec(cli, &a, "/bin/busybox readlink /proc/self/ns/pid").await?
             != exec(cli, &b, "/bin/busybox readlink /proc/self/ns/pid").await?

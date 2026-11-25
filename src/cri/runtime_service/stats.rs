@@ -5,6 +5,7 @@ use crate::proto::runtime::v1 as rt;
 use crate::sandbox::runc_backend::RuncBackend;
 use crate::vm::workload::{Operation, Reply, Sample};
 use pathrs::{flags::OpenFlags, Root};
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::Path;
 use tonic::Status;
@@ -35,7 +36,7 @@ pub(super) fn pod_attributes(p: &PodState) -> rt::PodSandboxAttributes {
     }
 }
 
-fn readings(s: Sample) -> Result<(rt::CpuUsage, rt::MemoryUsage), &'static str> {
+pub(super) fn readings(s: &Sample) -> Result<(rt::CpuUsage, rt::MemoryUsage), &'static str> {
     if s.timestamp <= 0 || s.working_set_bytes > s.memory_usage_bytes {
         return Err("invalid guest cgroup sample");
     }
@@ -61,7 +62,7 @@ fn readings(s: Sample) -> Result<(rt::CpuUsage, rt::MemoryUsage), &'static str> 
 }
 
 fn container_stats(c: &ContainerState, s: Sample) -> Result<rt::ContainerStats, &'static str> {
-    let (cpu, memory) = readings(s)?;
+    let (cpu, memory) = readings(&s)?;
     Ok(rt::ContainerStats {
         attributes: Some(container_attributes(c)),
         cpu: Some(cpu),
@@ -301,12 +302,20 @@ impl NautilusRuntimeService {
         container_stats(c, sample).map_err(Status::data_loss)
     }
 
+    pub(super) async fn guest_pod_samples(
+        &self,
+        pod: &PodState,
+    ) -> Result<(Sample, HashMap<String, Sample>), Status> {
+        let (sample, reply) = self.guest_sample(&pod.id, "", Operation::PodStats).await?;
+        Ok((sample, reply.containers))
+    }
+
     pub(super) async fn guest_pod_stats(
         &self,
         pod: &PodState,
     ) -> Result<rt::PodSandboxStats, Status> {
-        let (sample, mut reply) = self.guest_sample(&pod.id, "", Operation::PodStats).await?;
-        let (cpu, memory) = readings(sample).map_err(Status::data_loss)?;
+        let (sample, mut samples) = self.guest_pod_samples(pod).await?;
+        let (cpu, memory) = readings(&sample).map_err(Status::data_loss)?;
         let mut containers = Vec::new();
         for c in self
             ._state_manager
@@ -314,7 +323,7 @@ impl NautilusRuntimeService {
             .await
             .map_err(Status::from)?
         {
-            if let Some(s) = reply.containers.remove(&c.id) {
+            if let Some(s) = samples.remove(&c.id) {
                 containers.push(container_stats(&c, s).map_err(Status::data_loss)?);
             }
         }
