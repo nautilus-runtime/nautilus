@@ -78,9 +78,14 @@ impl NautilusRuntimeService {
         let finished = match records.as_slice() {
             [] => allow_empty || matches!(pod.status, PodStatus::Succeeded | PodStatus::Failed),
             [container] => {
-                container.status == ContainerStatus::Stopped
-                    || (container.status == ContainerStatus::Unknown
-                        && container.vm.as_ref().is_some_and(|vm| vm.logs_complete))
+                container
+                    .annotations
+                    .get(AUTO_REMOVE_ANNOTATION)
+                    .map(String::as_str)
+                    == Some("true")
+                    && (container.status == ContainerStatus::Stopped
+                        || (container.status == ContainerStatus::Unknown
+                            && container.vm.as_ref().is_some_and(|vm| vm.logs_complete)))
             }
             _ => false,
         };

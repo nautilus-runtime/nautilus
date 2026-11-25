@@ -1947,6 +1947,7 @@ mod container_event_tests {
         pod: &str,
         module: &std::path::Path,
         name: &str,
+        auto_remove: bool,
     ) -> String {
         service
             .create_container(Request::new(CreateContainerRequest {
@@ -1956,6 +1957,10 @@ mod container_event_tests {
                         name: name.into(),
                         ..Default::default()
                     }),
+                    annotations: auto_remove
+                        .then(|| [(super::super::AUTO_REMOVE_ANNOTATION.into(), "true".into())]
+                            .into_iter().collect())
+                        .unwrap_or_default(),
                     image: Some(ImageSpec {
                         image: module.display().to_string(),
                         ..Default::default()
@@ -2013,8 +2018,8 @@ mod container_event_tests {
             .await
             .unwrap()
             .into_inner();
-        let local = create_wasi(&service, &standalone, &module, "standalone").await;
-        let pod = create_wasi(&service, &kubernetes, &module, "kubernetes").await;
+        let local = create_wasi(&service, &standalone, &module, "standalone", false).await;
+        let pod = create_wasi(&service, &kubernetes, &module, "kubernetes", false).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), kube_events.next())
                 .await.unwrap().unwrap().unwrap().container_id,
@@ -2055,7 +2060,7 @@ mod container_event_tests {
         let automatic = service.run_pod_sandbox(standalone_request(requested))
             .await.unwrap().into_inner().pod_sandbox_id;
         for pod in [&regular, &automatic] {
-            let id = create_wasi(&service, pod, &module, "quick-exit").await;
+            let id = create_wasi(&service, pod, &module, "quick-exit", true).await;
             service.start_container(Request::new(StartContainerRequest { container_id: id }))
                 .await.unwrap();
         }
@@ -2072,7 +2077,7 @@ mod container_event_tests {
     async fn wasi_lifecycle_snapshots_include_siblings_and_skip_retries() {
         let (_tmp, service, module) = setup();
         let pod = wasi_pod(&service).await;
-        let sibling = create_wasi(&service, &pod, &module, "sibling").await;
+        let sibling = create_wasi(&service, &pod, &module, "sibling", false).await;
         // The workload record is visible before CreateContainer links it to the Pod.
         service
             .pod_manager
@@ -2084,7 +2089,7 @@ mod container_event_tests {
             .await
             .unwrap()
             .into_inner();
-        let id = create_wasi(&service, &pod, &module, "short-lived").await;
+        let id = create_wasi(&service, &pod, &module, "short-lived", false).await;
         service
             .start_container(Request::new(StartContainerRequest {
                 container_id: id.clone(),
@@ -2163,7 +2168,7 @@ mod container_event_tests {
             .await
             .unwrap()
             .into_inner();
-        let next = create_wasi(&service, &pod, &module, "next").await;
+        let next = create_wasi(&service, &pod, &module, "next", false).await;
         for stream in [&mut events, &mut reconnected] {
             let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
                 .await
@@ -2182,7 +2187,7 @@ mod container_event_tests {
     async fn lagged_subscriber_is_terminated() {
         let (_tmp, service, module) = setup();
         let pod = wasi_pod(&service).await;
-        let id = create_wasi(&service, &pod, &module, "subject").await;
+        let id = create_wasi(&service, &pod, &module, "subject", false).await;
         let mut state = service
             ._state_manager
             .get_container_state(&id)
