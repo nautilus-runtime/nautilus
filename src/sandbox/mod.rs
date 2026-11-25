@@ -6,6 +6,7 @@
 //!   * `runc` – real OCI containers via the runc CLI (libcontainer migration follows)
 //!   * `wasi` – WASM workloads executed in-process by wasmtime
 
+pub(crate) mod init_io;
 pub mod runc_backend;
 pub mod spec;
 pub mod wasm_backend;
@@ -270,6 +271,7 @@ pub trait SandboxBackend: Send + Sync {
 pub struct SandboxRegistry {
     default_handler: String,
     handlers: HashMap<String, Arc<dyn SandboxBackend>>,
+    wasi: Option<Arc<wasm_backend::WasmBackend>>,
 }
 
 impl SandboxRegistry {
@@ -292,11 +294,14 @@ impl SandboxRegistry {
         handlers.insert("runc".to_string(), runc.clone());
         handlers.insert("".to_string(), runc);
 
-        if sb_cfg.wasm_enabled {
+        let wasi = if sb_cfg.wasm_enabled {
             let wasm = Arc::new(wasm_backend::WasmBackend::new(config.clone())?);
             handlers.insert("wasi".to_string(), wasm.clone());
-            handlers.insert("wasm".to_string(), wasm);
-        }
+            handlers.insert("wasm".to_string(), wasm.clone());
+            Some(wasm)
+        } else {
+            None
+        };
 
         if !handlers.contains_key(&default_handler) {
             return Err(Error::Config(format!(
@@ -308,7 +313,12 @@ impl SandboxRegistry {
         Ok(Self {
             default_handler,
             handlers,
+            wasi,
         })
+    }
+
+    pub(crate) fn wasi_init_io(&self, id: &str) -> Option<Arc<init_io::InitIo>> {
+        self.wasi.as_ref()?.init_io(id)
     }
 
     /// Resolve a CRI runtime_handler (empty selects the default). Reject unknown

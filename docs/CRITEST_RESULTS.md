@@ -12,6 +12,16 @@
 
 完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 301.874 秒，结束时 CRI Pod 与容器均为零。Linux 串行 Rust 测试 121 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
 
+## 2026-11-25 OCI、VM 与 WASI 前台交互
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）验证 `0fe4db0`。原生 OCI 和 Cloud Hypervisor v55.0 Pod VM（virtiofsd 1.13.2，guest Linux 5.15.0-191）通过 `nautilus run` 验证 256 KiB 二进制 stdin 往返、独立 stderr、首条输出、快速退出、TTY 缩放、Ctrl-C 和本地终端恢复。原生 OCI 还验证了从继承文件的当前偏移读取和 stdout 管道写满时的 SIGINT 与 `--rm`。[OCI 与 VM 验收脚本](../tests/cli_interactive_acceptance.py)
+
+WASI Preview 1 的两个 handler 别名共做了 9 次空输入和二进制输入测试。模块在连续两次读到 EOF 后返回 37。阻塞读期间收到 SIGINT 会取消运行，CLI 返回 130。WASI 的 TTY 请求在创建工作负载前报错。带独立工作负载可见性请求的 CRI 清单确认测试后没有 Pod sandbox 或容器。[WASI 验收脚本](../tests/wasi_cli_acceptance.py)
+
+原生 `kubectl attach` 在真实 kubelet v1.37.2 上复验了管道 EOF、TTY 重连、窗口调整和退出码。Linux 串行 Rust 测试 126 通过、0 失败、8 项忽略，严格 Clippy 保持基线的 29 项诊断。故意让 VM init 在客户端发送输入和 resize 时退出的两项 Go 回归在旧版复现，修复后连续 10 轮通过。
+
+完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**105 通过、0 失败、37 跳过**，耗时 301.533 秒。结束时 CRI Pod 与容器均为零。
+
 ## 2026-11-25 原生 OCI init Attach
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）使用 Kubernetes v1.37.2 验证 `f046243`。管道模式连接 PID 1，返回首条 stdout、独立 stderr 和 stdin 输入。客户端关闭 stdin 后，init 观察到 EOF，输出仍进入 CRI 日志，`kubectl attach` 返回退出码 37。TTY 模式首次接入时读取启动输出，窗口从 24×80 调到 33×101。断开后重连同一个 init，Ctrl-C 触发 init 的信号处理并返回退出码 42。删除测试命名空间后 CRI 中没有该命名空间的 Pod sandbox 或容器。[真实 kubelet 验收脚本](../tests/kubelet_oci_attach_acceptance.py)

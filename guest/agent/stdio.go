@@ -24,6 +24,11 @@ type processIO struct {
 	outputs  map[string]*os.File
 }
 
+var (
+	errStdinClosed = errors.New("stdin is closed")
+	errNoTerminal  = errors.New("process has no terminal")
+)
+
 func (p *processIO) close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -43,7 +48,7 @@ func (p *processIO) write(b []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.input == nil {
-		return errors.New("stdin is closed")
+		return errStdinClosed
 	}
 	p.input.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	_, err := p.input.Write(b)
@@ -68,7 +73,7 @@ func (p *processIO) resize(width, height uint16) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.terminal == nil {
-		return errors.New("process has no terminal")
+		return errNoTerminal
 	}
 	return controlFD(p.terminal, func(fd uintptr) error {
 		return unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, &unix.Winsize{Col: width, Row: height})

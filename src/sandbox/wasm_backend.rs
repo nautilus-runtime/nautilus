@@ -6,8 +6,10 @@
 //! WASI stdout and stderr share the workload log file.
 
 use crate::core::{Config, Error, Result};
+use crate::sandbox::init_io::{InitIo, ATTACH_CHUNK_BYTES};
 use crate::sandbox::{SandboxBackend, SandboxKind, StartOutcome, WorkloadSpec};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -17,10 +19,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::{Engine, ExternType, InstancePre, Linker, Module, Store};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::{pipe::AsyncWriteStream, AsyncStdoutStream, WasiCtxBuilder};
+use wasmtime_wasi::{
+    pipe::AsyncWriteStream, AsyncStdoutStream, HostInputStream, StdinStream, StreamError,
+    Subscribe, WasiCtxBuilder,
+};
 
 pub struct WasmBackend {
     config: Arc<Config>,
@@ -32,6 +37,62 @@ pub struct WasmBackend {
 struct Job {
     cancel: watch::Sender<bool>,
     finished: watch::Receiver<Option<i32>>,
+    io: Arc<InitIo>,
+}
+
+struct WasiStdio {
+    io: Arc<InitIo>,
+    stdin: Option<mpsc::Receiver<Vec<u8>>>,
+    log: PathBuf,
+    packaged: bool,
+}
+
+#[derive(Clone)]
+struct WasiStdin(Arc<tokio::sync::Mutex<WasiInput>>);
+
+struct WasiInput {
+    reader: mpsc::Receiver<Vec<u8>>,
+    pending: Bytes,
+}
+
+impl StdinStream for WasiStdin {
+    fn stream(&self) -> Box<dyn HostInputStream> {
+        Box::new(self.clone())
+    }
+
+    fn isatty(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+impl HostInputStream for WasiStdin {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        let mut input = self
+            .0
+            .try_lock()
+            .map_err(|_| StreamError::trap("concurrent WASI stdin reads"))?;
+        if input.pending.is_empty() {
+            match input.reader.try_recv() {
+                Ok(bytes) => input.pending = bytes.into(),
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(Bytes::new()),
+                // Receiver disconnect stays observable on every subsequent read.
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(StreamError::Closed),
+            }
+        }
+        let size = size.min(input.pending.len());
+        Ok(input.pending.split_to(size))
+    }
+}
+
+#[async_trait]
+impl Subscribe for WasiStdin {
+    async fn ready(&mut self) {
+        let mut input = self.0.lock().await;
+        if input.pending.is_empty() {
+            input.pending = input.reader.recv().await.unwrap_or_default().into();
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -72,7 +133,8 @@ fn copy_image_module(root: &Path, path: &Path, destination: &Path) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::copy_image_module;
+    use super::*;
+    use crate::vm::workload::StreamOptions;
     use std::path::Path;
 
     #[test]
@@ -90,6 +152,118 @@ mod tests {
         assert_eq!(std::fs::read(&module).unwrap(), b"image module");
         assert!(copy_image_module(&root, Path::new("/escape"), &module).is_err());
     }
+
+    #[tokio::test]
+    async fn preview1_attach_forwards_pipes_eof_and_cancellation() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let temp = tempfile::tempdir().unwrap();
+            let module = temp.path().join("pipe.wat");
+            std::fs::write(
+                &module,
+                include_str!("../../tests/fixtures/wasi/pipe_stdio.wat"),
+            )
+            .unwrap();
+            let mut config = Config::default();
+            config.runtime.state_dir = temp.path().join("state");
+            let backend = WasmBackend::new(Arc::new(config)).unwrap();
+            let mut spec = WorkloadSpec {
+                id: "pipe".into(),
+                image_ref: module.to_string_lossy().into_owned(),
+                image_id: String::new(),
+                cgroup_parent: String::new(),
+                args: Vec::new(),
+                working_dir: String::new(),
+                strict_groups: false,
+                tty: false,
+                stdin_once: true,
+                entrypoint: Vec::new(),
+                env: HashMap::new(),
+                output_dir: temp.path().to_owned(),
+                resources: None,
+                security: None,
+                network_ns: None,
+                ipc_ns: None,
+                log_relpath: "out.log".into(),
+                hostname: None,
+                dns_servers: Vec::new(),
+                dns_searches: Vec::new(),
+                dns_options: Vec::new(),
+                volumes: Vec::new(),
+                pid_ns: None,
+                open_stdin: true,
+            };
+            let options = StreamOptions {
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            };
+            for (packaged, expect_exit) in [(false, 37), (true, 37), (true, 137)] {
+                if packaged && spec.image_id.is_empty() {
+                    spec.image_id = "sha256:test".into();
+                    let prepared = backend.prepared(&spec.id);
+                    std::fs::create_dir_all(&prepared).unwrap();
+                    std::fs::copy(&module, prepared.join("module.wasm")).unwrap();
+                    std::fs::write(
+                        prepared.join("command.json"),
+                        br#"{"module_name":"pipe","args":[],"env":[]}"#,
+                    )
+                    .unwrap();
+                    spec.log_relpath = "cri.log".into();
+                }
+                let StartOutcome::Managed {
+                    activate,
+                    mut finished,
+                } = backend.start(&spec).await.unwrap()
+                else {
+                    panic!("WASI must launch a managed job");
+                };
+                activate.send(()).unwrap();
+                let io = backend.init_io(&spec.id).unwrap();
+                let (cancel, _closed) = watch::channel(false);
+                let (mut streams, resize) = io.attach(options, false, cancel).unwrap();
+                assert!(resize.is_none());
+                assert_eq!(streams.stderr.recv().await.unwrap(), b"ready\n");
+                if expect_exit == 37 {
+                    let input = streams.stdin.take().unwrap();
+                    let payload: Vec<_> = if packaged {
+                        b"packaged\n".to_vec()
+                    } else {
+                        (0..16_384).map(|i| (i % 251) as u8).collect()
+                    };
+                    input.send(payload.clone()).await.unwrap();
+                    drop(input);
+                    let mut output = Vec::new();
+                    while let Some(chunk) = streams.stdout.recv().await {
+                        output.extend(chunk);
+                    }
+                    assert_eq!(output, payload);
+                    let log = temp.path().join(&spec.log_relpath);
+                    if packaged {
+                        let log = std::fs::read_to_string(log).unwrap();
+                        assert!(log.contains(" stderr F ready\n"), "{log}");
+                        assert!(log.contains(" stdout F packaged\n"), "{log}");
+                    } else {
+                        let mut expected = b"ready\n".to_vec();
+                        expected.extend(payload);
+                        assert_eq!(std::fs::read(log).unwrap(), expected);
+                    }
+                } else {
+                    assert_eq!(
+                        backend.stop(&spec.id, Duration::ZERO).await.unwrap(),
+                        Some(137)
+                    );
+                }
+                assert_eq!(streams.exit.await.unwrap().unwrap(), expect_exit);
+                assert_eq!(
+                    *finished.wait_for(Option::is_some).await.unwrap(),
+                    Some(expect_exit)
+                );
+            }
+        })
+        .await
+        .expect("WASI pipe or cancellation blocked");
+    }
 }
 
 type WriteRecord = Pin<Box<dyn Future<Output = io::Result<usize>> + Send>>;
@@ -98,19 +272,6 @@ struct CriLogWriter {
     path: PathBuf,
     channel: &'static str,
     pending: Option<WriteRecord>,
-}
-
-impl CriLogWriter {
-    fn stream(path: PathBuf, channel: &'static str) -> AsyncStdoutStream {
-        AsyncStdoutStream::new(AsyncWriteStream::new(
-            16 * 1024,
-            Self {
-                path,
-                channel,
-                pending: None,
-            },
-        ))
-    }
 }
 
 impl AsyncWrite for CriLogWriter {
@@ -160,6 +321,46 @@ impl AsyncWrite for CriLogWriter {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_flush(cx)
+    }
+}
+
+struct WorkloadLog<W> {
+    log: W,
+    io: Arc<InitIo>,
+    stderr: bool,
+}
+
+impl<W: AsyncWrite + Send + Unpin + 'static> WorkloadLog<W> {
+    fn stream(log: W, io: Arc<InitIo>, stderr: bool) -> AsyncStdoutStream {
+        AsyncStdoutStream::new(AsyncWriteStream::new(
+            ATTACH_CHUNK_BYTES,
+            Self { log, io, stderr },
+        ))
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for WorkloadLog<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let count = std::task::ready!(Pin::new(&mut self.log).poll_write(cx, bytes))?;
+        let output = if self.stderr {
+            &self.io.stderr
+        } else {
+            &self.io.stdout
+        };
+        output.send(&bytes[..count]);
+        Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.log).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.log).poll_shutdown(cx)
     }
 }
 
@@ -218,6 +419,10 @@ impl WasmBackend {
         self.config.runtime.state_dir.join("wasi").join(id)
     }
 
+    pub(super) fn init_io(&self, id: &str) -> Option<Arc<InitIo>> {
+        self.jobs.lock().unwrap().get(id).map(|job| job.io.clone())
+    }
+
     async fn compile(&self, path: PathBuf) -> Result<Module> {
         let engine = self.engine.clone();
         tokio::task::spawn_blocking(move || Module::from_file(&engine, path))
@@ -247,23 +452,41 @@ impl WasmBackend {
         module: InstancePre<WasiP1Ctx>,
         argv: Vec<String>,
         env: Vec<(String, String)>,
-        log: PathBuf,
-        packaged: bool,
+        stdio: WasiStdio,
     ) -> Result<i32> {
         let mut builder = WasiCtxBuilder::new();
+        let WasiStdio {
+            io,
+            stdin,
+            log,
+            packaged,
+        } = stdio;
+        if let Some(stdin) = stdin {
+            builder.stdin(WasiStdin(Arc::new(tokio::sync::Mutex::new(WasiInput {
+                reader: stdin,
+                pending: Bytes::new(),
+            }))));
+        }
         if packaged {
-            builder.stdout(CriLogWriter::stream(log.clone(), "stdout"));
-            builder.stderr(CriLogWriter::stream(log, "stderr"));
+            let log_writer = |path, channel| CriLogWriter {
+                path,
+                channel,
+                pending: None,
+            };
+            builder.stdout(WorkloadLog::stream(
+                log_writer(log.clone(), "stdout"),
+                io.clone(),
+                false,
+            ));
+            builder.stderr(WorkloadLog::stream(log_writer(log, "stderr"), io, true));
         } else {
             let file = tokio::fs::OpenOptions::new().append(true).open(log).await?;
-            builder.stdout(AsyncStdoutStream::new(AsyncWriteStream::new(
-                16 * 1024,
+            builder.stdout(WorkloadLog::stream(
                 file.try_clone().await?,
-            )));
-            builder.stderr(AsyncStdoutStream::new(AsyncWriteStream::new(
-                16 * 1024,
-                file,
-            )));
+                io.clone(),
+                false,
+            ));
+            builder.stderr(WorkloadLog::stream(file, io, true));
         }
         builder.args(&argv);
         for (k, v) in env {
@@ -417,6 +640,8 @@ impl SandboxBackend for WasmBackend {
         let (activate, active) = oneshot::channel();
         let (cancel, mut cancelled) = watch::channel(false);
         let (completed, finished) = watch::channel(None);
+        let (io, stdin) = InitIo::for_wasi(spec.open_stdin, spec.stdin_once);
+        let io = Arc::new(io);
         {
             let mut jobs = self.jobs.lock().unwrap();
             if jobs
@@ -433,6 +658,7 @@ impl SandboxBackend for WasmBackend {
                 Job {
                     cancel,
                     finished: finished.clone(),
+                    io: io.clone(),
                 },
             );
         }
@@ -443,7 +669,13 @@ impl SandboxBackend for WasmBackend {
                 if active.await.is_err() {
                     return 137;
                 }
-                match Self::run_module(engine, module, argv, env, log, packaged).await {
+                let stdio = WasiStdio {
+                    io: io.clone(),
+                    stdin,
+                    log,
+                    packaged,
+                };
+                match Self::run_module(engine, module, argv, env, stdio).await {
                     Ok(exit) => exit,
                     Err(error) => {
                         tracing::warn!(container_id = %id, %error, "WASI workload failed");
@@ -456,6 +688,9 @@ impl SandboxBackend for WasmBackend {
                 _ = cancelled.wait_for(|cancel| *cancel) => 137,
                 exit = run => exit,
             };
+            io.stdout.finish();
+            io.stderr.finish();
+            io.finish(Ok(exit));
             completed.send_replace(Some(exit));
         });
         Ok(StartOutcome::Managed { activate, finished })
@@ -465,6 +700,7 @@ impl SandboxBackend for WasmBackend {
         let Some(Job {
             cancel,
             mut finished,
+            ..
         }) = self.jobs.lock().unwrap().get(id).cloned()
         else {
             return Ok(None);

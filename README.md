@@ -50,6 +50,17 @@ Nautilus pulls the image on first use and follows the command output. With `--rm
 
 The CLI follows workload output and returns the workload exit code by default. Pass `-d` to start in the background and print the container ID.
 
+Foreground OCI and VM runs can use `-i` to forward stdin, `-t` to allocate a
+pseudo-terminal, or `-it` for an interactive shell. OCI attaches through the
+default libcontainer driver. VM runs use the guest agent's init streams.
+The first Attach can replay up to 16 KiB per output stream produced before
+the connection opens. For VM startup output, use an updated guest agent.
+
+```bash
+printf 'hello\n' | sudo nautilus run -i --rm busybox:1.36 cat
+sudo nautilus run -it --rm --runtime vm busybox:1.36 sh
+```
+
 ```sh
 sudo nautilus run -d --name demo busybox:1.36 sh -c 'while true; do echo tick; sleep 2; done'
 sudo nautilus ps
@@ -67,7 +78,7 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-d` for background execution and add `--rm` to reclaim the workload when it exits.
+The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-i` to pipe standard input to a foreground Preview 1 command. Use `-d` for background execution and add `--rm` to reclaim the workload when it exits.
 
 For Kubernetes, package the module in an OCI image and use its absolute path as the entrypoint. Build for the Linux node platform. In this example, set `IMAGE` to a registry tag that your node can pull.
 

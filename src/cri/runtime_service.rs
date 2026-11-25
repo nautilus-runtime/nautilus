@@ -923,6 +923,9 @@ impl RuntimeService for NautilusRuntimeService {
             return Err(Status::failed_precondition("pod sandbox is not ready"));
         }
 
+        if matches!(pod.runtime_handler.as_str(), "wasi" | "wasm") && config.tty {
+            return Err(Status::unimplemented("WASI workloads do not support TTY"));
+        }
         if pod.runtime_handler == "vm" {
             validate_vm_container(&config).map_err(|(code,msg)| Status::new(code,msg))?;
         }
@@ -1496,7 +1499,7 @@ impl RuntimeService for NautilusRuntimeService {
         if req.tty && req.stderr || !(req.stdin || req.stdout || req.stderr) {
             return Err(Status::invalid_argument("invalid attach stream selection"));
         }
-        let native_attach = match c.sandbox_kind.as_str() {
+        let local_attach = match c.sandbox_kind.as_str() {
             "vm" => None,
             "runc" if self._config.runtime.runc.driver != "exec" => {
                 if req.tty != c.tty || req.stdin && !c.open_stdin {
@@ -1505,6 +1508,18 @@ impl RuntimeService for NautilusRuntimeService {
                 let init = c.pid
                     .and_then(|pid| crate::sandbox::runc_backend::init_io(&c.id, pid))
                     .ok_or_else(|| Status::failed_precondition("daemon has no streams for this OCI init instance"))?;
+                Some(Arc::downgrade(&init))
+            }
+            "wasi" | "wasm" => {
+                if req.tty {
+                    return Err(Status::unimplemented("WASI attach does not support TTY"));
+                }
+                if req.stdin && !c.open_stdin {
+                    return Err(Status::invalid_argument("container stdin was not enabled"));
+                }
+                let init = self.sandbox_registry.wasi_init_io(&c.id).ok_or_else(|| {
+                    Status::failed_precondition("daemon has no streams for this WASI instance")
+                })?;
                 Some(Arc::downgrade(&init))
             }
             _ => return Err(Status::unimplemented("init attach is unavailable for this runtime handler")),
@@ -1519,7 +1534,7 @@ impl RuntimeService for NautilusRuntimeService {
                 stdout: req.stdout,
                 stderr: req.stderr,
             },
-            native_attach,
+            local_attach,
         )
         .await
         .map_err(Status::from)?;

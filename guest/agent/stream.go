@@ -207,7 +207,9 @@ func (s *server) stream(f *os.File, q request) {
 			return
 		}
 		c.mu.Lock()
-		if c.current().State != "running" {
+		current := c.current()
+		exitedAttach := q.Op == "attach" && current.State == "exited" && current.Started != 0
+		if current.State != "running" && !exitedAttach {
 			c.mu.Unlock()
 			reply(fail("conflict", "container is not running"))
 			return
