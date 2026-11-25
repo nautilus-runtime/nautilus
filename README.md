@@ -9,7 +9,7 @@ Nautilus is a Linux container runtime written in Rust. It implements the Kuberne
 | Workload | Runtime handler | Input |
 | --- | --- | --- |
 | Linux container | `runc` (default) | An OCI image from a registry. Nautilus pulls and caches the layers and runs the container with libcontainer. |
-| WebAssembly command | `wasi` or `wasm` | A local WASI Preview 1 module exporting `_start`. Wasmtime runs it inside the daemon. |
+| WebAssembly command | `wasi` or `wasm` | A WASI Preview 1 module exporting `_start`, supplied as a local file or an OCI image. Wasmtime runs it inside the daemon. |
 | Pod VM | `vm` (opt-in) | OCI images run inside one Linux guest per Pod. Requires KVM, Cloud Hypervisor and virtiofsd. |
 
 OCI containers support CNI pod networking, host port mappings, resource limits, logs and exec. You can also load a Wasm policy to allow or deny pod creation, container creation or container start. The [example policy](examples/policy-deny-label) rejects workloads carrying the `nautilus.policy/deny` label.
@@ -67,7 +67,18 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads the module from its local filesystem. WASI stdout and stderr are captured in the workload log. WASI commands run in the background with `-d` and can be stopped while running.
+The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-d` for background execution or `--rm` for cleanup after a foreground command.
+
+For Kubernetes, package the module in an OCI image and use its absolute path as the entrypoint. Build for the Linux node platform. In this example, set `IMAGE` to a registry tag that your node can pull.
+
+```sh
+docker buildx build --platform linux/amd64 --push -t "$IMAGE" examples/wasi-command
+kubectl apply -f examples/wasi-command/runtimeclass.yaml
+kubectl run wasi-hello --image="$IMAGE" --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"nautilus-wasi","automountServiceAccountToken":false}}'
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/wasi-hello --timeout=90s
+kubectl logs wasi-hello
+```
 
 ### Run a container in a Pod VM
 

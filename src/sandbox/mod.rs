@@ -107,9 +107,10 @@ impl ResourceLimits {
 pub struct WorkloadSpec {
     /// Unique workload id (nautilus container id).
     pub id: String,
-    /// Image reference. For runc: an OCI image ref pullable by the configured CLI.
-    /// For wasm: `file://` path (or absolute path) to a `.wasm`/`.wat` module.
+    /// OCI image reference or local WASI module path.
     pub image_ref: String,
+    /// Config digest persisted after preparing an OCI image, empty for local modules.
+    pub image_id: String,
     pub cgroup_parent: String,
     /// Process arguments requested by the CRI caller.
     /// Merge semantics (docker/k8s compatible), applied by the backend:

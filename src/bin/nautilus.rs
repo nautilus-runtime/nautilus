@@ -117,7 +117,7 @@ enum Commands {
         /// Remove the container and sandbox after the command exits
         #[arg(long, conflicts_with = "detach")]
         rm: bool,
-        /// Image reference (OCI image; wasm modules use a file:// path instead)
+        /// OCI image reference or a local WASI module path
         image: String,
         /// Command + arguments (overrides the image CMD; entrypoint kept unless --entrypoint)
         #[arg(trailing_var_arg = true)]
@@ -421,11 +421,8 @@ async fn container_status(r: &mut RClient, id: &str) -> Result<ContainerStatusRe
     Ok(resp)
 }
 
-/// Make sure `image` is usable by the daemon. Returns the reference the caller
-/// must use for container creation: normally None (keep as-is), but when the
-/// user passed a local image-ID prefix (`nautilus run a952f42cef39`, docker
-/// semantics) the canonical repo tag of that image is returned instead.
-async fn ensure_image(i: &mut IClient, image: &str) -> Result<Option<String>, String> {
+/// Prepare the image and return a replacement reference when needed.
+async fn ensure_image(i: &mut IClient, image: &str, pin: bool) -> Result<Option<String>, String> {
     let st = i
         .image_status(Request::new(ImageStatusRequest {
             image: Some(ImageSpec {
@@ -437,13 +434,13 @@ async fn ensure_image(i: &mut IClient, image: &str) -> Result<Option<String>, St
         .await
         .map_err(status)?
         .into_inner();
-    if st.image.is_some() {
-        return Ok(None);
+    if let Some(found) = st.image {
+        return Ok(pin.then_some(found.id));
     }
     // Docker parity: a hex prefix matches a locally-pulled image by its
     // config-digest IMAGE ID — never treat it as a registry name.
     if is_image_id_prefix(image) {
-        return match resolve_local_id(i, image).await {
+        return match resolve_local_id(i, image, pin).await {
             Ok(Some(resolved)) => {
                 eprintln!("Resolved '{}' to local image {}", image, resolved);
                 Ok(Some(resolved))
@@ -456,7 +453,7 @@ async fn ensure_image(i: &mut IClient, image: &str) -> Result<Option<String>, St
         };
     }
     eprintln!("Unable to find image '{}' locally; pulling", image);
-    pull_image(i, image).await.map(|_| None)
+    pull_image(i, image).await.map(|id| pin.then_some(id))
 }
 
 /// True when `s` looks like a truncated content digest: 4+ hex chars.
@@ -466,7 +463,7 @@ fn is_image_id_prefix(s: &str) -> bool {
 
 /// Find the unique local image whose config-digest ID starts with `prefix`.
 /// Ambiguous or missing matches produce docker-style errors.
-async fn resolve_local_id(i: &mut IClient, prefix: &str) -> Result<Option<String>, String> {
+async fn resolve_local_id(i: &mut IClient, prefix: &str, pin: bool) -> Result<Option<String>, String> {
     let resp = i
         .list_images(Request::new(ListImagesRequest::default()))
         .await
@@ -476,12 +473,14 @@ async fn resolve_local_id(i: &mut IClient, prefix: &str) -> Result<Option<String
     for img in &resp.images {
         let id = img.nautilus_image_id.trim_start_matches("sha256:");
         if id.starts_with(prefix) {
-            hits.push(
+            hits.push(if pin {
+                img.id.clone()
+            } else {
                 img.repo_tags
                     .first()
                     .cloned()
-                    .unwrap_or_else(|| img.id.clone()),
-            );
+                    .unwrap_or_else(|| img.id.clone())
+            });
         }
     }
     match hits.len() {
@@ -604,10 +603,12 @@ async fn cmd_run(
         cpuset_cpus: cpuset_cpus.unwrap_or_default(),
         ..Default::default()
     };
-    // OCI backends share the cache; WASI modules are node-local files.
+    // OCI workloads and packaged WASI modules share the image cache.
     let mut image = image;
-    if matches!(runtime.as_str(), "" | "runc" | "vm") {
-        if let Some(resolved) = ensure_image(i, &image).await? {
+    let is_local_module = is_wasi && (image.starts_with("file://") || image.starts_with('/')
+        || std::path::Path::new(&image).is_file());
+    if !is_local_module && matches!(runtime.as_str(), "" | "runc" | "vm" | "wasi" | "wasm") {
+        if let Some(resolved) = ensure_image(i, &image, is_wasi).await? {
             image = resolved;
         }
     }
@@ -709,7 +710,7 @@ async fn cmd_run(
         started = true;
         if let Some(interrupt) = interrupt.as_mut() {
             tokio::select! {
-                result = follow_workload(r, &id, !is_wasi, !is_vm && !is_wasi) => result,
+                result = follow_workload(r, &id, !is_local_module, !is_vm && !is_wasi) => result,
                 _ = interrupt.recv() => {
                     r.stop_container(Request::new(StopContainerRequest {
                         container_id: id.clone(),
@@ -1127,14 +1128,18 @@ async fn log_path_of(r: &mut RClient, id: &str) -> Result<String, String> {
 async fn cmd_logs(r: &mut RClient, target: String, follow: bool, tail: usize) -> Result<(), String> {
     let c = resolve_container(r, &target).await?;
     let path = log_path_of(r, &c.id).await?;
+    let cri_log = c.image_id.starts_with("sha256:");
 
     if !follow {
         let data = read_log(&path, 0).await?;
-        let text = String::from_utf8_lossy(&data);
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&[u8]> = data.split_inclusive(|byte| *byte == b'\n').collect();
         let start = if tail > 0 { lines.len().saturating_sub(tail) } else { 0 };
-        for l in &lines[start..] {
-            println!("{}", l);
+        for line in &lines[start..] {
+            if cri_log {
+                write_cri_log_line(line);
+            } else {
+                println!("{}", String::from_utf8_lossy(line).trim_end_matches('\n'));
+            }
         }
         return Ok(());
     }
@@ -1142,22 +1147,29 @@ async fn cmd_logs(r: &mut RClient, target: String, follow: bool, tail: usize) ->
     // Follow: incremental reads until the container exits and output drains.
     let mut offset: u64 = if tail > 0 {
         let data = read_log(&path, 0).await?;
-        let text = String::from_utf8_lossy(&data);
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&[u8]> = data.split_inclusive(|byte| *byte == b'\n').collect();
         let start = lines.len().saturating_sub(tail);
         let skip: u64 = lines[..start]
             .iter()
-            .map(|l| l.len() as u64 + 1)
+            .map(|l| l.len() as u64)
             .sum();
         skip.min(data.len() as u64)
     } else {
         0
     };
+    let mut pending = Vec::new();
     loop {
         let data = read_log(&path, offset).await?;
-        if !data.is_empty() {
-            offset += data.len() as u64;
+        offset += data.len() as u64;
+        if !cri_log {
             write_stdout(&data);
+        } else if !data.is_empty() {
+            pending.extend(data);
+            let consumed = pending.iter().rposition(|byte| *byte == b'\n').map_or(0, |i| i + 1);
+            for line in pending[..consumed].split_inclusive(|byte| *byte == b'\n') {
+                write_cri_log_line(line);
+            }
+            pending.drain(..consumed);
         }
         let exited = container_status(r, &c.id)
             .await
@@ -1167,7 +1179,12 @@ async fn cmd_logs(r: &mut RClient, target: String, follow: bool, tail: usize) ->
             .unwrap_or(true);
         if exited {
             let rest = read_log(&path, offset).await?;
-            if !rest.is_empty() {
+            if cri_log {
+                pending.extend(rest);
+                for line in pending.split_inclusive(|byte| *byte == b'\n') {
+                    write_cri_log_line(line);
+                }
+            } else if !rest.is_empty() {
                 write_stdout(&rest);
             }
             break;

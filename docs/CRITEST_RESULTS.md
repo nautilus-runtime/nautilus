@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 OCI 镜像中的 WASI 命令
+
+Kubernetes v1.37.2 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118）通过 `wasi` RuntimeClass 从 TLS Registry 拉取多架构镜像。Pod 成功退出，`kubectl logs` 返回模块输出。第二个镜像只有 OCI CMD，入口经镜像内绝对符号链接解析，`kubectl logs` 与 `nautilus logs` 返回相同内容。单独运行的 CLI 也验证了镜像默认命令参数和环境变量以及请求覆盖。
+
+日志轮转后、CRI reopen 前写入的新文件内容被保留。重启 daemon 会清理上次中断的暂存目录和无容器记录的发布目录，并保留已有容器的文件。删除 Pod 后，CRI Pod、容器和暂存目录均归零。完整 `critest` v1.37.0 联合回归见下一节。Linux 单线程 Rust 测试为 108 通过、0 失败、8 项默认忽略。全库格式检查仍有存量差异，严格 Clippy 报告与基线相同的 29 项诊断。
+
 ## 2026-11-25 OCI 镜像元数据校验
 
 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118）以 OCI WASI 联合构建验证，共用的 CRI ImageService 从 TLS Registry 拉取多架构镜像。分别篡改 registry 返回的 manifest digest、index 所选子 manifest 和 config JSON，三种拉取均被拒绝。使用 SHA-512 校验 config descriptor 的镜像仍以配置原始字节的 SHA-256 作为 CRI ImageID，kubelet v1.37.2 用该镜像成功启动 WASI 命令。

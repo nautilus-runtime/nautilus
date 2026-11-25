@@ -298,6 +298,7 @@ impl ContainerManager {
         Ok(WorkloadSpec {
             id: state.id.clone(),
             image_ref: state.image.clone(),
+            image_id: state.image_id.clone(),
             cgroup_parent: String::new(),
             args: state.wasi_args.clone(),
             entrypoint: Vec::new(),
@@ -503,7 +504,7 @@ impl ContainerManager {
                 self.state_manager.save_container_state(&state).await?;
             }
         }
-        Ok(())
+        crate::sandbox::wasm_backend::recover_staging(&self._config, &self.state_manager).await
     }
 
     /// Watch one detached workload pid; flip its state to Stopped with the
