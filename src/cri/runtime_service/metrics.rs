@@ -1034,7 +1034,12 @@ mod tests {
     #[test]
     fn pod_network_stats_keep_interface_and_rx_tx_fields() {
         let series = network_metrics(
-            "Inter-| Receive | Transmit\n+             eth0: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n+             Lo: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n+             Veth1: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n",
+            concat!(
+                "Inter-| Receive | Transmit\n",
+                " eth0: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n",
+                " Lo: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n",
+                " Veth1: 1 2 3 4 0 0 0 0 11 12 13 14 0 0 0 0\n",
+            ),
             &LABELS.map(String::from),
         );
         assert_eq!(series.len(), 8);
