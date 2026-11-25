@@ -56,6 +56,8 @@ curl -fsSL https://raw.githubusercontent.com/kubernetes/cri-api/v0.37.2/pkg/apis
 
 ## 高级 RPC 和验证边界
 
+未交付功能的优先级、实现阶段和上线验收见[后续交付顺序](CRI_FOLLOW_UP.md)。
+
 | 功能 | v1.37.2 行为与本项目边界 |
 | --- | --- |
 | 资源热更新 | `UpdateContainerResources` 要同步、事务性地应用请求。Pod 级 `UpdatePodSandboxResources` 的 proto 注释写为 kubelet 修改 cgroup 后尽力通知，v1.37.2 kubelet 实际先通知运行时，略过 `Unimplemented`，其他错误会阻止此次修改，宿主 cgroup 修改失败还会通知回滚。当前 Nautilus 的两个 RPC 都返回 `Unimplemented`。支持热更新需要分别验证 guest、VMM 和宿主账目，未支持时记录限制。 [proto](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto#L220-L226) · [实际调用顺序](https://github.com/kubernetes/kubernetes/blob/v1.37.2/pkg/kubelet/kuberuntime/kuberuntime_manager.go#L1002-L1016) · [错误处理](https://github.com/kubernetes/kubernetes/blob/v1.37.2/pkg/kubelet/kuberuntime/kuberuntime_container.go#L432-L453) |

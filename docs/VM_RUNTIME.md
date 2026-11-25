@@ -148,6 +148,8 @@ Kata Containers 4.4.0 经 containerd 向 Kubernetes 提供 VM RuntimeClass。其
 
 ## 交付顺序
 
+尚未交付的交互式启动、扩展指标、资源热更新与检查点按[后续优先级与设计](CRI_FOLLOW_UP.md)推进。该方案记录了与 Kata、Firecracker 的对照及每个后端的验收条件。
+
 | 事项 | 依赖 | 合并前验收 |
 | --- | --- | --- |
 | [#2 节点与 guest 握手](https://github.com/nautilus-runtime/nautilus/issues/2) | 可独立实施 | 真实 KVM 上的 CLI 验证就绪协议；错误应答、超时和 VMM 提前退出均被识别并清理。 |
