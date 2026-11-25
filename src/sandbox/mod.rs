@@ -53,6 +53,10 @@ pub struct ResourceLimits {
     #[serde(default)]
     pub oom_score_adj: i32,
     #[serde(default)]
+    pub native_disable_swap: bool,
+    #[serde(default)]
+    pub native_oom_group: Option<bool>,
+    #[serde(default)]
     pub guest_unified: HashMap<String, String>,
     #[serde(default)]
     pub guest_no_hugepages: Vec<String>,

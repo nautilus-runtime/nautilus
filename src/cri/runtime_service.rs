@@ -152,7 +152,29 @@ fn container_status(c: StoredContainer, image_id: String) -> runtime::v1::Contai
             })
             .collect(),
         log_path: c.log_path.unwrap_or_default(),
-        resources: None,
+        resources: c.resources.as_ref().filter(|_| c.sandbox_kind == "runc").map(|r| {
+            let mut unified = HashMap::new();
+            if r.native_disable_swap {
+                unified.insert("memory.swap.max".into(), "0".into());
+            }
+            if let Some(group) = r.native_oom_group {
+                unified.insert("memory.oom.group".into(), if group { "1" } else { "0" }.into());
+            }
+            runtime::v1::ContainerResources {
+            linux: Some(runtime::v1::LinuxContainerResources {
+                cpu_period: r.cpu_period,
+                cpu_quota: r.cpu_quota,
+                cpu_shares: r.cpu_shares,
+                cpuset_cpus: r.cpuset_cpus.clone(),
+                cpuset_mems: r.cpuset_mems.clone(),
+                memory_limit_in_bytes: r.memory_limit_in_bytes,
+                oom_score_adj: i64::from(r.oom_score_adj),
+                unified,
+                ..Default::default()
+            }),
+            windows: None,
+            }
+        }),
         image_id,
         user: None,
         stop_signal: 0, // SIGTERM (proto enum 0); not configurable yet
@@ -340,6 +362,7 @@ impl NautilusRuntimeService {
 
 impl NautilusRuntimeService {
     pub async fn recover_workloads(&self) -> crate::core::Result<()> {
+        self.container_manager.recover_native_resizes().await?;
         self.container_manager.recover_managed_workloads().await?;
         self.recover_vm_pods().await
     }
@@ -945,6 +968,8 @@ impl RuntimeService for NautilusRuntimeService {
                 cpuset_mems: r.cpuset_mems.clone(),
                 memory_limit_in_bytes: r.memory_limit_in_bytes,
                 oom_score_adj: r.oom_score_adj as i32,
+                native_disable_swap: false,
+                native_oom_group: None,
                 guest_unified: if pod.runtime_handler == "vm" { r.unified.clone() } else { Default::default() },
                 guest_no_hugepages: if pod.runtime_handler == "vm" { r.hugepage_limits.iter().map(|p| p.page_size.clone()).collect() } else { Vec::new() },
             });
@@ -1358,9 +1383,42 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn update_container_resources(
         &self,
-        _request: Request<UpdateContainerResourcesRequest>,
+        request: Request<UpdateContainerResourcesRequest>,
     ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
-        Err(Status::unimplemented("not implemented yet"))
+        let req = request.into_inner();
+        let before = self.container_manager.get_container_state(&req.container_id).await?
+            .ok_or_else(|| Status::not_found(format!("container {} not found", req.container_id)))?;
+        let linux = req.linux.ok_or_else(|| Status::unimplemented("expected Linux resources"))?;
+        if req.windows.is_some() || linux.memory_swap_limit_in_bytes != 0
+            || !linux.cpuset_cpus.is_empty() || !linux.cpuset_mems.is_empty()
+            || linux.hugepage_limits.iter().any(|limit| limit.limit != 0)
+            || linux.unified.iter().any(|(key, value)| !matches!(
+                (key.as_str(), value.as_str()),
+                ("memory.swap.max" | "memory.low" | "memory.min", "0")
+                    | ("memory.oom.group", "0" | "1")
+            ))
+        {
+            return Err(Status::unimplemented("unsupported live Linux resource setting"));
+        }
+        // Kubelet also copies the process's OOM score into this request. Like
+        // containerd, this RPC changes cgroup controls, leaving that score alone.
+        let patch = crate::sandbox::ResourceLimits {
+            cpu_period: linux.cpu_period,
+            cpu_quota: linux.cpu_quota,
+            cpu_shares: linux.cpu_shares,
+            memory_limit_in_bytes: linux.memory_limit_in_bytes,
+            native_disable_swap: linux.unified.contains_key("memory.swap.max"),
+            native_oom_group: linux.unified.get("memory.oom.group").map(|value| value == "1"),
+            ..Default::default()
+        };
+        let guard = self.pod_manager.operation_guard(&before.pod_id).await;
+        let manager = self.container_manager.clone();
+        // Finish the state commit or rollback even if the CRI client times out.
+        tokio::spawn(async move {
+            let _guard = guard;
+            manager.resize_native_container(&req.container_id, patch).await
+        }).await.map_err(|e| Status::internal(format!("resource update task: {e}")))??;
+        Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
 
     async fn reopen_container_log(
