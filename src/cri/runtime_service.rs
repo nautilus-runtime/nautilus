@@ -1,4 +1,5 @@
 mod auto_remove;
+mod metrics;
 mod stats;
 
 use super::list_stream::{batches, ListStream};
@@ -1715,7 +1716,9 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         _request: Request<ListMetricDescriptorsRequest>,
     ) -> Result<Response<ListMetricDescriptorsResponse>, Status> {
-        Err(Status::unimplemented("not implemented yet"))
+        Ok(Response::new(ListMetricDescriptorsResponse {
+            descriptors: metrics::descriptors(),
+        }))
     }
 
     async fn list_pod_sandbox_stats(
@@ -1754,9 +1757,18 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn list_pod_sandbox_metrics(
         &self,
-        _request: Request<ListPodSandboxMetricsRequest>,
+        request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
-        Err(Status::unimplemented("not implemented yet"))
+        let include = includes_standalone(&request);
+        let pods = self.pod_manager.list_pods().await.map_err(Status::from)?;
+        let matches = pods.into_iter().filter(|pod| include || !pod.standalone);
+        let pod_metrics = futures::stream::iter(matches)
+            .map(|pod| async move { self.collect_pod_metrics(&pod).await.ok() })
+            .buffered(8)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        Ok(Response::new(ListPodSandboxMetricsResponse { pod_metrics }))
     }
 
     async fn runtime_config(
@@ -1831,15 +1843,19 @@ impl RuntimeService for NautilusRuntimeService {
         })))
     }
 
-    type StreamPodSandboxMetricsStream = Pin<
-        Box<dyn Stream<Item = Result<StreamPodSandboxMetricsResponse, Status>> + Send + 'static>,
-    >;
+    type StreamPodSandboxMetricsStream = ListStream<StreamPodSandboxMetricsResponse>;
 
     async fn stream_pod_sandbox_metrics(
         &self,
-        _request: Request<StreamPodSandboxMetricsRequest>,
+        request: Request<StreamPodSandboxMetricsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxMetricsStream>, Status> {
-        Err(Status::unimplemented("metrics pipeline not implemented yet"))
+        let reply = self
+            .list_pod_sandbox_metrics(request.map(|_| ListPodSandboxMetricsRequest {}))
+            .await?
+            .into_inner();
+        Ok(Response::new(batches(reply.pod_metrics, |pod_sandbox_metrics| {
+            StreamPodSandboxMetricsResponse { pod_sandbox_metrics }
+        })))
     }
 
     async fn update_pod_sandbox_resources(

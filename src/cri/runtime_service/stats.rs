@@ -70,7 +70,7 @@ fn container_stats(c: &ContainerState, s: Sample) -> Result<rt::ContainerStats, 
     })
 }
 
-fn stat_value(stat: &str, key: &str) -> Option<u64> {
+pub(super) fn stat_value(stat: &str, key: &str) -> Option<u64> {
     for line in stat.lines() {
         let mut fields = line.split_ascii_whitespace();
         if fields.next() == Some(key) {
@@ -80,7 +80,7 @@ fn stat_value(stat: &str, key: &str) -> Option<u64> {
     None
 }
 
-fn pressure(stat: &str) -> Option<rt::PsiStats> {
+pub(super) fn pressure(stat: &str) -> Option<rt::PsiStats> {
     let parse = |class| {
         let line = stat.lines().find_map(|line| line.strip_prefix(class))?;
         let get = |key| {
@@ -105,13 +105,15 @@ fn pressure(stat: &str) -> Option<rt::PsiStats> {
     (some.is_some() || full.is_some()).then_some(rt::PsiStats { full, some })
 }
 
+pub(super) fn read_cgroup_file(group: &Root, name: &str) -> Option<String> {
+    let mut file = group.open_subpath(name, OpenFlags::O_RDONLY).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
 fn cgroup_usage(group: &Root, timestamp: i64) -> rt::ContainerStats {
-    let read = |name: &str| {
-        let mut file = group.open_subpath(name, OpenFlags::O_RDONLY).ok()?;
-        let mut text = String::new();
-        file.read_to_string(&mut text).ok()?;
-        Some(text)
-    };
+    let read = |name| read_cgroup_file(group, name);
     let number = |name| read(name)?.trim().parse::<u64>().ok();
     let psi = |name| read(name).and_then(|stat| pressure(&stat));
     let value = |value| rt::UInt64Value { value };
@@ -192,6 +194,37 @@ async fn process_usage(pid: u32) -> Result<(u64, u64), Status> {
 }
 
 impl NautilusRuntimeService {
+    pub(super) async fn read_native_cgroup<T: Send + 'static>(
+        &self,
+        c: &ContainerState,
+        sample: impl FnOnce(&Root, &Path, &Path) -> T + Send + 'static,
+    ) -> Result<Option<T>, Status> {
+        if c.sandbox_kind != "runc" || self._config.runtime.runc.driver == "exec" {
+            return Ok(None);
+        }
+        let pid = c
+            .pid
+            .filter(|&pid| {
+                pid > 0 && matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused)
+            })
+            .ok_or_else(|| Status::failed_precondition("container is not running"))?;
+        let backend = RuncBackend::new(self._config.clone());
+        let id = c.id.clone();
+        tokio::task::spawn_blocking(move || {
+            if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
+                return Ok(None);
+            }
+            let path = backend
+                .workload_cgroup_v2(&id, pid)
+                .ok_or_else(|| Status::unavailable("owned container cgroup is not readable"))?;
+            let group = Root::open(&path)
+                .map_err(|_| Status::unavailable("owned container cgroup is not readable"))?;
+            Ok::<_, Status>(Some(sample(&group, &path, &backend.bundle_dir(&id))))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("container stats worker: {e}")))?
+    }
+
     pub(super) async fn local_container_stats(
         &self,
         c: &ContainerState,
@@ -204,24 +237,9 @@ impl NautilusRuntimeService {
             .filter(|&pid| pid > 0)
             .ok_or_else(|| Status::failed_precondition("container is not running"))?;
         let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let cgroup = if c.sandbox_kind == "runc" && self._config.runtime.runc.driver != "exec" {
-            let backend = RuncBackend::new(self._config.clone());
-            let id = c.id.clone();
-            tokio::task::spawn_blocking(move || {
-                if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
-                    return Ok(None);
-                }
-                let group = backend
-                    .workload_cgroup_v2(&id, pid)
-                    .and_then(|path| Root::open(path).ok())
-                    .ok_or_else(|| Status::unavailable("owned container cgroup is not readable"))?;
-                Ok::<_, Status>(Some(cgroup_usage(&group, timestamp)))
-            })
-            .await
-            .map_err(|e| Status::internal(format!("container stats worker: {e}")))??
-        } else {
-            None
-        };
+        let cgroup = self
+            .read_native_cgroup(c, move |group, _, _| cgroup_usage(group, timestamp))
+            .await?;
         let mut stats = match cgroup {
             // Init-only CPU may be lower than the previous cgroup sample.
             Some(stats) => stats,

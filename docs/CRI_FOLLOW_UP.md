@@ -5,7 +5,7 @@
 | 顺序 | 功能 | 使用场景和优先级 |
 | --- | --- | --- |
 | 1 · P0 | 交互式启动与 Attach | 开发、人工排障和 Agent 工具环境的交互入口。先修复原生 OCI Attach，再让 CLI 复用 OCI 和 VM 的同一调用路径。[#45](https://github.com/nautilus-runtime/nautilus/issues/45) |
-| 2 · P0 | CRI 扩展指标 | 启用 CRI 指标采集后，监控系统会持续拉取，后台调用频率最高。与交互并行开发。[#40](https://github.com/nautilus-runtime/nautilus/issues/40) · [草稿 #47](https://github.com/nautilus-runtime/nautilus/pull/47) |
+| 2 · P0 | CRI 扩展指标 | 已接通原生 cAdvisor 指标和 VM 基础 CPU、内存指标。后续补齐 guest 侧的扩展采样。[#40](https://github.com/nautilus-runtime/nautilus/issues/40) · [PR #47](https://github.com/nautilus-runtime/nautilus/pull/47) |
 | 3 · P1 | 原地更新 CPU 和内存 | 在容量调整和部分自动扩缩容流程中触发。先实现原生容器和 kubelet 的 Pod 资源同步，再验证 VM 资源更新。[#41](https://github.com/nautilus-runtime/nautilus/issues/41) |
 | 4 · P2 | Checkpoint / Restore | 取证、长任务恢复和迁移时使用。优先交付原生 OCI 的单容器检查点。Kubernetes v1.37 的 Pod 级检查点与恢复是独立的 Alpha 路径。[#42](https://github.com/nautilus-runtime/nautilus/issues/42) · [Kubernetes 发布记录](https://kubernetes.io/blog/2026/08/26/kubernetes-v1-37-release/) |
 
@@ -20,7 +20,7 @@
 
 - **调用路径**。实现 `ListMetricDescriptors`、`ListPodSandboxMetrics` 和 `StreamPodSandboxMetrics`。启用 `PodAndContainerStatsFromCRI` 的 kubelet 会在 `/metrics/cadvisor` 使用 CRI 扩展指标。基本 Pod 和容器统计沿用已有接口。描述符在 daemon 启动时固定。两种列表共用采样和编码，流使用现有分批逻辑，每个 Pod 出现一次并以 EOF 结束。[kubelet 指标入口](https://github.com/kubernetes/kubernetes/blob/v1.37.2/pkg/kubelet/server/server.go) · [CRI v0.37.2](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto)
 - **采样来源**。原生容器先通过归属已经验证的 cgroup v2 读取 CPU、throttling、内存、OOM 和进程数，再核对文件系统、块 I/O 和 Pod 网络。Pod 网络计数从所属 netns 取样一次。VM 使用现有认证 guest 协议扩展可选采样字段，容器用量从 guest 容器 cgroup 读取，Pod 和 VMM 账目保留各自含义。新字段兼容旧 agent；无测量能力的字段不生成数据。WASI 的用量按其能独立归属的计数交付。重复采集限制并发和等待时间，单个不可达 guest 不影响其他 Pod。
-- **指标语义**。按 kubelet v1.37.2 使用的 cAdvisor 版本统一指标名、类型、标签顺序和量纲。CRI 载荷使用整数，秒值按实际累计值转换成整数秒。用 `memory.peak` 等字段前要核对运行内核和 controller。计数器、量表、缺失值和测得的零分别验证。#47 的两个原型指标族仍需补齐 critest 要求的 cAdvisor 家族，具体覆盖面记录在 #40。[cAdvisor 定义](https://github.com/google/cadvisor/blob/lib/v0.60.5/lib/metrics/prometheus.go) · [cri-tools 断言](https://github.com/kubernetes-sigs/cri-tools/blob/v1.37.0/pkg/validate/pod.go) · [指标任务 #40](https://github.com/nautilus-runtime/nautilus/issues/40)
+- **指标语义**。指标名、类型、标签顺序和量纲对齐 kubelet v1.37.2 使用的 cAdvisor。CRI 载荷使用整数，秒值按实际累计值转换成整数秒。用 `memory.peak` 等字段前核对运行内核和 controller。计数器、量表、缺失值和测得的零分别验证。原生描述符覆盖 critest 要求的指标名，实测覆盖面见验收记录。[cAdvisor 定义](https://github.com/google/cadvisor/blob/lib/v0.60.5/lib/metrics/prometheus.go) · [cri-tools 断言](https://github.com/kubernetes-sigs/cri-tools/blob/v1.37.0/pkg/validate/pod.go) · [验证记录](CRITEST_RESULTS.md)
 - **验收**。真实 kubelet 的 `/metrics/cadvisor` 返回符合定义的 CRI 指标。制造 CPU、内存、磁盘和网络负载，比较宿主 OCI、VM 容器、Pod 和空闲邻居的实际测量值。核对累计量、标签、独立 CLI 工作负载可见范围、旧 agent 和不可达 guest。列表和流结果在同一采样口径下等价，完整 critest 的指标用例通过后合入该功能。
 
 ## P1 原地更新资源
