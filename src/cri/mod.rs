@@ -6,3 +6,5 @@ pub mod version;
 
 pub use image_service::NautilusImageService;
 pub use runtime_service::NautilusRuntimeService;
+
+pub const STANDALONE_METADATA: &str = "nautilus-standalone";

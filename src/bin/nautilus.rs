@@ -206,8 +206,21 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-type RClient = RuntimeServiceClient<Channel>;
+type RClient = RuntimeServiceClient<tonic::service::interceptor::InterceptedService<Channel, Standalone>>;
 type IClient = ImageServiceClient<Channel>;
+
+#[derive(Clone)]
+struct Standalone;
+
+impl tonic::service::Interceptor for Standalone {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request.metadata_mut().insert(
+            nautilus::cri::STANDALONE_METADATA,
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        Ok(request)
+    }
+}
 
 async fn connect(socket: &str) -> Result<(RClient, IClient), String> {
     let p = socket.to_string();
@@ -223,7 +236,7 @@ async fn connect(socket: &str) -> Result<(RClient, IClient), String> {
             }
         }));
     Ok((
-        RuntimeServiceClient::new(channel.clone()),
+        RuntimeServiceClient::with_interceptor(channel.clone(), Standalone),
         ImageServiceClient::new(channel),
     ))
 }
@@ -1020,6 +1033,7 @@ async fn remove_implicit_workload(
             request.metadata_mut().insert("nautilus-remove-if", tonic::metadata::MetadataValue::from_static(value));
         }
         match r.remove_container(request).await {
+            Err(error) if error.code() == tonic::Code::NotFound => {}
             Err(error) if condition == Some("exited") && error.code() == tonic::Code::FailedPrecondition => return Ok(false),
             result => { result.map_err(status)?; }
         }

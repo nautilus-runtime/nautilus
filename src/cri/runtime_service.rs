@@ -14,11 +14,18 @@ use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
 use crate::proto::runtime;
 use futures::{Stream, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status};
+
+fn includes_standalone<T>(request: &Request<T>) -> bool {
+    request
+        .metadata()
+        .get(super::STANDALONE_METADATA)
+        .is_some_and(|value| value.as_encoded_bytes() == b"true")
+}
 
 /// CRI MountPropagation (proto i32) → OCI bind-mount propagation option.
 /// Unknown values fall back to rprivate, the CRI default.
@@ -273,6 +280,21 @@ fn validate_vm_container(config: &ContainerConfig) -> Result<(), (tonic::Code, &
 }
 
 impl NautilusRuntimeService {
+    async fn hidden_standalone_pods(&self, include: bool) -> Result<HashSet<String>, Status> {
+        if include {
+            return Ok(HashSet::new());
+        }
+        Ok(self
+            .pod_manager
+            .list_pods()
+            .await
+            .map_err(Status::from)?
+            .into_iter()
+            .filter(|pod| pod.standalone)
+            .map(|pod| pod.id)
+            .collect())
+    }
+
     pub fn new(
         config: Arc<Config>,
         state_manager: Arc<StateManager>,
@@ -545,6 +567,7 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<RunPodSandboxRequest>,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
+        let standalone = includes_standalone(&request);
         let req = request.into_inner();
         let config = req.config.ok_or_else(|| {
             Status::invalid_argument("Pod sandbox config is required")
@@ -634,6 +657,7 @@ impl RuntimeService for NautilusRuntimeService {
             namespace: metadata.namespace,
             name: metadata.name,
             uid: metadata.uid,
+            standalone,
             runtime_handler: handler.clone(),
             labels: config.labels,
             annotations: config.annotations,
@@ -840,12 +864,13 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
+        let include = includes_standalone(&request);
         let req = request.into_inner();
         let pods = self.pod_manager.list_pods().await
             .map_err(|e| Status::internal(format!("Failed to list pods: {}", e)))?;
 
         let filter = req.filter.as_ref();
-        let candidates = pods.into_iter().filter(|p| filter.is_none_or(|f| {
+        let candidates = pods.into_iter().filter(|p| (include || !p.standalone) && filter.is_none_or(|f| {
             (f.id.is_empty() || f.id == p.id) &&
                 f.label_selector.iter().all(|(k, v)| p.labels.get(k) == Some(v))
         }));
@@ -1272,14 +1297,19 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
+        let include = includes_standalone(&request);
         let req = request.into_inner();
         
         let containers = self.container_manager.observed_containers().await
             .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
+        let hidden = self.hidden_standalone_pods(include).await?;
         
         let mut filtered_containers = Vec::new();
         
         for container in containers {
+            if hidden.contains(&container.pod_id) {
+                continue;
+            }
             let container_status = match container.status {
                 ContainerStatus::Created => runtime::v1::ContainerState::ContainerCreated,
                 ContainerStatus::Running => runtime::v1::ContainerState::ContainerRunning,
@@ -1545,6 +1575,7 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
+        let include = includes_standalone(&request);
         let req = request.into_inner();
         let filter = req.filter.unwrap_or_default();
 
@@ -1554,8 +1585,10 @@ impl RuntimeService for NautilusRuntimeService {
             .await
             .map_err(Status::from)?;
 
+        let hidden = self.hidden_standalone_pods(include).await?;
         let matches = containers.into_iter().filter(|c| {
-            (filter.id.is_empty() || filter.id == c.id)
+            !hidden.contains(&c.pod_id)
+                && (filter.id.is_empty() || filter.id == c.id)
                 && (filter.pod_sandbox_id.is_empty() || filter.pod_sandbox_id == c.pod_id)
                 && filter.label_selector.iter().all(|(k, v)| c.labels.get(k) == Some(v))
         });
@@ -1620,17 +1653,21 @@ impl RuntimeService for NautilusRuntimeService {
 
     async fn get_container_events(
         &self,
-        _request: Request<GetEventsRequest>,
+        request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
+        let include = includes_standalone(&request);
         let receiver = self._state_manager.subscribe_container_events();
-        let stream = futures::stream::unfold(Some((receiver, self.images.clone())), |session| async {
+        let stream = futures::stream::unfold(Some((receiver, self.images.clone())), move |session| async move {
             let (mut receiver, images) = session?;
-            let event = match receiver.recv().await {
-                Ok(event) => event,
-                Err(RecvError::Closed) => return None,
-                Err(RecvError::Lagged(skipped)) => {
-                    let error = Status::resource_exhausted(format!("container event subscriber missed {skipped} events"));
-                    return Some((Err(error), None));
+            let event = loop {
+                match receiver.recv().await {
+                    Ok(event) if include || !event.pod.as_ref().is_some_and(|pod| pod.standalone) => break event,
+                    Ok(_) => {}
+                    Err(RecvError::Closed) => return None,
+                    Err(RecvError::Lagged(skipped)) => {
+                        let error = Status::resource_exhausted(format!("container event subscriber missed {skipped} events"));
+                        return Some((Err(error), None));
+                    }
                 }
             };
             let mut containers_statuses = Vec::with_capacity(event.containers.len());
@@ -1671,10 +1708,12 @@ impl RuntimeService for NautilusRuntimeService {
         &self,
         request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
+        let include = includes_standalone(&request);
         let filter = request.into_inner().filter.unwrap_or_default();
         let pods = self.pod_manager.list_pods().await.map_err(Status::from)?;
         let matches = pods.into_iter().filter(|p| {
-            (filter.id.is_empty() || filter.id == p.id)
+            (include || !p.standalone)
+                && (filter.id.is_empty() || filter.id == p.id)
                 && filter.label_selector.iter().all(|(k, v)| p.labels.get(k) == Some(v))
         });
         let stats = futures::stream::iter(matches)
@@ -1834,9 +1873,17 @@ mod container_event_tests {
     use super::*;
     use std::time::Duration;
 
-    async fn wasi_pod(service: &NautilusRuntimeService) -> String {
-        service
-            .run_pod_sandbox(Request::new(RunPodSandboxRequest {
+    fn standalone_request<T>(body: T) -> Request<T> {
+        let mut request = Request::new(body);
+        request.metadata_mut().insert(
+            super::super::STANDALONE_METADATA,
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        request
+    }
+
+    fn wasi_pod_request() -> RunPodSandboxRequest {
+        RunPodSandboxRequest {
                 config: Some(PodSandboxConfig {
                     metadata: Some(PodSandboxMetadata {
                         name: "event-tests".into(),
@@ -1847,7 +1894,12 @@ mod container_event_tests {
                     ..Default::default()
                 }),
                 runtime_handler: "wasi".into(),
-            }))
+        }
+    }
+
+    async fn wasi_pod(service: &NautilusRuntimeService) -> String {
+        service
+            .run_pod_sandbox(Request::new(wasi_pod_request()))
             .await
             .unwrap()
             .into_inner()
@@ -1903,6 +1955,55 @@ mod container_event_tests {
         )
         .unwrap();
         (tmp, service, module)
+    }
+
+    #[tokio::test]
+    async fn standalone_pods_stay_out_of_kubernetes_inventory_and_events() {
+        let (_tmp, service, module) = setup();
+        let standalone = service
+            .run_pod_sandbox(standalone_request(wasi_pod_request()))
+            .await
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let kubernetes = wasi_pod(&service).await;
+        let mut kube_events = service
+            .get_container_events(Request::new(GetEventsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut cli_events = service
+            .get_container_events(standalone_request(GetEventsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let local = create_wasi(&service, &standalone, &module, "standalone").await;
+        let pod = create_wasi(&service, &kubernetes, &module, "kubernetes").await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), kube_events.next())
+                .await.unwrap().unwrap().unwrap().container_id,
+            pod,
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), cli_events.next())
+                .await.unwrap().unwrap().unwrap().container_id,
+            local,
+        );
+        let pods = service
+            .list_pod_sandbox(Request::new(ListPodSandboxRequest::default()))
+            .await.unwrap().into_inner().items;
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0].id, kubernetes);
+        let containers = service
+            .list_containers(Request::new(ListContainersRequest::default()))
+            .await.unwrap().into_inner().containers;
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].id, pod);
+        let visible = service
+            .list_containers(standalone_request(ListContainersRequest::default()))
+            .await.unwrap().into_inner().containers;
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().any(|item| item.id == local));
     }
 
     #[tokio::test]

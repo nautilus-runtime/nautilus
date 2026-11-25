@@ -96,6 +96,9 @@ pub struct PodState {
     /// Internal startup probe; kubelet must never enumerate this sandbox.
     #[serde(default)]
     pub vm_probe: bool,
+    /// Pod created by the standalone Nautilus client on the shared CRI socket.
+    #[serde(default)]
+    pub standalone: bool,
     /// Exact CRI cgroup parent assigned by kubelet.
     #[serde(default)]
     pub cgroup_parent: String,
