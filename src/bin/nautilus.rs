@@ -206,7 +206,8 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-type RClient = RuntimeServiceClient<tonic::service::interceptor::InterceptedService<Channel, Standalone>>;
+type RClient =
+    RuntimeServiceClient<tonic::service::interceptor::InterceptedService<Channel, Standalone>>;
 type IClient = ImageServiceClient<Channel>;
 
 #[derive(Clone)]

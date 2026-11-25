@@ -1884,16 +1884,16 @@ mod container_event_tests {
 
     fn wasi_pod_request() -> RunPodSandboxRequest {
         RunPodSandboxRequest {
-                config: Some(PodSandboxConfig {
-                    metadata: Some(PodSandboxMetadata {
-                        name: "event-tests".into(),
-                        uid: "event-tests-uid".into(),
-                        namespace: "default".into(),
-                        ..Default::default()
-                    }),
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "event-tests".into(),
+                    uid: "event-tests-uid".into(),
+                    namespace: "default".into(),
                     ..Default::default()
                 }),
-                runtime_handler: "wasi".into(),
+                ..Default::default()
+            }),
+            runtime_handler: "wasi".into(),
         }
     }
 
