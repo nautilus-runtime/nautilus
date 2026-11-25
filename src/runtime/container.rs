@@ -415,30 +415,35 @@ impl ContainerManager {
 
         let backend = self.backend_for(&container_state)?;
         let spec = self.workload_spec_with_net(&container_state).await?;
-        match backend.start(&spec).await? {
+        let managed = match backend.start(&spec).await? {
             StartOutcome::Detached { pid } => {
                 container_state.status = ContainerStatus::Running;
                 container_state.started_at = Some(chrono::Utc::now());
                 container_state.pid = Some(pid);
+                None
             }
             StartOutcome::Guest => {
                 container_state.status = ContainerStatus::Running;
                 container_state.started_at = Some(chrono::Utc::now());
+                None
             }
-            StartOutcome::Finished { exit_code } => {
-                // Batch workload already completed (typical for wasi modules).
-                let now = chrono::Utc::now();
-                container_state.status = ContainerStatus::Stopped;
-                container_state.started_at = Some(now);
-                container_state.finished_at = Some(now);
-                container_state.exit_code = Some(exit_code);
+            StartOutcome::Managed { activate, finished } => {
+                container_state.status = ContainerStatus::Running;
+                container_state.started_at = Some(chrono::Utc::now());
+                container_state.finish_reason.clear();
+                Some((activate, finished))
             }
-        }
+        };
 
         self.state_manager.save_container_state(&container_state).await?;
         {
             let mut containers = self.containers.write().await;
             containers.insert(container_id.to_string(), container_state.clone());
+        }
+
+        if let Some((activate, finished)) = managed {
+            self.spawn_managed_reaper(&container_state, finished);
+            let _ = activate.send(());
         }
 
         self.publish_rules(&container_state).await;
@@ -454,6 +459,51 @@ impl ContainerManager {
             }
         }
         Ok(())
+    }
+
+    fn spawn_managed_reaper(
+        &self,
+        state: &ContainerState,
+        mut finished: tokio::sync::watch::Receiver<Option<i32>>,
+    ) {
+        let manager = self.clone();
+        let id = state.id.clone();
+        let instance = state.started_at;
+        tokio::spawn(async move {
+            let result = finished.wait_for(Option::is_some).await;
+            let code = result.ok().and_then(|exit| *exit).unwrap_or(1);
+            let mut cache = manager.containers.write().await;
+            let outcome = async {
+                if let Some(mut current) = manager.state_manager.get_container_state(&id).await? {
+                    if current.started_at == instance && current.status == ContainerStatus::Running {
+                        current.status = ContainerStatus::Stopped;
+                        current.finished_at = Some(chrono::Utc::now());
+                        current.exit_code = Some(code);
+                        manager.state_manager.save_container_state(&current).await?;
+                        cache.insert(id.clone(), current);
+                    }
+                }
+                Ok::<_, Error>(())
+            }.await;
+            if let Err(error) = outcome {
+                tracing::error!(container_id = %id, %error, "could not record WASI workload exit");
+            }
+        });
+    }
+
+    pub(crate) async fn recover_managed_workloads(&self) -> Result<()> {
+        for mut state in self.state_manager.list_containers().await? {
+            if matches!(state.sandbox_kind.as_str(), "wasi" | "wasm")
+                && matches!(state.status, ContainerStatus::Running | ContainerStatus::Paused)
+            {
+                state.status = ContainerStatus::Stopped;
+                state.finished_at = Some(chrono::Utc::now());
+                state.exit_code = Some(137);
+                state.finish_reason = "RuntimeRestarted".into();
+                self.state_manager.save_container_state(&state).await?;
+            }
+        }
+        crate::sandbox::wasm_backend::recover_staging(&self._config, &self.state_manager).await
     }
 
     /// Watch one detached workload pid; flip its state to Stopped with the
@@ -655,13 +705,11 @@ impl ContainerManager {
             }
         }
 
-        // Remove from state manager
-        self.state_manager.delete_container_state(container_id).await?;
-
-        // Remove from memory cache
+        // Serialize deletion with the exit watchers so they cannot reinsert a removed workload.
         {
             let mut containers = self.containers.write().await;
             containers.remove(container_id);
+            self.state_manager.delete_container_state(container_id).await?;
         }
 
         crate::network::publish::remove(container_id).await;

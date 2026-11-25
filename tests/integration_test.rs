@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_pod_and_container_lifecycle() {
     // Create temporary directory for test
     let temp_dir = TempDir::new().unwrap();
@@ -16,6 +16,7 @@ async fn test_pod_and_container_lifecycle() {
     // Create test config
     let mut config = Config::default();
     config.runtime.state_dir = state_dir.clone();
+    config.storage.container_dir = temp_dir.path().join("containers");
     config.runtime.runc_path = "/usr/bin/runc".into();
     let config = Arc::new(config);
 
@@ -89,6 +90,7 @@ async fn test_pod_and_container_lifecycle() {
         &wat_path,
         r#"(module
   (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+  (memory (export "memory") 1)
   (func (export "_start") i32.const 0 call $exit))"#,
     )
     .unwrap();
@@ -151,6 +153,54 @@ async fn test_pod_and_container_lifecycle() {
     assert_eq!(pod_containers.len(), 1);
     assert_eq!(pod_containers[0].id, container_id);
     
+    container_manager.start_container(&container_id).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let state = container_manager.get_container_state(&container_id).await.unwrap().unwrap();
+            if state.status == nautilus::core::ContainerStatus::Stopped {
+                assert_eq!(state.exit_code, Some(0));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("WASI exit was not recorded");
+
+    // Even a module that never returns to a host ABI must yield to the runtime.
+    std::fs::write(
+        &wat_path,
+        r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 16) "started")
+  (func (export "_start")
+    (i32.store (i32.const 0) (i32.const 16))
+    (i32.store (i32.const 4) (i32.const 7))
+    (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+    (loop $run (br $run))))"#,
+    ).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        container_manager.start_container(&container_id),
+    ).await.expect("WASI start waited for the running module").unwrap();
+    let running = container_manager.get_container_state(&container_id).await.unwrap().unwrap();
+    assert_eq!(running.status, nautilus::core::ContainerStatus::Running);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let log = running.log_path.as_ref().unwrap();
+        while !tokio::fs::read_to_string(log).await.unwrap_or_default().contains("started") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("busy WASI module never entered _start");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        container_manager.stop_container(&container_id, Some(0)),
+    ).await.expect("WASI stop could not interrupt the loop").unwrap();
+    let stopped = container_manager.get_container_state(&container_id).await.unwrap().unwrap();
+    assert_eq!(stopped.status, nautilus::core::ContainerStatus::Stopped);
+    assert_eq!(stopped.exit_code, Some(137));
+    container_manager.stop_container(&container_id, Some(0)).await.unwrap();
+
+    // Force removal must drain the active instance before deleting its record.
+    container_manager.start_container(&container_id).await.unwrap();
     // Clean up - remove container
     let result = container_manager.remove_container(&container_id).await;
     assert!(result.is_ok(), "Failed to remove container: {:?}", result.err());

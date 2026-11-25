@@ -67,7 +67,7 @@ If you have a WASI Preview 1 command compiled as `hello.wasm`, run it from the d
 sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"
 ```
 
-The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. WASI jobs execute to completion during start.
+The daemon reads local modules from its own filesystem. WASI stdout and stderr are captured as CRI log records. Use `-d` for background execution or `--rm` for cleanup after a foreground command.
 
 For Kubernetes, package the module in an OCI image and use its absolute path as the entrypoint. Build for the Linux node platform. In this example, set `IMAGE` to a registry tag that your node can pull.
 
