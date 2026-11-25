@@ -32,6 +32,7 @@ pub struct ImageWorkload {
 struct CachedImage {
     manifest: OciImageManifest,
     config: oci_distribution::config::ConfigFile,
+    image_id: String,
     /// Digest of the resolved platform manifest (`sha256:...`), the digest
     /// half of a `repo@digest` reference. Empty for cache files written
     /// before this field existed.
@@ -121,9 +122,15 @@ async fn load_cached(config: &Config, reference: &Reference) -> Option<CachedIma
         }
         blobs.push((path, desc.media_type.clone()));
     }
+    let image_id = if file.image_id.is_empty() {
+        file.manifest.config.digest.clone()
+    } else {
+        file.image_id
+    };
     Some(CachedImage {
         manifest: file.manifest,
         config: file.config,
+        image_id,
         manifest_digest: file.manifest_digest.clone(),
         blobs,
     })
@@ -133,6 +140,8 @@ async fn load_cached(config: &Config, reference: &Reference) -> Option<CachedIma
 struct CachedManifestFile {
     manifest: OciImageManifest,
     config: oci_distribution::config::ConfigFile,
+    #[serde(default)]
+    image_id: String,
     #[serde(default)]
     manifest_digest: String,
 }
@@ -277,6 +286,9 @@ impl CachedImage {
             .map_err(|e| Error::Image(format!("pull image config: {e}")))?;
         verify_size(&cfg_bytes, cfg_desc.size)?;
         verify_digest(&cfg_bytes, &cfg_desc.digest)?;
+        // OCI ImageID uses SHA-256 even when the configuration descriptor
+        // uses another supported digest algorithm.
+        let image_id = format!("sha256:{:x}", Sha256::digest(&cfg_bytes));
         let config_file: oci_distribution::config::ConfigFile = serde_json::from_slice(&cfg_bytes)
             .map_err(|e| Error::Image(format!("parse image config: {e}")))?;
 
@@ -321,6 +333,7 @@ impl CachedImage {
         let cache_file = CachedManifestFile {
             manifest: manifest.clone(),
             config: config_file.clone(),
+            image_id: image_id.clone(),
             manifest_digest: manifest_digest.clone(),
         };
         let json = serde_json::to_vec(&cache_file)?;
@@ -333,6 +346,7 @@ impl CachedImage {
         Ok(Self {
             manifest,
             config: config_file,
+            image_id,
             manifest_digest,
             blobs,
         })
@@ -341,7 +355,7 @@ impl CachedImage {
     fn workload(&self) -> ImageWorkload {
         let cfg = self.config.config.as_ref();
         ImageWorkload {
-            image_id: self.manifest.config.digest.clone(),
+            image_id: self.image_id.clone(),
             entrypoint: cfg
                 .and_then(|c| c.entrypoint.clone())
                 .unwrap_or_default(),
@@ -448,7 +462,12 @@ async fn pin_cached_tag(config: &Config, reference: &Reference) -> Result<Option
     if reference != &pinned && !tokio::fs::try_exists(&alias).await? {
         super::atomic_write(&alias, &json).await?;
     }
-    Ok(Some((old.manifest.config.digest, digest.to_owned())))
+    let image_id = if old.image_id.is_empty() {
+        old.manifest.config.digest
+    } else {
+        old.image_id
+    };
+    Ok(Some((image_id, digest.to_owned())))
 }
 
 pub(super) async fn cached_manifest_for_id(config: &Config, image_ref: &str, id: &str) -> Result<Option<String>> {
@@ -507,7 +526,7 @@ impl CachedImage {
         } else {
             self.manifest_digest.as_bytes().to_owned()
         };
-        Ok(super::snapshot::key(&self.manifest.config.digest, &identity))
+        Ok(super::snapshot::key(&self.image_id, &identity))
     }
 
     fn unpack(&self, dst: &Path, image_dir: &Path) -> Result<()> {
@@ -515,12 +534,12 @@ impl CachedImage {
             crate::storage::unpack::apply_layer(dst, &std::fs::read(path)?, media_type)?;
         }
         let meta = serde_json::json!({
-            "image_id": self.manifest.config.digest,
+            "image_id": self.image_id,
             "created": self.config.created.map(|c| c.to_rfc3339()),
             "size": dir_size(dst),
         });
         let sidecar = image_dir.join(format!("{}.nmeta",
-            super::image::safe_image_name(&self.manifest.config.digest)));
+            super::image::safe_image_name(&self.image_id)));
         // Size is optional display metadata. Never expose a partial JSON file.
         if let Ok(mut file) = tempfile::NamedTempFile::new_in(image_dir) {
             if serde_json::to_writer(&mut file, &meta).is_ok() {
@@ -544,7 +563,7 @@ impl CachedImage {
                 .unwrap_or_default()
         };
         ImageFacts {
-            config_digest: self.manifest.config.digest.clone(),
+            config_digest: self.image_id.clone(),
             manifest_digest,
             created: self.config.created,
             size,
@@ -660,6 +679,7 @@ mod tests {
         let file = CachedManifestFile {
             manifest: OciImageManifest::default(),
             config: Default::default(),
+            image_id: String::new(),
             manifest_digest: manifest_digest.clone(),
         };
         std::fs::write(manifest_cache_path(&cfg, &tag), serde_json::to_vec(&file).unwrap()).unwrap();
