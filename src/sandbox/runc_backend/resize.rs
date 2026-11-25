@@ -183,9 +183,9 @@ impl LiveResize {
     }
 
     pub(crate) fn apply(&self) -> Result<()> {
-        // Keep the stop-the-world interval across the resource commit. An
-        // increase can otherwise let the workload allocate past the old limit
-        // while the daemon still needs to be able to roll back.
+        // Keep the cgroup frozen until the resource commit. An increase can
+        // otherwise let the workload allocate past the old limit before the
+        // daemon can guarantee it will never need to restore that limit.
         if self.frozen.is_some() {
             self.freeze()?;
         }
@@ -198,6 +198,16 @@ impl LiveResize {
         }
         for change in &self.changes {
             self.write_and_check(change.original.control, &change.next)?;
+        }
+        // Updating another systemd unit property can reapply a previously set
+        // CPU bandwidth in systemd's rounded units. Verify it after all of them.
+        if let Some(cpu) = self
+            .changes
+            .iter()
+            .find(|c| c.original.control == Control::CpuMax)
+            .filter(|_| self.unit.is_some())
+        {
+            self.write_kernel_and_check(Control::CpuMax, &cpu.next)?;
         }
         Ok(())
     }
@@ -255,7 +265,7 @@ impl LiveResize {
             }
             if Instant::now() >= deadline {
                 return Err(Error::Precondition(
-                    "could not freeze cgroup for memory reduction".into(),
+                    "could not freeze cgroup for memory resize".into(),
                 ));
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -263,7 +273,6 @@ impl LiveResize {
     }
 
     fn write_and_check(&self, control: Control, value: &str) -> Result<()> {
-        let name = control.file();
         if let Some(unit) = &self.unit {
             let properties = control.systemd_properties(value)?;
             if !properties.is_empty() {
@@ -293,6 +302,11 @@ impl LiveResize {
                 }
             }
         }
+        self.write_kernel_and_check(control, value)
+    }
+
+    fn write_kernel_and_check(&self, control: Control, value: &str) -> Result<()> {
+        let name = control.file();
         if read_control(&self.group, name)? != value {
             let mut file = self.group.open_subpath(
                 name,
