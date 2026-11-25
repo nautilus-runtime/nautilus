@@ -758,6 +758,15 @@ impl RuncBackend {
             },
             "hostname": hostname.unwrap_or("nautilus")
         });
+        if tty {
+            // libcontainer resolves /dev/ptmx through this container's devpts.
+            spec["mounts"].as_array_mut().unwrap().push(serde_json::json!({
+                "destination": "/dev/pts",
+                "type": "devpts",
+                "source": "devpts",
+                "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"]
+            }));
+        }
         // Bidirectional (rshared) volumes only propagate container-made mounts
         // back to the host when the container's mount root is SHARED as well;
         // youki defaults the root to slave, which is one-way.
