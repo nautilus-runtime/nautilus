@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-25 后台工作负载自动回收
+
+在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）验证 `nautilus run -d --rm`。OCI、Registry WASI 和 VM 均返回容器 ID，并在执行结束后回收容器及其隐式 Pod。VM 执行期间可见的宿主日志目录随后删除。CLI 对旧 daemon 在创建资源前拒绝此选项。
+
+强制终止 daemon 后，WASI 运行实例在重启期间收敛为已退出并完成回收。另一次在独立测试服务中保留 OCI 原进程，记录 daemon PID 变化，并确认相同的容器 init PID 在新 daemon 就绪后仍存活。原进程退出后，新 daemon 回收其隐式 Pod、容器、宿主日志目录和 OCI 运行状态。
+
+首轮 `critest` v1.37.0 的安全上下文用例因公开 Registry CDN 拉取超时失败。预拉取该用例镜像后，对同一候选版本和 socket 重跑未过滤的 Runtime 与 Image 套件，105 通过、0 失败、37 跳过，耗时 264.137 秒，结束时 CRI Pod 和容器数均为零。Linux 串行 Rust 测试为 114 通过、0 失败、8 项忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍报告存量差异。
+
 ## 2026-11-25 独立 CLI 与 kubelet 共用 socket
 
 在 pro6000 的独立 Debian 13 节点（Linux 6.12.118、Cloud Hypervisor v55.0）用同一 daemon 启动真实 kubelet v1.37.2 和 Nautilus CLI。标准 CRI 清单返回 Kubernetes 创建的原生 OCI 和 VM 容器，CLI 创建的 WASI 容器仅在 CLI 清单可见。经过 65 秒，独立 WASI 容器仍可读出此前已经退出的进程日志，两个 Kubernetes Pod 保持 Running。连续十次前台 `--rm` 与一次显式删除均成功。
