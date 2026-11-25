@@ -70,6 +70,28 @@ fn copy_image_module(root: &Path, path: &Path, destination: &Path) -> Result<()>
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::copy_image_module;
+    use std::path::Path;
+
+    #[test]
+    fn resolves_absolute_module_symlinks_inside_the_image() {
+        let stage = tempfile::tempdir().unwrap();
+        let root = stage.path().join("rootfs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("command.wat"), b"image module").unwrap();
+        std::os::unix::fs::symlink("/command.wat", root.join("entry")).unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("escape")).unwrap();
+        std::fs::write(stage.path().join("outside"), b"host data").unwrap();
+
+        let module = stage.path().join("module");
+        copy_image_module(&root, Path::new("/entry"), &module).unwrap();
+        assert_eq!(std::fs::read(&module).unwrap(), b"image module");
+        assert!(copy_image_module(&root, Path::new("/escape"), &module).is_err());
+    }
+}
+
 type WriteRecord = Pin<Box<dyn Future<Output = io::Result<usize>> + Send>>;
 
 struct CriLogWriter {
@@ -234,8 +256,14 @@ impl WasmBackend {
             builder.stderr(CriLogWriter::stream(log, "stderr"));
         } else {
             let file = tokio::fs::OpenOptions::new().append(true).open(log).await?;
-            builder.stdout(AsyncStdoutStream::new(AsyncWriteStream::new(16 * 1024, file.try_clone().await?)));
-            builder.stderr(AsyncStdoutStream::new(AsyncWriteStream::new(16 * 1024, file)));
+            builder.stdout(AsyncStdoutStream::new(AsyncWriteStream::new(
+                16 * 1024,
+                file.try_clone().await?,
+            )));
+            builder.stderr(AsyncStdoutStream::new(AsyncWriteStream::new(
+                16 * 1024,
+                file,
+            )));
         }
         builder.args(&argv);
         for (k, v) in env {
@@ -318,7 +346,8 @@ impl SandboxBackend for WasmBackend {
         } else {
             (&spec.entrypoint, &spec.args)
         };
-        let (module_name, entry_args, args) = if let Some((module, rest)) = entrypoint.split_first() {
+        let (module_name, entry_args, args) = if let Some((module, rest)) = entrypoint.split_first()
+        {
             (module, rest, args.as_slice())
         } else {
             let (module, rest) = args.split_first().ok_or_else(|| {
