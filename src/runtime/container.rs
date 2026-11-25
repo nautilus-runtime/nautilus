@@ -1,5 +1,5 @@
 use crate::core::{Config, Error, Result, StateManager};
-use crate::core::state::{ContainerState, ContainerStatus};
+use crate::core::state::{ContainerState, ContainerStatus, NativeResizeControl};
 use crate::sandbox::{SandboxRegistry, StartOutcome, WorkloadSpec};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -497,12 +497,25 @@ impl ContainerManager {
             (live, applied)
         }).await.map_err(|e| Error::Runtime(format!("cgroup update worker: {e}")))?;
         let mut next = previous.clone();
-        next.native_resize_pending.clear();
+        next.native_resize_pending.retain(|value| value.control == NativeResizeControl::Frozen);
         next.resources = Some(updated);
         let error = match applied {
             Ok(()) => match self.state_manager.save_container_state(&next).await {
                 Ok(()) => {
-                    cache.insert(id.to_string(), next);
+                    cache.insert(id.to_string(), next.clone());
+                    if !next.native_resize_pending.is_empty() {
+                        let freezer = next.native_resize_pending.clone();
+                        tokio::task::spawn_blocking(move || live.restore(&freezer))
+                            .await.map_err(|e| Error::Runtime(format!("cgroup thaw worker: {e}")))??;
+                        next.native_resize_pending.clear();
+                        // The committed snapshot still permits recovery if
+                        // clearing the now-idempotent thaw record fails.
+                        if let Err(error) = self.state_manager.save_container_state(&next).await {
+                            tracing::warn!(container_id = %id, %error, "could not clear native resize thaw record");
+                        } else {
+                            cache.insert(id.to_string(), next);
+                        }
+                    }
                     return Ok(());
                 }
                 Err(error) => error,

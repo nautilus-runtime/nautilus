@@ -31,6 +31,7 @@ pub struct ContainerState {
     /// Resource limits requested via CRI (mapped to OCI linux.resources).
     #[serde(default)]
     pub resources: Option<crate::sandbox::ResourceLimits>,
+    /// Original controls before commit. After commit, only the freezer may need restoring.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native_resize_pending: Vec<NativeResizeValue>,
     /// Per-container security context (CRI LinuxContainerSecurityContext).

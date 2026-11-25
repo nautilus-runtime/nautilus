@@ -183,21 +183,21 @@ impl LiveResize {
     }
 
     pub(crate) fn apply(&self) -> Result<()> {
+        // Keep the stop-the-world interval across the resource commit. An
+        // increase can otherwise let the workload allocate past the old limit
+        // while the daemon still needs to be able to roll back.
+        if self.frozen.is_some() {
+            self.freeze()?;
+        }
         if let Some(memory) = self
             .changes
             .iter()
             .find(|c| c.original.control == Control::MemoryLimit)
         {
-            if limit(&memory.next)? < limit(&memory.original.value)? {
-                self.freeze()?;
-                self.check_memory_limit(&memory.original.value, &memory.next)?;
-            }
+            self.check_memory_limit(&memory.original.value, &memory.next)?;
         }
         for change in &self.changes {
             self.write_and_check(change.original.control, &change.next)?;
-        }
-        if let Some(frozen) = &self.frozen {
-            self.write_and_check(Control::Frozen, frozen)?;
         }
         Ok(())
     }
@@ -497,6 +497,38 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("memory.max")).unwrap(),
             "67108864"
+        );
+    }
+
+    #[test]
+    fn committed_memory_update_leaves_only_the_freezer_to_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, value) in [
+            ("memory.max", "67108864"),
+            ("cgroup.freeze", "0"),
+            ("cgroup.events", "populated 1\nfrozen 1\n"),
+        ] {
+            std::fs::write(dir.path().join(name), value).unwrap();
+        }
+        let mut live = LiveResize::new(Root::open(dir.path()).unwrap());
+        live.plan(&ResourceLimits {
+            memory_limit_in_bytes: 128 << 20,
+            ..Default::default()
+        })
+        .unwrap();
+        live.apply().unwrap();
+        assert_eq!(read_control(&live.group, "cgroup.freeze").unwrap(), "1");
+        let mut committed = live.original_values();
+        committed.retain(|value| value.control == Control::Frozen);
+        let recovered = LiveResize::new(Root::open(dir.path()).unwrap());
+        recovered.restore(&committed).unwrap();
+        assert_eq!(
+            read_control(&recovered.group, "cgroup.freeze").unwrap(),
+            "0"
+        );
+        assert_eq!(
+            read_control(&recovered.group, "memory.max").unwrap(),
+            "134217728"
         );
     }
 }
