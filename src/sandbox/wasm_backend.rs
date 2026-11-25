@@ -66,27 +66,28 @@ impl WasmBackend {
         })
     }
 
-    async fn compile(&self, path: PathBuf) -> Result<InstancePre<WasiP1Ctx>> {
+    async fn compile(&self, path: PathBuf) -> Result<Module> {
         let engine = self.engine.clone();
-        tokio::task::spawn_blocking(move || {
-            let module = Module::from_file(&engine, path)
-                .map_err(|e| Error::Runtime(format!("compile wasm module: {e}")))?;
-            if !matches!(module.get_export("_start"), Some(ExternType::Func(start))
-                if start.params().len() == 0 && start.results().len() == 0)
-            {
-                return Err(Error::Runtime(
-                    "WASI module must export _start with no parameters or results".into(),
-                ));
-            }
-            let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-            preview1::add_to_linker_async(&mut linker, |t| t)
-                .map_err(|e| Error::Runtime(format!("WASI linker setup failed: {e}")))?;
-            linker
-                .instantiate_pre(&module)
-                .map_err(|e| Error::Runtime(format!("link WASI module: {e}")))
-        })
-        .await
-        .map_err(|e| Error::Runtime(format!("WASI compiler task failed: {e}")))?
+        tokio::task::spawn_blocking(move || Module::from_file(&engine, path))
+            .await
+            .map_err(|e| Error::Runtime(format!("WASI compiler task failed: {e}")))?
+            .map_err(|e| Error::Runtime(format!("compile wasm module: {e}")))
+    }
+
+    fn link(&self, module: &Module) -> Result<InstancePre<WasiP1Ctx>> {
+        if !matches!(module.get_export("_start"), Some(ExternType::Func(start))
+            if start.params().len() == 0 && start.results().len() == 0)
+        {
+            return Err(Error::Runtime(
+                "WASI module must export _start with no parameters or results".into(),
+            ));
+        }
+        let mut linker: Linker<WasiP1Ctx> = Linker::new(&self.engine);
+        preview1::add_to_linker_async(&mut linker, |ctx| ctx)
+            .map_err(|e| Error::Runtime(format!("WASI linker setup failed: {e}")))?;
+        linker
+            .instantiate_pre(module)
+            .map_err(|e| Error::Runtime(format!("link WASI module: {e}")))
     }
 
     async fn run_module(
@@ -176,7 +177,7 @@ impl SandboxBackend for WasmBackend {
         let mut argv = vec![path.display().to_string()];
         argv.extend(spec.args.iter().cloned());
         let env = spec.env.clone().into_iter().collect();
-        let module = self.compile(path).await?;
+        let module = self.link(&self.compile(path).await?)?;
 
         tokio::fs::create_dir_all(&spec.output_dir).await?;
         let log = tokio::fs::OpenOptions::new()
