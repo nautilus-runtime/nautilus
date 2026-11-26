@@ -1,13 +1,14 @@
 //! Container operations for one authenticated Pod VM.
 use super::{SandboxBackend, SandboxKind, StartOutcome, WorkloadSpec};
 use crate::core::{Config, Error, Result};
+use crate::storage::{pull, snapshot};
 use crate::vm::{
     owner::PodVmStore,
     workload::{Operation, Reply},
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::{io, sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 pub(crate) struct VmBackend {
     config: Arc<Config>,
@@ -26,15 +27,7 @@ impl VmBackend {
     }
 
     fn staging_dir(&self, id: &str) -> Result<std::path::PathBuf> {
-        if !uuid::Uuid::parse_str(id).is_ok_and(|u| !u.is_nil() && u.to_string() == id) {
-            return Err(Error::Container("invalid VM container ID".into()));
-        }
-        Ok(self
-            .config
-            .runtime
-            .state_dir
-            .join("vms")
-            .join(format!(".oci-{id}")))
+        Ok(self.store.staged_bundle(id)?)
     }
 
     pub fn discard_stage(&self, id: &str) -> Result<()> {
@@ -48,6 +41,10 @@ impl VmBackend {
             }
             Ok(_) => Err(Error::Storage("VM staging directory was replaced".into())),
         }
+    }
+
+    fn backing_bundle(&self, id: &str) -> PathBuf {
+        self.config.storage.container_dir.join(id)
     }
 
     pub async fn call(&self, id: &str, op: Operation<'_>) -> Result<Reply> {
@@ -100,18 +97,60 @@ impl VmBackend {
         std::fs::DirBuilder::new().mode(0o700).create(&staged)?;
         let rootfs = staged.join("rootfs");
         tokio::fs::create_dir(&rootfs).await?;
-        let mut image =
-            crate::storage::pull::materialize_rootfs(&self.config, &spec.image_ref, &rootfs)
-                .await?;
-        let root = pathrs::Root::open(&rootfs)?;
+        let backing = self.backing_bundle(&spec.id);
+        let use_snapshot = self.config.storage.overlay.enabled
+            && self.store.supports_rootfs_mount(&self.pod).await?;
+        if use_snapshot {
+            snapshot::begin(&backing)?;
+            tokio::fs::create_dir(backing.join("rootfs")).await?;
+        }
+        let mut image = pull::prepare_root(
+            &self.config,
+            &spec.image_ref,
+            &rootfs,
+            use_snapshot.then_some(backing.as_path()),
+        )
+        .await?;
         let security = spec.security.as_ref();
-        let (uid, gid) = crate::storage::user::resolve(&root, &image.user, security)?;
-        let groups = crate::storage::user::groups(
-            &root,
-            uid,
-            security.map_or(&[][..], |s| s.supplemental_groups.as_slice()),
-            spec.strict_groups,
-        )?;
+        let readonly_root = self.config.security.read_only_root_filesystem
+            || security.is_some_and(|s| s.readonly_rootfs);
+        let user = image.user.clone();
+        let security_context = spec.security.clone();
+        let strict_groups = spec.strict_groups;
+        let (uid, gid, groups, view) = tokio::task::spawn_blocking(move || {
+            let overlay = use_snapshot && snapshot::has_view(&backing)?;
+            if use_snapshot && !overlay {
+                snapshot::remove(&backing)?;
+            }
+            if overlay {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o700))?;
+            }
+            if overlay && readonly_root {
+                std::fs::File::create(backing.join(snapshot::VM_READONLY_ROOT))?.sync_all()?;
+                std::fs::File::open(&backing)?.sync_all()?;
+            }
+            snapshot::with_view(&backing, || {
+                let path = if overlay {
+                    backing.join("rootfs")
+                } else {
+                    rootfs
+                };
+                let root = pathrs::Root::open(&path)?;
+                let security = security_context.as_ref();
+                let (uid, gid) = crate::storage::user::resolve(&root, &user, security)?;
+                let groups = crate::storage::user::groups(
+                    &root,
+                    uid,
+                    security.map_or(&[][..], |s| s.supplemental_groups.as_slice()),
+                    strict_groups,
+                )?;
+                let view = overlay.then(|| snapshot::clone_view(&path)).transpose()?;
+                Ok((uid, gid, groups, view))
+            })
+        })
+        .await
+        .map_err(|e| Error::Runtime(format!("VM rootfs worker: {e}")))??;
         let argv = if spec.entrypoint.is_empty() {
             image.entrypoint.extend(
                 if spec.args.is_empty() {
@@ -183,7 +222,7 @@ impl VmBackend {
         }
         let mut spec_json = json!({
             "ociVersion":"1.1.0", "mounts":mounts,
-            "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
+            "root":{"path":"rootfs", "readonly": readonly_root},
             "annotations":{"io.nautilus.stdin":spec.open_stdin.to_string(),"io.nautilus.stdinOnce":spec.stdin_once.to_string()},
             "process":{"terminal":spec.tty,"user":{"uid":uid,"gid":gid,"additionalGids":groups},
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},
@@ -204,7 +243,7 @@ impl VmBackend {
         }
         tokio::fs::write(staged.join("config.json"), serde_json::to_vec(&spec_json)?).await?;
         self.store
-            .publish_bundle(&self.pod, &spec.id, &staged)
+            .publish_bundle_with_root(&self.pod, &spec.id, &staged, view)
             .await?;
         self.call(&spec.id, Operation::Create).await?;
         Ok(image.image_id)
@@ -284,6 +323,10 @@ impl SandboxBackend for VmBackend {
         }
         self.store.remove_bundle(&self.pod, id).await?;
         self.discard_stage(id)?;
+        let backing = self.backing_bundle(id);
+        tokio::task::spawn_blocking(move || snapshot::remove(&backing))
+            .await
+            .map_err(|e| Error::Runtime(format!("remove VM backing bundle: {e}")))??;
         Ok(())
     }
 }

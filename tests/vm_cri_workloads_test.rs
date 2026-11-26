@@ -15,6 +15,7 @@ use nautilus::Config;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -58,6 +59,16 @@ fn cache_image(images: &Path) -> Result<String> {
     h.set_gid(0);
     h.set_mtime(0);
     tar.append_data(&mut h, "bin/busybox", bb.as_slice())?;
+    for path in ["workspace/image-file", "workspace/image-delete"] {
+        let content = b"from-image\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_mode(0o644);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mtime(0);
+        tar.append_data(&mut h, path, content.as_slice())?;
+    }
     let blob = tar.into_inner()?;
     let layer_digest = digest(&blob);
     let arch = if std::env::consts::ARCH == "aarch64" {
@@ -339,7 +350,6 @@ async fn exec(cli: &mut Runtime, id: &str, program: &str) -> Result<Vec<u8>> {
 // but before renameat2. A public file of exactly the expected type and size is
 // still someone else's. Cleanup must release only the private staged inode.
 fn interrupted_volume(root: &Path, pod: &str, container: &str) -> Result<(PathBuf, PathBuf, u64)> {
-    use std::os::unix::fs::MetadataExt;
     let store = root.join("state/vms");
     let slot = Uuid::new_v4().to_string();
     let stage = store.join(pod).join(".volume-stage").join(&slot);
@@ -366,6 +376,36 @@ fn interrupted_volume(root: &Path, pod: &str, container: &str) -> Result<(PathBu
         }));
     fs::write(record, serde_json::to_vec(&owner)?)?;
     Ok((stage, public, foreign.metadata()?.ino()))
+}
+
+async fn unpublished_rootfs_removal(root: &Path, pod: &str) -> Result<()> {
+    let vms = root.join("state/vms");
+    let container = Uuid::new_v4().to_string();
+    let staged = vms.join(format!(".oci-{container}"));
+    let public = vms.join(pod).join("podfs/containers").join(&container);
+    fs::DirBuilder::new().mode(0o700).create(&staged)?;
+    fs::create_dir(&public)?;
+    fs::write(public.join("contents"), b"existing bundle")?;
+    let metadata = fs::metadata(&staged)?;
+    let identity = json!({"device":metadata.dev(), "inode":metadata.ino()});
+    let record = vms.join(format!("{pod}.json"));
+    let mut owner: serde_json::Value = serde_json::from_slice(&fs::read(&record)?)?;
+    owner["share"]["rootfs"]
+        .as_array_mut()
+        .context("rootfs receipts")?
+        .push(json!({
+            "container":container, "mount":0, "bundle":identity,
+            "placeholder":identity, "root":identity
+        }));
+    fs::write(record, serde_json::to_vec(&owner)?)?;
+    let store = nautilus::vm::owner::PodVmStore::new(vms);
+    store.remove_bundle(pod, &container).await?;
+    fs::remove_dir(&staged)?;
+    // Restarted cleanup can retry after the staging inode has been removed.
+    store.remove_bundle(pod, &container).await?;
+    ensure!(fs::read(public.join("contents"))? == b"existing bundle");
+    fs::remove_dir_all(public)?;
+    Ok(())
 }
 
 // These host mounts are confined to the disposable fixture. Drop them before
@@ -764,6 +804,20 @@ async fn scenario(
     let b = create(cli, &id, &pod, second)
         .await
         .context("create second")?;
+    let bundles = root.join("containers");
+    let a_pin = bundles.join(&a).join("snapshot.v1");
+    let b_pin = bundles.join(&b).join("snapshot.v1");
+    let expect_snapshot = a_pin.exists()
+        || b_pin.exists()
+        || std::env::var_os("NAUTILUS_VM_TEST_REQUIRE_SNAPSHOT").is_some();
+    if expect_snapshot {
+        let a_pin = fs::metadata(a_pin).context("first VM root must pin the snapshot")?;
+        let b_pin = fs::metadata(b_pin).context("second VM root must pin the snapshot")?;
+        ensure!((a_pin.dev(), a_pin.ino()) == (b_pin.dev(), b_pin.ino()));
+        let a_upper = fs::metadata(bundles.join(&a).join("upper"))?;
+        let b_upper = fs::metadata(bundles.join(&b).join("upper"))?;
+        ensure!((a_upper.dev(), a_upper.ino()) != (b_upper.dev(), b_upper.ino()));
+    }
     let initial = state(cli, &a).await?;
     ensure!(initial.image_id == image_id && initial.metadata.as_ref().unwrap().attempt == 2);
     for c in [&a, &b] {
@@ -778,6 +832,44 @@ async fn scenario(
                 == format!("{boot_a}\n").as_bytes()
         );
     }
+    exec(
+        cli,
+        &a,
+        "echo copied-up > image-file; /bin/busybox rm image-delete",
+    )
+    .await?;
+    ensure!(exec(cli, &a, "/bin/busybox cat image-file").await? == b"copied-up\n");
+    exec(cli, &a, "test ! -e image-delete").await?;
+    ensure!(
+        exec(cli, &b, "/bin/busybox cat image-file image-delete").await?
+            == b"from-image\nfrom-image\n"
+    );
+    let mut readonly = workload("readonly", image, "exec /bin/busybox sleep 300");
+    readonly
+        .linux
+        .as_mut()
+        .unwrap()
+        .security_context
+        .as_mut()
+        .unwrap()
+        .readonly_rootfs = true;
+    let readonly = create(cli, &id, &pod, readonly).await?;
+    cli.start_container(StartContainerRequest {
+        container_id: readonly.clone(),
+    })
+    .await?;
+    ensure!(
+        exec(
+            cli,
+            &readonly,
+            "if (echo forbidden > image-file) 2>/dev/null; then exit 1; fi; /bin/busybox cat image-file",
+        )
+        .await? == b"from-image\n"
+    );
+    cli.remove_container(RemoveContainerRequest {
+        container_id: readonly,
+    })
+    .await?;
     guest_stats(cli, &id, &other, &a, &b).await?;
     guest_cgroup_metrics(cli, &id, &a, &b).await?;
     ensure!(
@@ -882,6 +974,23 @@ async fn scenario(
             PathBuf::from(format!("/proc/{pid}/root/volumes")),
         ))
     };
+    let (_, worker_volumes) = fsd(&id)?;
+    let mountinfo = worker_volumes
+        .ancestors()
+        .nth(2)
+        .context("virtiofsd proc directory")?
+        .join("mountinfo");
+    let mounted_root = |container: &str| -> Result<bool> {
+        let suffix = format!("/containers/{container}/rootfs");
+        Ok(fs::read_to_string(&mountinfo)?.lines().any(|line| {
+            line.split_ascii_whitespace()
+                .nth(4)
+                .is_some_and(|path| path.ends_with(&suffix))
+        }))
+    };
+    if expect_snapshot {
+        ensure!(mounted_root(&a)? && mounted_root(&b)?);
+    }
     let (_, mounted) = fsd(&id)?;
     let (_, sibling) = fsd(&other)?;
     for slot in export.read_dir()? {
@@ -989,10 +1098,19 @@ async fn scenario(
 
     daemon_process.kill().await?;
     let (staging, foreign, foreign_ino) = interrupted_volume(root, &id, &a)?;
+    if expect_snapshot {
+        unpublished_rootfs_removal(root, &id).await?;
+    }
     let (new_daemon, new_client) = daemon(root).await?;
     *daemon_process = new_daemon;
     *cli = new_client;
     ensure!(boot_id(cli, &id).await? == boot_a && boot_id(cli, &other).await? == boot_b);
+    ensure!(exec(cli, &a, "/bin/busybox cat image-file").await? == b"copied-up\n");
+    exec(cli, &a, "test ! -e image-delete").await?;
+    ensure!(
+        exec(cli, &b, "/bin/busybox cat image-file image-delete").await?
+            == b"from-image\nfrom-image\n"
+    );
     ensure!(
         exec(cli, &a, "/bin/busybox cat /projected/key /data/token").await? == b"newfrom-guest\n"
     );
@@ -1076,8 +1194,10 @@ async fn scenario(
             })
             .await?;
         }
+        if expect_snapshot {
+            ensure!(!mounted_root(c)? && !bundles.join(c).exists());
+        }
         if c == &a {
-            use std::os::unix::fs::MetadataExt;
             ensure!(!staging.exists() && fs::metadata(&foreign)?.ino() == foreign_ino);
             fs::remove_file(&foreign)?;
             ensure!(export.read_dir()?.count() == 1 && fs::read(&hosts)? == b"updated hosts");
@@ -1222,6 +1342,7 @@ async fn verify_host_cleanup(root: &Path) -> Result<()> {
     for (dir, allowed) in [
         ("state/vms", &[".operations"][..]),
         ("state/vm-network", &[".operations"][..]),
+        ("containers", &[][..]),
         ("netns", &[][..]),
         ("ipam/ntcriw15", &["lock", "last_reserved_ip.0"][..]),
     ] {
@@ -1231,6 +1352,9 @@ async fn verify_host_cleanup(root: &Path) -> Result<()> {
         };
         for entry in entries {
             let entry = entry?;
+            if dir == "containers" && entry.file_name() == ".snapshots-v1" {
+                continue;
+            }
             ensure!(
                 entry.file_type()?.is_file()
                     && allowed.iter().any(|&name| entry.file_name() == name),

@@ -12,6 +12,7 @@ use std::path::Path;
 const STORE: &str = ".snapshots-v1";
 const PIN: &str = "snapshot.v1";
 const OWNER: &str = ".nautilus-bundle-v1";
+pub(crate) const VM_READONLY_ROOT: &str = ".vm-readonly-root";
 
 fn invalid(msg: &str) -> Error {
     Error::Storage(msg.into())
@@ -244,6 +245,7 @@ pub(super) fn publish_pull(
 /// Attach the shared tree, building on demand for an older store or a direct create.
 pub(super) fn prepare(
     bundle: &Path,
+    plain_rootfs: &Path,
     key: &str,
     options: &[String],
     unpack: impl Fn(&Path) -> Result<()>,
@@ -251,7 +253,7 @@ pub(super) fn prepare(
     let flags = mount_flags(options)?;
     let bundle = fs::canonicalize(bundle)?;
     if !overlay_path(&bundle, flags)? {
-        return unpack(&bundle.join("rootfs"));
+        return unpack(plain_rootfs);
     }
     let store = bundle
         .parent()
@@ -260,7 +262,7 @@ pub(super) fn prepare(
     let _lock = lock(&store, key)?;
     let tree = store.join(key);
     if !install(&tree, stage_tree(&store, key, flags, &unpack)?)? {
-        return unpack(&bundle.join("rootfs"));
+        return unpack(plain_rootfs);
     }
     fs::hard_link(tree.join("pin"), bundle.join(PIN))?;
     for name in ["upper", "work"] {
@@ -271,6 +273,28 @@ pub(super) fn prepare(
         serde_json::to_vec(options)?,
     )?;
     Ok(())
+}
+
+pub(crate) fn has_view(bundle: &Path) -> Result<bool> {
+    Ok(bundle.join(PIN).try_exists()?)
+}
+
+/// Keep a mounted snapshot alive after its temporary view namespace exits.
+pub(crate) fn clone_view(rootfs: &Path) -> Result<File> {
+    use libcontainer::syscall::{
+        linux::{self, LinuxSyscall},
+        Syscall,
+    };
+    use std::os::fd::AsRawFd;
+    let root = File::open(rootfs)?;
+    LinuxSyscall
+        .open_tree(
+            root.as_raw_fd(),
+            None,
+            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC | linux::AT_EMPTY_PATH,
+        )
+        .map(File::from)
+        .map_err(|e| Error::Storage(format!("clone snapshot mount: {e}")))
 }
 
 fn mount_view(bundle: &Path, tree: &Path, flags: MsFlags) -> nix::Result<()> {
@@ -511,7 +535,7 @@ mod tests {
         let bundle = temp.path().join("container");
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
         let key = key("config", b"manifest");
-        let err = prepare(&bundle, &key, &[], |root| {
+        let err = prepare(&bundle, &bundle.join("rootfs"), &key, &[], |root| {
             fs::write(root.join("partial"), b"uncommitted")?;
             Err(invalid("interrupted extraction"))
         });
@@ -558,13 +582,19 @@ mod tests {
             for bundle in &bundles {
                 fs::create_dir_all(bundle.join("rootfs")).unwrap();
                 scope.spawn(|| {
-                    prepare(bundle, &key, &["nosuid".into()], |root| {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        fs::write(root.join("file"), b"base")?;
-                        fs::hard_link(root.join("file"), root.join("alias"))?;
-                        fs::write(root.join("deleted"), b"base")?;
-                        Ok(())
-                    })
+                    prepare(
+                        bundle,
+                        &bundle.join("rootfs"),
+                        &key,
+                        &["nosuid".into()],
+                        |root| {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            fs::write(root.join("file"), b"base")?;
+                            fs::hard_link(root.join("file"), root.join("alias"))?;
+                            fs::write(root.join("deleted"), b"base")?;
+                            Ok(())
+                        },
+                    )
                     .unwrap();
                 });
             }

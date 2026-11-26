@@ -553,20 +553,19 @@ const DIRECTORY: OpenFlags = OpenFlags::O_RDONLY
     .union(OpenFlags::O_DIRECTORY)
     .union(OpenFlags::O_NOFOLLOW);
 
-fn writable_bytes(root: &Root, dev: u64, budget: Duration) -> Option<u64> {
-    let start = Instant::now();
+fn writable_bytes(root: &Root, dev: u64, deadline: Instant) -> Option<u64> {
     let mut directories = vec![PathBuf::from(".")];
     let mut seen = HashSet::new();
     let mut bytes = 0u64;
     while let Some(path) = directories.pop() {
-        if start.elapsed() >= budget {
+        if Instant::now() >= deadline {
             return None;
         }
         let directory = root.open_subpath(&path, DIRECTORY).ok()?;
         let fd_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
         // Keep the directory fd pinned as entries come and go in the container.
         for entry in fs::read_dir(fd_path).ok()? {
-            if start.elapsed() >= budget {
+            if Instant::now() >= deadline {
                 return None;
             }
             let entry = entry.ok()?;
@@ -599,6 +598,10 @@ fn filesystem_metric(
 }
 
 fn filesystem_stats(bundle: &Path) -> Option<FilesystemSample> {
+    filesystem_stats_until(bundle, Instant::now() + Duration::from_millis(250))
+}
+
+fn filesystem_stats_until(bundle: &Path, deadline: Instant) -> Option<FilesystemSample> {
     let bundle_path = bundle.canonicalize().ok()?;
     let bundle = Root::open(&bundle_path).ok()?;
     // OverlayFS charges changes to upper. A non-overlay container owns its
@@ -617,16 +620,23 @@ fn filesystem_stats(bundle: &Path) -> Option<FilesystemSample> {
     let metadata = fs::metadata(format!("/proc/self/fd/{fd}")).ok()?;
     let dev = metadata.dev();
     let stats = nix::sys::statvfs::fstatvfs(&directory).ok()?;
+    let readonly = bundle_path
+        .join(crate::storage::snapshot::VM_READONLY_ROOT)
+        .is_file();
     let root = Root::from_fd(directory);
     Some(FilesystemSample {
         device: device_name(libc::major(dev), libc::minor(dev)),
         inodes: Some(stats.files()),
         inodes_free: Some(stats.files_available()),
         capacity_bytes: Some(stats.blocks().checked_mul(stats.fragment_size())?),
-        usage_bytes: writable_bytes(&root, dev, Duration::from_millis(250)).and_then(|bytes| {
-            crate::storage::snapshot::check_unmounted(&layer).ok()?;
-            bytes.checked_add(metadata.blocks().checked_mul(512)?)
-        }),
+        usage_bytes: if readonly {
+            None
+        } else {
+            writable_bytes(&root, dev, deadline).and_then(|bytes| {
+                crate::storage::snapshot::check_unmounted(&layer).ok()?;
+                bytes.checked_add(metadata.blocks().checked_mul(512)?)
+            })
+        },
     })
 }
 
@@ -968,6 +978,47 @@ impl NautilusRuntimeService {
             .map_err(Status::from)?;
         if pod.runtime_handler == "vm" {
             let (sample, mut samples) = self.guest_pod_metric_samples(pod).await?;
+            let mut upper_layers = Vec::new();
+            for container in &containers {
+                let bundle = self._config.storage.container_dir.join(&container.id);
+                if let Some(filesystem) = samples
+                    .get_mut(&container.id)
+                    .and_then(|sample| sample.filesystem.as_mut())
+                    .filter(|_| crate::storage::snapshot::has_view(&bundle).unwrap_or(false))
+                {
+                    // Preserve guest device, capacity and inode fields. Its
+                    // merged view cannot distinguish upper and lower blocks.
+                    filesystem.usage_bytes = None;
+                    upper_layers.push((container.id.clone(), bundle));
+                }
+            }
+            static UPPER_SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+            if !upper_layers.is_empty() {
+                if let Ok(permit) = UPPER_SCANS.try_acquire() {
+                    let budget = Duration::from_millis(100);
+                    let deadline = Instant::now() + budget;
+                    let task = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        upper_layers
+                            .into_iter()
+                            .take_while(|_| Instant::now() < deadline)
+                            .filter_map(|(id, path)| {
+                                Some((id, filesystem_stats_until(&path, deadline)?.usage_bytes?))
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    if let Ok(Ok(usages)) = tokio::time::timeout(budget, task).await {
+                        for (id, bytes) in usages {
+                            if let Some(filesystem) = samples
+                                .get_mut(&id)
+                                .and_then(|sample| sample.filesystem.as_mut())
+                            {
+                                filesystem.usage_bytes = Some(bytes);
+                            }
+                        }
+                    }
+                }
+            }
             let mut container_metrics = Vec::new();
             for container in containers {
                 if let Some(sample) = samples.remove(&container.id) {

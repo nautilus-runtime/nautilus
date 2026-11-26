@@ -69,7 +69,7 @@ exec 和 attach 的 `stream` 带有可选布尔值 `stdin`、`stdout`、`stderr`
 
 ## OCI 交付
 
-宿主在独占 podfs 的 `containers/<containerId>/` 原子发布完整的 `config.json` 和 `rootfs/`，待 guest remove 成功才回收。agent 将导出挂在 `/run/nautilus/share`，从固定位置读取，随后把审核后的 spec 写入仅 guest 可见的 bundle，调用静态 runc。宿主必须保证各容器使用独立可写 rootfs，授权卷和 bundle 在其使用期内不可替换。工作负载只能访问自己的 rootfs 和显式挂载的卷。
+宿主在独占 podfs 的 `containers/<containerId>/` 发布完整的 `config.json` 和 `rootfs/`，再调用 guest create。rootfs 可来自只读镜像快照和容器私有 upper 的合成视图，也可来自逐容器解包。宿主在 guest remove 成功后回收 bundle。agent 将导出挂在 `/run/nautilus/share`，从固定位置读取，随后把审核后的 spec 写入仅 guest 可见的 bundle，调用静态 runc。宿主必须保证各容器拥有独立的可写数据、授权卷和 bundle 在其使用期内不可替换。工作负载只能访问自己的 rootfs 和显式挂载的卷。
 
 - `ociVersion` 支持 1.0.2、1.1.0、1.2.0。`root.path` 必须是 `rootfs`，接受 `root.readonly`。配置不超过 256 KiB。
 - `process` 接受 `args`、`env`、规范的绝对 `cwd`、数字 `user.uid/gid/additionalGids`。`terminal=true` 分配真实 PTY，要求 `noNewPrivileges=true`，能力集仅接受空集合。exec 复用该进程的环境、安全设置、用户和目录。guest 拒绝未实现的配置字段。

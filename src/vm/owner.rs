@@ -74,6 +74,8 @@ struct Share {
     volume_stage: Option<FileIdentity>,
     volume_catalog_mount: Option<u64>,
     bindings: Vec<volume::Binding>,
+    #[serde(default)]
+    rootfs: Vec<share::RootfsMount>,
     invocation: Option<String>,
     socket: Option<FileIdentity>,
     pid_file: Option<FileIdentity>,
