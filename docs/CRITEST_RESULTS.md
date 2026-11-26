@@ -18,6 +18,12 @@ Cloud Hypervisor v55.0、virtiofsd 1.13.2 和真实 CRI 的 VM 工作负载与 d
 
 完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**107 通过、0 失败、35 跳过**，耗时 314.576 秒，结束时无残留 Pod 或容器。
 
+## 2026-11-26 Pod VM 流式交互恢复
+
+在 `pro6000` 的 Debian 13 嵌套 KVM 节点验证 `5ab551a`。宿主运行 Linux `6.12.118+deb13-cloud-amd64`，使用 Cloud Hypervisor `v55.0` 和 virtiofsd `1.13.2`。分别在交互 exec、3 MiB 二进制 stdin 和 attach 前短暂隐藏 guest vsock，并通过 CRI 确认容器状态变为 `Unknown`。恢复原 socket 后，上游 `crictl v1.37.0` 首次请求即成功，三个场景无需先调用 `ContainerStatus` 刷新。另以相同生产代码连续完成 20 次 3 MiB 二进制往返。
+
+未过滤的 `critest v1.37.0` 使用同一个 CRI socket 的 runtime 和 image 端点，结果为 **107 通过、0 失败、35 跳过**（287.442 秒），结束后 Pod 和容器均为零。Linux Rust 测试完整复跑为 134 通过、0 失败、8 项默认忽略。严格 Clippy 与基线相同，仍有 29 项诊断。全库格式检查沿用存量差异。
+
 ## 2026-11-25 原生 OCI CPU 与内存原地调整
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118、systemd 257）验证 `48c4112`。未修改 resize 相关配置的 kubelet v1.37.2 通过 Pod `/resize` 完成 Guaranteed 和 Burstable Pod 的升配与降配。Guaranteed Pod 从 250m/128 MiB 调到 500m/256 MiB，再调到 300m/96 MiB。容器 ID、PID、启动时间和重启次数均保持原值，CRI、Kubernetes、容器和 Pod cgroup 以及 systemd scope 报告一致，调整结束后容器已解冻。
