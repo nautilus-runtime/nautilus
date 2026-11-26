@@ -34,7 +34,8 @@ check-protoc: ## 检查 protoc 能否编译 vendored CRI schema
 .PHONY: release
 release: check-protoc ## 构建生产版本
 	@echo "🚀 构建 Nautilus 生产版本..."
-	$(CARGO) build --locked --release --target $(TARGET) --target-dir $(CARGO_TARGET_DIR)
+	# Keep install-time make overrides out of Cargo's native dependency builds.
+	env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES $(CARGO) build --locked --release --target $(TARGET) --target-dir $(CARGO_TARGET_DIR)
 	@echo "✅ 生产版本构建完成"
 
 .PHONY: debug
