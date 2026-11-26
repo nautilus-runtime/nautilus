@@ -78,6 +78,25 @@ fn sandbox_state(status: &PodStatus) -> PodSandboxState {
 }
 
 fn pod_status(pod: PodState, state: PodSandboxState) -> PodSandboxStatus {
+    let namespace_options = if pod.vm_attempt.is_some() {
+        Some(NamespaceOption {
+            pid: NamespaceMode::Container as i32,
+            ..Default::default()
+        })
+    } else if matches!(pod.runtime_handler.as_str(), "" | "runc") {
+        let network = if pod.host_network {
+            NamespaceMode::Node
+        } else {
+            NamespaceMode::Pod
+        };
+        Some(NamespaceOption {
+            network: network as i32,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
     runtime::v1::PodSandboxStatus {
         id: pod.id.clone(),
         metadata: Some(runtime::v1::PodSandboxMetadata {
@@ -92,17 +111,11 @@ fn pod_status(pod: PodState, state: PodSandboxState) -> PodSandboxStatus {
             ip: pod.network_ip.clone(),
             additional_ips: Vec::new(),
         }),
-        linux: pod
-            .vm_attempt
-            .as_ref()
-            .map(|_| runtime::v1::LinuxPodSandboxStatus {
-                namespaces: Some(runtime::v1::Namespace {
-                    options: Some(runtime::v1::NamespaceOption {
-                        pid: runtime::v1::NamespaceMode::Container as i32,
-                        ..Default::default()
-                    }),
-                }),
+        linux: namespace_options.map(|options| LinuxPodSandboxStatus {
+            namespaces: Some(Namespace {
+                options: Some(options),
             }),
+        }),
         labels: pod.labels,
         annotations: pod.annotations,
         runtime_handler: pod.runtime_handler,
