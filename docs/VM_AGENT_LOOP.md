@@ -19,7 +19,7 @@
 
 ## 测量方法
 
-- 冷启动从 `crictl runp` 前开始，经过 CreateContainer、StartContainer，直至首条 ExecSync 返回合法的 guest boot ID。这个口径使用已拉取的镜像，包含每次建容器准备独立 rootfs 的时间。每个并发波次校验 sandbox ID、容器 ID、Pod IP 和 boot ID 各不相同。现有 VM 后端对每个 CreateContainer 调用 `materialize_rootfs`，从缓存的镜像层解包到该容器的独立目录。[VM 容器创建](../src/sandbox/vm_backend.rs) [镜像物化](../src/storage/pull.rs)
+- 冷启动从 `crictl runp` 前开始，经过 CreateContainer、StartContainer，直至首条 ExecSync 返回合法的 guest boot ID。这个口径使用已拉取的镜像，包含每次建容器准备独立 rootfs 的时间。每个并发波次校验 sandbox ID、容器 ID、Pod IP 和 boot ID 各不相同。本节的历史基线在快照复用前采集，每次 VM CreateContainer 都把缓存镜像层解包到独立目录。[VM 容器创建](../src/sandbox/vm_backend.rs) [镜像物化](../src/storage/pull.rs)
 - 热调用在同一容器内顺序读上次写入的值，再写入本次结果。每个耗时包含启动本地 crictl、CRI、vsock、guest runc 和工具进程，以及将输出读回客户端。首轮要求状态文件尚不存在，之后每轮必须读取并核对上一轮的值。所有 P50 和 P95 使用样本排序后的最近秩。同一波的每个会话顺序做 10 次调用，会话之间并行。聚合吞吐量由每波总调用数除以该波热调用阶段墙钟时间得出。
 - 会话启动并完成该波安排的模型工作后，空闲 1 秒，再按 VMM 和 virtiofsd 各自的 systemd ControlGroup 枚举进程，从 `/proc/PID/smaps_rollup` 读取并汇总 PSS。每项原始记录含对应 PID、cgroup `memory.current` 和约束值，PSS 单位换算为 MiB。它衡量运行 Pod VM 的节点上这两项服务的实际驻留物理内存份额，节点上的 daemon 和镜像文件缓存另计。
 - 取消通过主动关闭一条已在 guest 启动子进程的 ExecSync 客户端触发。记录子进程的 Linux 状态和同一 guest 继续执行的结果，再由 CRI 停止和删除会话。每波结束都对照测试前的 VMM/virtiofsd 服务、owner、网络记录、netns、IPAM 租约，以及节点 mountinfo 中配置的运行、容器、存储、临时和网络目录内的挂载。结束时还按运行标签查验剩余 CRI 容器和 sandbox 数。

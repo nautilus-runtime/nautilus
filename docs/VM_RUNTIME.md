@@ -107,7 +107,7 @@ sudo --preserve-env=NAUTILUS_CNI_BIN_DIR,NAUTILUS_VM_VMM,NAUTILUS_VM_KERNEL,NAUT
 
 用 `guest/build-workload-initramfs.sh` 构建工作负载镜像。每个容器独立持有 OCI rootfs、PID namespace 和 guest runc 实例，通过认证的 vsock 连接进行生命周期和 ExecSync 操作。宿主按 guest 提供的日志偏移写入 kubelet 日志。日志文件系统需支持 `O_TMPFILE` 和用户扩展属性，宿主先持久化匿名 inode 的身份，再发布 kubelet 使用的文件名。[guest 协议](GUEST_OCI_PROTOCOL.md)
 
-`tests/vm_cri_workloads_test.rs` 在独立网络命名空间启动真实 daemon，使用带摘要的本地 OCI 镜像测试两个 Pod、同 Pod 的两个容器、十次连续 exec、日志、超时、断连、daemon 重启和重复删除。运行时设置 `NAUTILUS_VM_VMM`、`NAUTILUS_VM_KERNEL`、`NAUTILUS_VM_INITRAMFS`、`NAUTILUS_VM_VIRTIOFSD`、`NAUTILUS_CNI_BIN_DIR` 和指向静态 BusyBox 的 `NAUTILUS_TEST_BUSYBOX`，再执行 `cargo test --locked --test vm_cri_workloads_test -- --ignored --nocapture`。
+`tests/vm_cri_workloads_test.rs` 在独立网络命名空间启动真实 daemon，使用带摘要的本地 OCI 镜像测试两个 Pod、同 Pod 的两个容器、十次连续 exec、日志、超时、断连、daemon 重启和重复删除。运行时设置 `NAUTILUS_VM_VMM`、`NAUTILUS_VM_KERNEL`、`NAUTILUS_VM_INITRAMFS`、`NAUTILUS_VM_VIRTIOFSD`、`NAUTILUS_CNI_BIN_DIR` 和指向静态 BusyBox 的 `NAUTILUS_TEST_BUSYBOX`，再执行 `cargo test --locked --test vm_cri_workloads_test -- --ignored --nocapture`。在支持 OverlayFS 的节点同时设置 `NAUTILUS_VM_TEST_REQUIRE_SNAPSHOT=1`，可强制验证两个容器固定同一快照、upper 各自独立、写入与删除互相隔离、只读 rootfs 拒绝写入，以及重启后内容与清理结果。
 
 在上述测试环境中设置 `NAUTILUS_TEST_CRICTL` 指向上游 crictl v1.37.0，即可同时运行真实客户端的 SPDY 验收。测试先读取一行 stdout，再写入 stdin，检查单独的 stderr 和退出码 35。它还验证终端尺寸变化、两次 attach 连到同一 init PID 1、断连后取消 exec、guest 回环端口的成功连接与拒绝，以及一次性 URL 的重用拒绝。
 
@@ -175,6 +175,8 @@ Kata Containers 4.4.0 经 containerd 向 Kubernetes 提供 VM RuntimeClass。其
 
 #16 分为 [#21 宿主卷实时交付](https://github.com/nautilus-runtime/nautilus/issues/21)、[#23 Exec / Attach / PortForward](https://github.com/nautilus-runtime/nautilus/issues/23) 和 [#22 真实 kubelet 及 RuntimeClass 验收](https://github.com/nautilus-runtime/nautilus/issues/22)。前两项可独立开发，最后一项在真实集群核对两条路径。
 
-首版使用每个 Pod 专属的 virtiofsd 导出容器 bundle。宿主复用 Nautilus 拉取的 OCI 镜像，为每个容器准备独立 rootfs。对 CRI 卷只开放已能兑现权限、读写和传播语义的类型。Kata 4.4.0 的 Cloud Hypervisor 配置也默认使用 virtio-fs，并为块设备 snapshotter 提供单独的接入路径。[Kata Go runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/Makefile#L266-L267) · [Kata Rust runtime 默认配置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime-rs/Makefile#L240) · [Kata 存储设计](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture/storage.md)
+每个 Pod 使用专属的 virtiofsd 导出容器 bundle。Kata 4.4.0 的 Rust runtime 将宿主传入的 rootfs 挂载后通过 virtio-fs 共享，containerd v2.4.2 的 OverlayFS snapshotter 为每个 active snapshot 分配独立的可写层并复用已提交的父层。Firecracker v1.18.0 的块设备接口使用宿主文件作为磁盘后端。Nautilus 沿用现有 virtio-fs bundle 路径，复用 PullImage 生成的不可变镜像树，避免为每个容器建立磁盘或重新解包镜像。[Kata 4.4.0 rootfs 共享](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime-rs/crates/resource/src/rootfs/share_fs_rootfs.rs) · [containerd v2.4.2 OverlayFS snapshotter](https://github.com/containerd/containerd/blob/v2.4.2/plugins/snapshots/overlay/overlay.go) · [Firecracker v1.18.0 块设备](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/block.md)
+
+每个 VM 容器在宿主私有目录持有独立的 `upper`、`work` 和快照引用。daemon 将合成视图接入该 Pod 的 virtiofsd 挂载命名空间，guest 仍从 `containers/<id>/rootfs` 启动 OCI 容器。挂载前记录 bundle 和挂载身份，删除时先回收 guest 容器，再卸载视图、释放引用。镜像清理会保留仍有引用的树。关闭 OverlayFS、存储不满足快照探测条件或沿用早期 Pod 的导出时，使用原有逐容器解包路径。扩展文件系统指标沿用 guest 的容量与设备标签，可写用量只计算当前容器的 upper，并受单次采样预算约束。[Issue #76](https://github.com/nautilus-runtime/nautilus/issues/76)
 
 首版范围为 Linux CPU 工作负载。GPU 直通、跨主机迁移和 VM 快照需要独立的资源与一致性设计。Firecracker 和 Dragonball 保留为后续 VMM 候选。工作负载兼容性由 CRI 验收结果决定，节点探针与性能测量单独记录。
