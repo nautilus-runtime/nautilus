@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-26 Pod VM OCI 镜像快照复用
+
+在 pro6000 的隔离 Debian 13 KVM 节点验证 Nautilus Release 构建 `8526792`，宿主 Linux `6.12.118+deb13-cloud-amd64`、Cloud Hypervisor `v55.0`、virtiofsd `1.13.2`、guest Linux `5.15.0-191-generic`。真实 CRI 验证同一镜像快照可供同 Pod 的两个容器使用，各有独立的 upper，镜像文件的写入和删除互相隔离。验证了只读根、daemon 重启后写入保留、发布中断后的重复回滚、容器删除后即时卸载、virtiofsd 异常退出和最终零残留。关闭 OverlayFS 后重复运行同一 VM 场景，逐容器解包路径也通过。[Issue #76](https://github.com/nautilus-runtime/nautilus/issues/76)
+
+未过滤的 `critest v1.37.0` 对同一隔离 Unix socket 验证 Runtime 和 Image，**107 通过、0 失败、35 跳过**（289.950 秒），剩余 Pod 和容器各为 0。Linux Rust 测试 139 通过、0 失败、8 项默认忽略。严格 Clippy 维持基线的 29 项诊断，格式检查仍涉及基线的 31 个文件。[同镜像与配额的 Kata A/B](VM_AGENT_LOOP.md#oci-rootfs-快照复用-ab)
+
 ## 2026-11-26 Pod VM guest 文件系统、进程与网络扩展指标
 
 在 pro6000 的隔离 Debian 13 KVM 节点验证 `780b258`。宿主 Linux `6.12.118+deb13-cloud-amd64`，Cloud Hypervisor `v55.0`，virtiofsd `1.13.2`，guest Linux `5.15.0-191-generic`。真实 kubelet `v1.37.2` 的 `/metrics/cadvisor` 与 CRI 列表和读至 EOF 的流式列表核对了两台 VM Pod、三个容器的 **118 条序列、29 个指标族**。同一 daemon 对运行中的旧 agent 回退到 `podStats`，保留全部 65 条原有 CPU 和内存序列。
