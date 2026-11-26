@@ -75,11 +75,12 @@ func success(s status) response          { return response{OK: true, status: s} 
 
 type server struct {
 	identity
-	mu         sync.Mutex
-	containers map[string]*container
-	execSlots  chan struct{}
-	statsMu    sync.Mutex
-	cpu        cpuHistory
+	mu           sync.Mutex
+	containers   map[string]*container
+	execSlots    chan struct{}
+	statsMu      sync.Mutex
+	filesystemMu sync.Mutex
+	cpu          cpuHistory
 }
 
 func strictJSON(input []byte, v any) error {
@@ -117,9 +118,9 @@ func writeResponse(w io.Writer, res response) error {
 		return err
 	}
 	// Keep basic stats available for Pods whose extended sample exceeds the wire limit.
-	res.Stats.CgroupCounters = nil
+	res.Stats.clearOptionalMetrics()
 	for id, child := range res.Containers {
-		child.CgroupCounters = nil
+		child.clearOptionalMetrics()
 		res.Containers[id] = child
 	}
 	return writeFrame(w, res)

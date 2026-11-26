@@ -73,14 +73,14 @@ func TestRootFilesystemCountsOwnedAllocatedBlocks(t *testing.T) {
 	}
 	defer dir.Close()
 
-	got := readRootFilesystem(dir, false)
+	got := readRootFilesystem(dir, false, time.Now().Add(time.Second))
 	if got == nil || got.UsageBytes == nil || *got.UsageBytes != expected {
 		t.Fatalf("usage returned %+v, expected %d bytes", got, expected)
 	}
 	if got.CapacityBytes == nil || *got.CapacityBytes < expected || got.Inodes == nil || got.InodesFree == nil {
 		t.Fatalf("backing filesystem geometry missing: %+v", got)
 	}
-	if readonly := readRootFilesystem(dir, true); readonly == nil || readonly.UsageBytes != nil {
+	if readonly := readRootFilesystem(dir, true, time.Now().Add(time.Second)); readonly == nil || readonly.UsageBytes != nil {
 		t.Fatalf("readonly sample: %+v", readonly)
 	}
 

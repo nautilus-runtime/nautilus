@@ -31,6 +31,14 @@ type sample struct {
 	Network        map[string][8]uint64         `json:"network,omitempty"`
 }
 
+func (s *sample) clearOptionalMetrics() {
+	s.CgroupCounters = nil
+	s.Filesystem = nil
+	s.BlockIO = nil
+	s.Process = nil
+	s.Network = nil
+}
+
 func counters(path string, names ...string) (map[string]uint64, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

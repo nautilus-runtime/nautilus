@@ -231,6 +231,7 @@ impl Channel {
                 Duration::from_millis((*timeout_ms).try_into().map_err(invalid)?)
                     .saturating_add(Duration::from_secs(10)),
             ),
+            Operation::PodMetrics => Some(Duration::from_secs(5)),
             _ => Some(Duration::from_secs(30)),
         };
         let request = Request {

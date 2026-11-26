@@ -43,40 +43,93 @@ func (s *server) podStats(extended bool) response {
 	}
 	s.mu.Unlock()
 
-	deadline := time.Now().Add(250 * time.Millisecond)
 	children := make(map[string]sample)
+	var running []*container
 	for _, c := range known {
 		c.mu.Lock()
 		if c.current().State == "running" {
 			data, err := c.sample()
-			if err == nil && extended {
-				group := filepath.Join(podCgroup, c.id)
-				data.BlockIO = readBlockIO(group)
-				data.Process = readProcessSample(group, deadline)
-				if time.Now().Before(deadline) {
-					data.Filesystem = readContainerFilesystem(c.id, c.dir)
-				}
-			}
 			c.mu.Unlock()
 			if err != nil {
 				return fail("unavailable", err)
 			}
 			children[c.id] = data
+			if extended {
+				running = append(running, c)
+			}
 		} else {
 			c.mu.Unlock()
 		}
 	}
 	s.statsMu.Lock()
-	defer s.statsMu.Unlock()
 	parent, err := readSample(podCgroup)
+	if err == nil {
+		s.cpu.update(&parent, time.Now())
+	}
+	s.statsMu.Unlock()
 	if err != nil {
 		return fail("unavailable", err)
 	}
-	s.cpu.update(&parent, time.Now())
 	if extended {
+		deadline := time.Now().Add(250 * time.Millisecond)
 		parent.BlockIO = readBlockIO(podCgroup)
 		parent.Process = readProcessSample(podCgroup, deadline)
 		parent.Network = readPodNetwork()
+		for _, c := range running {
+			data := children[c.id]
+			group := filepath.Join(podCgroup, c.id)
+			data.BlockIO = readBlockIO(group)
+			data.Process = readProcessSample(group, deadline)
+			children[c.id] = data
+		}
+		s.sampleFilesystems(running, children, deadline)
+		s.mu.Lock()
+		for _, c := range running {
+			if s.containers[c.id] != c {
+				delete(children, c.id)
+			}
+		}
+		s.mu.Unlock()
 	}
 	return response{OK: true, Stats: &parent, Containers: children}
+}
+
+func (s *server) sampleFilesystems(running []*container, children map[string]sample, deadline time.Time) {
+	if len(running) == 0 || !time.Now().Before(deadline) || !s.filesystemMu.TryLock() {
+		return
+	}
+	// A stalled virtio-fs syscall must not hold a lifecycle lock or occupy more
+	// than one worker per guest. A later request can still return local stats.
+	type reading struct {
+		id         string
+		filesystem *filesystemSample
+	}
+	results := make(chan reading, len(running))
+	go func() {
+		defer close(results)
+		defer s.filesystemMu.Unlock()
+		for _, c := range running {
+			if !time.Now().Before(deadline) {
+				return
+			}
+			if filesystem := readContainerFilesystem(c.id, c.dir, deadline); filesystem != nil {
+				results <- reading{c.id, filesystem}
+			}
+		}
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				return
+			}
+			data := children[result.id]
+			data.Filesystem = result.filesystem
+			children[result.id] = data
+		case <-timer.C:
+			return
+		}
+	}
 }

@@ -123,7 +123,7 @@ func parseBlockIO(data []byte) []blockIOSample {
 const storageLookup = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV
 const storageDirectory = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC
 
-func readContainerFilesystem(id string, privateBundle string) *filesystemSample {
+func readContainerFilesystem(id string, privateBundle string, deadline time.Time) *filesystemSample {
 	if !validID(id) {
 		return nil
 	}
@@ -153,10 +153,10 @@ func readContainerFilesystem(id string, privateBundle string) *filesystemSample 
 	}
 	dir := os.NewFile(uintptr(fd), path)
 	defer dir.Close()
-	return readRootFilesystem(dir, config.Root.Readonly)
+	return readRootFilesystem(dir, config.Root.Readonly, deadline)
 }
 
-func readRootFilesystem(dir *os.File, readonly bool) *filesystemSample {
+func readRootFilesystem(dir *os.File, readonly bool, deadline time.Time) *filesystemSample {
 	s := filesystemSample{Device: "virtiofs:podfs"}
 	var stats unix.Statfs_t
 	if unix.Fstatfs(int(dir.Fd()), &stats) == nil {
@@ -177,7 +177,7 @@ func readRootFilesystem(dir *os.File, readonly bool) *filesystemSample {
 		// VM images are materialized as a private rootfs, including the image
 		// blocks. Volume mounts and guest-visible pseudo filesystems are outside it.
 		walk := storageWalk{
-			until: time.Now().Add(100 * time.Millisecond),
+			until: min(deadline, time.Now().Add(100*time.Millisecond)),
 			seen:  make(map[uint64]bool),
 		}
 		if walk.directory(dir, 0) {
