@@ -37,7 +37,7 @@ h1 em { font-family: "Georgia", serif; font-weight: 500; color: var(--mint); }
 .art img { width: 85%; height: auto; }
 .workloads { background: var(--paper); color: #162630; padding-block: 4rem; }
 h2 { font-size: clamp(1.9rem, 3.5vw, 3.1rem); letter-spacing: -.05em; line-height: 1.1; }
-.examples { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2.5rem; margin-top: 2rem; }
+.examples { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); gap: 2rem; margin-top: 2rem; }
 article { display: grid; grid-template-rows: auto 1fr auto; border-top: 2px solid #99afa9; padding-top: 1.2rem; }
 h3 { font-size: 1.4rem; letter-spacing: -.035em; }
 article p { line-height: 1.65; color: #3e5057; }
