@@ -137,9 +137,12 @@ Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 
 每个容器在 guest 的 `/sys/fs/cgroup/nautilus/<containerId>` 计量，包含该容器的 init 和 exec 后代。Pod 采样读取 `/sys/fs/cgroup/nautilus` 的层级计数，可累计已退出子 cgroup 的 CPU。guest init 和 agent 在该子树之外。一次经启动身份校验的 vsock 请求传回 Pod 及其运行中容器的采样，宿主按已记录的 Pod 归属补上 ID、标签和 attempt。[guest 协议](GUEST_OCI_PROTOCOL.md)
 
 - CPU 累计值将 `cpu.stat usage_usec` 换算成纳秒。第二次采样与前一次至少相隔一秒时，agent 用单调时钟间隔计算平均 nanocores；更密集的请求沿用最近一次已测速率。
-- 使用量为 `memory.current`。工作集为使用量减 `memory.stat inactive_file`，下限为零。RSS 取匿名内存 `anon` 加内核提供的 `swapcached`；随附的 initramfs 不启用 swap，旧内核无该字段时交换缓存为零。次缺页为 `pgfault - pgmajfault`，下限为零，主缺页取 `pgmajfault`。有限的 `memory.max` 减工作集得到可用内存。无限额时省略可用内存。I/O、PSI、网络等可选字段待独立采样后提供。[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- 使用量为 `memory.current`。工作集为使用量减 `memory.stat inactive_file`，下限为零。RSS 取匿名内存 `anon` 加内核提供的 `swapcached`；随附的 initramfs 不启用 swap，旧内核无该字段时交换缓存为零。次缺页为 `pgfault - pgmajfault`，下限为零，主缺页取 `pgmajfault`。有限的 `memory.max` 减工作集得到可用内存。无限额时省略可用内存。基础统计请求保持轻量。独立的 `podMetrics` 使用同一 guest 身份校验，并为扩展采样设置单独预算。[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 - 验收通过真实 daemon 的四个 CRI 统计 RPC，令同一 Pod 的一个容器写入 16 MiB tmpfs 并计算摘要，另一个容器休眠。核对两者 CPU 增量、内存差异、Pod 汇总、列表的 ID 与标签组合筛选，以及另一个 guest 断连期间的可用性。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
-- 扩展指标从同一采样读取 user/system CPU、CFS 周期和限流、内存缓存/匿名页/内核内存/映射文件及缺页计数。Pod 和容器各自报告本级 CFS 限流，Pod 计数不累加子 cgroup 的限流。验收令设定 CPU 配额的 VM 容器运行 CPU 密集任务，检查其限流计数增加、空闲邻居计数稳定、Pod 样本包含 tmpfs 对应缓存。两种 CRI 指标列表从同一来源采样。旧 agent 提供基础 CPU 和内存指标。块 I/O、文件系统、网络及进程指标继续在 [#40](https://github.com/nautilus-runtime/nautilus/issues/40) 跟踪。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
+- 扩展指标从同一采样读取 user/system CPU、CFS 周期和限流、内存缓存/匿名页/内核内存/映射文件及缺页计数。Pod 和容器各自报告本级 CFS 限流，Pod 计数不累加子 cgroup 的限流。验收令设定 CPU 配额的 VM 容器运行 CPU 密集任务，检查其限流计数增加、空闲邻居计数稳定、Pod 样本包含 tmpfs 对应缓存。两种 CRI 指标列表从同一来源采样。旧 agent 继续提供原有 CPU 和内存指标。[CRI 验收程序](../tests/vm_cri_workloads_test.rs)
+
+- Pod 网络在 guest 内按接口采样一次，过滤回环和 cAdvisor 排除的接口。进程、FD、socket 和任务按各自 guest cgroup 归属，扫描分组与进程身份无法核实时省略对应值。
+- 容器文件系统容量、inode 和用量来自独占的物化 rootfs。用量包含该副本的镜像块，容量反映承载文件系统。扫描按 inode 去重，限制目录遍历并排除挂载卷。每个 guest 同时只有一个文件系统采样 worker，超出等待预算时仍返回其他指标。Kata 4.4.0 同样在容器生命周期锁之外调用阻塞的统计读取。块 I/O 使用 guest 的 `io.stat`，当前 virtio-fs 根盘没有 guest 块设备时省略设备计数。Firecracker v1.18.0 的 VMM 设备指标描述整台 VM。 [Kata agent](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/agent/src/rpc.rs#L1035-L1068) · [Firecracker metrics](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/metrics.md) · [CRI 验证记录](CRITEST_RESULTS.md)
 
 ## 独立 CLI 工作负载和 kubelet
 

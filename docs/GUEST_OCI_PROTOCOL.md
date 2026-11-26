@@ -7,7 +7,7 @@
 1. 宿主写入 ASCII `CONNECT 4083\n`，读完 Cloud Hypervisor 的 `OK <port>\n`。
 2. guest 先发 hello。每个帧均为 **4 字节大端无符号长度 + 对应字节数的 UTF-8 JSON**。hello 为 `{"version":1,"sandboxId":"…","nonce":"…","bootId":"…"}`。宿主逐项核对自己的该次启动记录，再发送命令。绑定到同一连接可以在向对端发送 nonce 前识别错误端点。
 3. 宿主发送一个请求，保持连接的写端打开，读取一个应答。每个连接执行一次调用。host 读帧时必须限制应答长度在 1 MiB 内，同时校验协议版本、请求 ID 和 `ok`。guest 限制请求为 1–65536 字节，接收预算 3 秒。错误帧长和传输截断会关闭连接。
-4. 请求包含 hello 的四个字段、`requestId` 和 `op`。容器操作还包含 `containerId`，`podStats` 省略它。四种 ID 均为小写、带连字符的非零 UUID。`requestId` 由宿主为每次调用生成。VM 重启后，旧 bootId 失效。宿主可关闭 exec 连接取消执行。
+4. 请求包含 hello 的四个字段、`requestId` 和 `op`。容器操作还包含 `containerId`，`podStats` 和 `podMetrics` 省略它。四种 ID 均为小写、带连字符的非零 UUID。`requestId` 由宿主为每次调用生成。VM 重启后，旧 bootId 失效。宿主可关闭 exec 连接取消执行。
 
 | op | 额外字段 | 成功应答 |
 | --- | --- | --- |
@@ -16,6 +16,7 @@
 | `status` | 无 | 返回 `state`，取值 `created`、`running` 或 `exited`。 |
 | `stats` | 无 | 返回该运行中容器 cgroup 的 `stats`。 |
 | `podStats` | 无 | 返回工作负载父 cgroup 的 `stats` 和以运行中容器 ID 为键的 `containers` 采样表。无运行中容器时可省略表。 |
+| `podMetrics` | 无 | 与 `podStats` 相同，可附加当前 guest 可归属的文件系统、块 I/O、进程和网络样本。 |
 | `exec` | `argv` 非空数组，最多 256 项。`timeoutMs` 为 0–300000 的整数。0 表示执行无时间上限。 | 返回 `stdout`、`stderr` 和 `exitCode`。两个流独立用标准带填充 Base64 编码，空流可省略。每个流最多 256 KiB，超限返回错误。 |
 | `stop` | `timeoutMs` 可省略，取值 0–300000。 | 返回退出状态。0 或省略表示立即 SIGKILL，正值表示先 SIGTERM 并允许指定毫秒数的退出时间，超时后 SIGKILL。目标已删除时成功。 |
 | `readLog` | `offset` 非负有符号 64 位整数，`limit` 为 1–262144。 | `stdout` 为从 offset 开始的 CRI 日志字节的 Base64（空时可省略），`nextOffset` 为 offset 加实际读取字节数。可在进程运行时轮询和重试。 |
@@ -23,7 +24,14 @@
 
 统计样本的 `timestamp` 为 Unix epoch 纳秒。必填的无符号计数为 `cpuUsageNanos`、`memoryUsageBytes`、`workingSetBytes`、`rssBytes`、`pageFaults` 和 `majorPageFaults`。两次独立采样间隔达到一秒后可提供 `usageNanoCores`，cgroup 有有限的内存上限时提供 `availableBytes`。采样失败返回错误。宿主按样本自身的时间戳填充 CRI 字段。[统计语义](VM_RUNTIME.md#guest-工作负载统计)
 
-扩展指标使用可选的 `cgroupCounters` 对象，按 `cpu.stat`、`memory.stat` 文件名及 Linux 字段名组织无符号计数。只填入已观测的 CPU user/system、CFS 限流、内存缓存/匿名页/内核内存/映射文件及缺页字段，零值照常发送。旧 agent 可以省略该对象。应答超出 1 MiB 时，guest 省略扩展计数并保留基础样本。
+扩展指标使用可选的 `cgroupCounters` 对象，按 `cpu.stat`、`memory.stat` 文件名及 Linux 字段名组织无符号计数。只填入已观测的 CPU user/system、CFS 限流、内存缓存/匿名页/内核内存/映射文件及缺页字段，零值照常发送。旧 agent 可以省略该对象。应答超出 1 MiB 时，guest 省略全部可选指标并保留基础样本。
+
+`podMetrics` 保持协议 v1。旧 agent 拒绝该操作时，host 通过 `podStats` 读取已有指标。两次连接及身份校验共用 5 秒预算。新增字段只在有采样来源时返回。
+
+- `filesystem` 仅用于容器，含 `device` 和可选的 `capacityBytes`、`inodes`、`inodesFree`、`usageBytes`。
+- `blockIo` 按 guest 块设备提供 `device`、`major`、`minor` 和实际存在的 `readBytes`、`writeBytes`、`discardBytes`、`readOps`、`writeOps`。
+- `process` 可包含 `processes`、`fileDescriptors`、`sockets`、`threads`、`threadsMax`。`threadsMax` 为零表示内核报告无上限。
+- `network` 仅用于 Pod，是接口名到八个无符号计数的映射。先列接收字节、包、错误和丢包，再以相同顺序列发送计数。
 
 状态应答具有 `createdAt`、`startedAt`、`finishedAt`，单位为 Unix epoch 纳秒，尚未发生的时间可省略。`exitCode` 在退出状态或 exec 结果中有效；信号退出取 128 加信号编号。guest 作为 subreaper 对容器 init 执行 wait，退出状态发布前会排空日志管道。宿主根据时间和状态填写 CRI 字段。
 

@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-26 Pod VM guest 文件系统、进程与网络扩展指标
+
+在 pro6000 的隔离 Debian 13 KVM 节点验证 `780b258`。宿主 Linux `6.12.118+deb13-cloud-amd64`，Cloud Hypervisor `v55.0`，virtiofsd `1.13.2`，guest Linux `5.15.0-191-generic`。真实 kubelet `v1.37.2` 的 `/metrics/cadvisor` 与 CRI 列表和读至 EOF 的流式列表核对了两台 VM Pod、三个容器的 **118 条序列、29 个指标族**。同一 daemon 对运行中的旧 agent 回退到 `podStats`，保留全部 65 条原有 CPU 和内存序列。
+
+目标容器写入 16 MiB 文件、创建硬链接并写入独立 tmpfs，采样只增加目标 rootfs 的 16,777,216 字节。空闲同 Pod 容器和另一 VM 用量不变，容量及 inode 与 guest statfs 一致。进程、文件描述符和 socket 对照 guest 的进程记录。16 MiB HTTP 传输使目标 Pod 的 `eth0` 发送计数增加 17,542,601 字节，单独核对另一 Pod 及 guest `/proc/net/dev`。网络序列只出现在 Pod 范围，默认 VM 无 guest 块设备，未产生块 I/O 序列。设备映射和真实零值由 Linux Go 测试及 Rust 指标投影测试核对。[问题 #40](https://github.com/nautilus-runtime/nautilus/issues/40)
+
+完整未过滤的 `critest v1.37.0` 对同一隔离 Runtime 和 Image socket 运行，**107 通过、0 失败、35 跳过**（281.391 秒），结束时无残留 Pod 或容器。Linux Rust 测试 138 通过、0 失败、8 项默认忽略，Linux guest Go 测试 10 项通过。Clippy 的 29 项诊断和格式检查涉及的 31 个文件均与基线一致。
+
 ## 2026-11-26 原生 OCI 沙箱网络命名空间
 
 在 pro6000 的隔离 Debian 13 节点（Linux `6.12.118+deb13-cloud-amd64`、systemd 257）使用上游 kubelet `v1.37.2` 并排运行 `hostNetwork: true` 和普通 CNI 静态 Pod。旧版原生沙箱缺少 `linux.namespaces.options`，kubelet 判定网络模式不匹配并停止 hostNetwork 容器。修复版 `9795fce` 从已持久化的 Pod 状态报告 `NODE` 和 `POD`，同时核对两种容器的实际网络命名空间分别与宿主相同和独立。
