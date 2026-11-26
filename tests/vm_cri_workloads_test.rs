@@ -15,7 +15,7 @@ use nautilus::Config;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -350,7 +350,6 @@ async fn exec(cli: &mut Runtime, id: &str, program: &str) -> Result<Vec<u8>> {
 // but before renameat2. A public file of exactly the expected type and size is
 // still someone else's. Cleanup must release only the private staged inode.
 fn interrupted_volume(root: &Path, pod: &str, container: &str) -> Result<(PathBuf, PathBuf, u64)> {
-    use std::os::unix::fs::MetadataExt;
     let store = root.join("state/vms");
     let slot = Uuid::new_v4().to_string();
     let stage = store.join(pod).join(".volume-stage").join(&slot);
@@ -377,6 +376,36 @@ fn interrupted_volume(root: &Path, pod: &str, container: &str) -> Result<(PathBu
         }));
     fs::write(record, serde_json::to_vec(&owner)?)?;
     Ok((stage, public, foreign.metadata()?.ino()))
+}
+
+async fn unpublished_rootfs_removal(root: &Path, pod: &str) -> Result<()> {
+    let vms = root.join("state/vms");
+    let container = Uuid::new_v4().to_string();
+    let staged = vms.join(format!(".oci-{container}"));
+    let public = vms.join(pod).join("podfs/containers").join(&container);
+    fs::DirBuilder::new().mode(0o700).create(&staged)?;
+    fs::create_dir(&public)?;
+    fs::write(public.join("contents"), b"existing bundle")?;
+    let metadata = fs::metadata(&staged)?;
+    let identity = json!({"device":metadata.dev(), "inode":metadata.ino()});
+    let record = vms.join(format!("{pod}.json"));
+    let mut owner: serde_json::Value = serde_json::from_slice(&fs::read(&record)?)?;
+    owner["share"]["rootfs"]
+        .as_array_mut()
+        .context("rootfs receipts")?
+        .push(json!({
+            "container":container, "mount":0, "bundle":identity,
+            "placeholder":identity, "root":identity
+        }));
+    fs::write(record, serde_json::to_vec(&owner)?)?;
+    let store = nautilus::vm::owner::PodVmStore::new(vms);
+    store.remove_bundle(pod, &container).await?;
+    fs::remove_dir(&staged)?;
+    // Restarted cleanup can retry after the staging inode has been removed.
+    store.remove_bundle(pod, &container).await?;
+    ensure!(fs::read(public.join("contents"))? == b"existing bundle");
+    fs::remove_dir_all(public)?;
+    Ok(())
 }
 
 // These host mounts are confined to the disposable fixture. Drop them before
@@ -1069,6 +1098,9 @@ async fn scenario(
 
     daemon_process.kill().await?;
     let (staging, foreign, foreign_ino) = interrupted_volume(root, &id, &a)?;
+    if expect_snapshot {
+        unpublished_rootfs_removal(root, &id).await?;
+    }
     let (new_daemon, new_client) = daemon(root).await?;
     *daemon_process = new_daemon;
     *cli = new_client;
