@@ -2001,8 +2001,30 @@ mod log_reopen_tests {
 }
 
 #[cfg(test)]
-mod sandbox_filter_tests {
+mod sandbox_status_tests {
     use super::*;
+
+    #[test]
+    fn native_sandbox_reports_persisted_network_mode() {
+        for (handler, host_network, expected) in [
+            ("runc", true, NamespaceMode::Node),
+            ("runc", false, NamespaceMode::Pod),
+            ("", true, NamespaceMode::Node),
+        ] {
+            let pod = PodState {
+                runtime_handler: handler.into(),
+                host_network,
+                ..Default::default()
+            };
+            let status = pod_status(pod, PodSandboxState::SandboxReady);
+            let options = status
+                .linux
+                .and_then(|linux| linux.namespaces)
+                .and_then(|namespaces| namespaces.options)
+                .expect("native sandbox reports its namespace options");
+            assert_eq!(options.network(), expected, "handler {handler:?}");
+        }
+    }
 
     #[test]
     fn sandbox_state_filter_matches_status_projection() {
