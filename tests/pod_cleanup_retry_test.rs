@@ -39,3 +39,72 @@ test -e "$CNI_PATH/ready"
     assert!(state.get_pod_state(&id).await.unwrap().is_none());
     assert_eq!(std::fs::read_to_string(tmp.path().join("calls")).unwrap(), format!("DEL {id}\nDEL {id}\n"));
 }
+
+// Stop journals the VM attempt before shutdown, commits the stopped Pod, and
+// Remove deletes its record. These writes may overlap for distinct sandboxes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pod_cleanup_commits_finish_and_survive_reopen() {
+    use nautilus::core::PodStatus;
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+    use tokio::task::JoinSet;
+
+    const CHILD_DB: &str = "NAUTILUS_TEST_CONCURRENT_POD_DB";
+    let Some(path) = std::env::var_os(CHILD_DB) else {
+        // A deadlocked sled pool is process-wide, including Db::drop. Isolate it
+        // so a regression fails within the deadline and other tests can continue.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "concurrent_pod_cleanup_commits_finish_and_survive_reopen",
+            ])
+            .env(CHILD_DB, tmp.path())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+            Ok(status) => assert!(status.unwrap().success()),
+            Err(_) => {
+                child.kill().await.unwrap();
+                panic!("concurrent Pod state commits stalled");
+            }
+        }
+        let reopened = StateManager::new(tmp.path()).unwrap();
+        let pods = reopened.list_pods().await.unwrap();
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0].id, "survivor");
+        return;
+    };
+
+    let state = Arc::new(StateManager::new(path).unwrap());
+    let survivor = PodState {
+        id: "survivor".into(),
+        ..Default::default()
+    };
+    state.save_pod_state(&survivor).await.unwrap();
+    for _ in 0..8 {
+        let gate = Arc::new(Barrier::new(16));
+        let mut workers = JoinSet::new();
+        for _ in 0..16 {
+            let state = state.clone();
+            let gate = gate.clone();
+            workers.spawn(async move {
+                let mut pod = PodState {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    status: PodStatus::Failed,
+                    runtime_handler: "vm".into(),
+                    ..Default::default()
+                };
+                gate.wait().await;
+                state.save_pod_state(&pod).await.unwrap();
+                pod.status = PodStatus::Succeeded;
+                state.save_pod_state(&pod).await.unwrap();
+                state.delete_pod_state(&pod.id).await.unwrap();
+            });
+        }
+        while let Some(result) = workers.join_next().await {
+            result.unwrap();
+        }
+    }
+}
