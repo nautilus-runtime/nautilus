@@ -42,7 +42,7 @@
           </article>
           <article>
             <h3>WebAssembly commands</h3>
-            <p>Place a WASI Preview 1 module exporting <code>_start</code> in your current directory. The <code>wasi</code> handler runs it in Wasmtime and records stdout and stderr in the container’s CRI log.</p>
+            <p>Place a WASI Preview 1 module exporting <code>_start</code> in your current directory. The <code>wasi</code> handler runs it in Wasmtime and the CLI displays its output.</p>
             <pre><code>sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"</code></pre>
           </article>
           <article>

@@ -6,7 +6,7 @@
 
 | 范围 | 已验证的行为 |
 |---|---|
-| 运行与交互 | OCI 和 Pod VM 支持连接容器 init 的交互输入、Attach 和 PTY。WASI 命令支持前台标准输入和 CRI 日志。CLI 支持前后台运行与自动回收。[工作负载示例](../README.md#what-you-can-run) |
+| 运行与交互 | OCI 和 Pod VM 支持连接容器 init 的交互输入、Attach 和 PTY。WASI 命令支持前台标准输入，OCI 打包命令提供 CRI 日志。CLI 支持前后台运行与自动回收。[工作负载示例](../README.md#what-you-can-run) |
 | Kubernetes | 在 Kubernetes v1.37.2 上实测了 VM RuntimeClass、Pod 网络、日志、exec 和 daemon 重启恢复。原生 OCI 的 Guaranteed 和 Burstable 容器可以原地调整 CPU 和内存。[节点验收](VM_RUNTIMECLASS.md) · [CRI 验证记录](CRITEST_RESULTS.md) |
 | 镜像和存储 | PullImage 缓存压缩层并准备可复用的镜像树。流式解包覆盖 tar、gzip 和 zstd。21 层镜像的配对测试中，两版各完成 110 个 VM Pod、1,100 次热 ExecSync，清理并发为 4；清场后 daemon PSS 从 705.0 MiB 降到 71.9 MiB。[测量条件](VM_AGENT_LOOP.md#daemon-解包内存复验) |
 | 网络与安全 | 原生 OCI 支持 CNI、hostPort、seccomp 和 AppArmor。Pod VM 当前使用 IPv4 bridge 和 host-local CNI。Wasm 策略可在创建 Pod、创建容器和启动容器时检查请求。[架构](ARCHITECTURE.md) · [VM 设计](VM_RUNTIME.md) |
