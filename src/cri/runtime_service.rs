@@ -29,6 +29,20 @@ fn includes_standalone<T>(request: &Request<T>) -> bool {
         .is_some_and(|value| value.as_encoded_bytes() == b"true")
 }
 
+fn allows_container_stream(container: &StoredContainer) -> bool {
+    match container.status {
+        ContainerStatus::Running | ContainerStatus::Stopped => true,
+        // The status observer can still report Unknown after a recovered
+        // transport. The stream verifies the VM's identity and the guest
+        // decides whether the original container can be used.
+        ContainerStatus::Unknown if container.sandbox_kind == "vm" => container
+            .vm
+            .as_ref()
+            .is_some_and(|vm| !vm.preparing && !vm.logs_complete),
+        _ => false,
+    }
+}
+
 /// CRI MountPropagation (proto i32) → OCI bind-mount propagation option.
 /// Unknown values fall back to rprivate, the CRI default.
 fn cri_propagation_to_oci(p: i32) -> String {
@@ -1513,10 +1527,7 @@ impl RuntimeService for NautilusRuntimeService {
             })?;
         // A short batch workload can finish between start and exec; delegate
         // the liveness judgement to the backend (same tolerance as execSync).
-        if !matches!(
-            c.status,
-            ContainerStatus::Running | ContainerStatus::Stopped
-        ) {
+        if !allows_container_stream(&c) {
             return Err(Status::invalid_argument(format!(
                 "container {} is not running, current status: {:?}",
                 req.container_id, c.status
@@ -1553,10 +1564,7 @@ impl RuntimeService for NautilusRuntimeService {
             .ok_or_else(|| {
                 Status::not_found(format!("container {} not found", req.container_id))
             })?;
-        if !matches!(
-            c.status,
-            ContainerStatus::Running | ContainerStatus::Stopped
-        ) {
+        if !allows_container_stream(&c) {
             return Err(Status::invalid_argument(format!(
                 "container {} is not running, current status: {:?}",
                 req.container_id, c.status

@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import http.client
+import json
 import os
 import pty
 import re
@@ -113,6 +114,9 @@ detached = transport.with_name("spdy-offline.sock")
 transport.rename(detached)
 try:
     result = run(["exec", target, *shell, "echo unexpected"])
+    observed = run(["inspect", target])
+    assert observed.returncode == 0, observed.stderr
+    assert json.loads(observed.stdout)["status"]["state"] == "CONTAINER_UNKNOWN"
 finally:
     detached.rename(transport)
 assert result.returncode != 0 and (
@@ -138,8 +142,9 @@ with child(
 payload = bytes(range(256)) * (12 * 1024)
 echo = subprocess.run(
     base + ["exec", "-i", target, "/bin/busybox", "cat"],
-    input=payload, capture_output=True, timeout=20, check=True,
+    input=payload, capture_output=True, timeout=20,
 )
+assert echo.returncode == 0, (echo.returncode, echo.stderr)
 assert echo.stdout == payload, (len(payload), len(echo.stdout))
 
 
