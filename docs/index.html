@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101c25">
-  <meta name="description" content="Run OCI containers and WASI commands with Nautilus, an open-source Linux container runtime written in Rust for Kubernetes CRI v1.">
-  <title>Nautilus · OCI and WebAssembly runtime</title>
+  <meta name="description" content="Run OCI containers, WASI commands and VM-isolated Pods on Linux through the Kubernetes Container Runtime Interface.">
+  <title>Nautilus · OCI, WebAssembly and Pod VMs</title>
   <link rel="icon" href="assets/favicon.ico">
   <link rel="stylesheet" href="site.css">
 </head>
@@ -23,8 +23,8 @@
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="intro">
         <p class="eyebrow">Linux runtime / Kubernetes CRI v1</p>
-        <h1 id="hero-title">Run containers<br>and <em>WebAssembly.</em></h1>
-        <p class="lead">Nautilus runs OCI images and WASI commands on Linux. Its Rust daemon serves both the Nautilus CLI and kubelet over one Unix socket.</p>
+        <h1 id="hero-title">OCI containers,<br>WASI and <em>Pod VMs.</em></h1>
+        <p class="lead">Run OCI containers directly on Linux or in a dedicated VM per Pod. Run WASI commands with Wasmtime. The Nautilus CLI and kubelet use the same CRI socket.</p>
         <a class="button" href="https://github.com/nautilus-runtime/nautilus#install-from-source">Install Nautilus</a>
       </div>
       <div class="art">
@@ -42,8 +42,13 @@
           </article>
           <article>
             <h3>WebAssembly commands</h3>
-            <p>Place a WASI Preview 1 module exporting <code>_start</code> in your current directory. The <code>wasi</code> handler runs it in Wasmtime and sends output to the daemon log.</p>
+            <p>Place a WASI Preview 1 module exporting <code>_start</code> in your current directory. The <code>wasi</code> handler runs it in Wasmtime and records stdout and stderr in the container’s CRI log.</p>
             <pre><code>sudo nautilus run --rm --runtime wasi "file://$PWD/hello.wasm"</code></pre>
+          </article>
+          <article>
+            <h3>Pod VMs</h3>
+            <p>On a KVM node with the <code>vm</code> handler enabled, run BusyBox inside its own Linux guest and print the guest kernel version.</p>
+            <pre><code>sudo nautilus run --rm --runtime vm busybox:1.36 uname -r</code></pre>
           </article>
         </div>
       </div>
@@ -52,8 +57,9 @@
       <h2 id="docs-title">Project documentation</h2>
       <ul>
         <li><a href="https://github.com/nautilus-runtime/nautilus#quick-start">Quick start</a><span>Build from source and configure the daemon.</span></li>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/VM_RUNTIMECLASS.md">Pod VM setup</a><span>Configure Cloud Hypervisor and virtiofsd, then select the VM RuntimeClass.</span></li>
         <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/ARCHITECTURE.md">Architecture</a><span>Follow a CRI request through the runtime.</span></li>
-        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/CRITEST_RESULTS.md">CRI test results</a><span>Review the published conformance results and skipped cases.</span></li>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/CRITEST_RESULTS.md">CRI test results</a><span>The November 2026 cri-tools v1.37.0 run passed 107 tests and skipped 35.</span></li>
       </ul>
     </section>
   </main>

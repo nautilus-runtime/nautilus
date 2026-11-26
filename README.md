@@ -2,7 +2,7 @@
 
 <p align="center"><a href="https://nautilus-runtime.github.io/nautilus/">Project website</a></p>
 
-Nautilus is a Linux container runtime written in Rust. It implements the Kubernetes Container Runtime Interface (CRI v1) and runs OCI containers, WebAssembly commands, and OCI containers inside a Pod-level VM. Kubelet and the bundled CLI use the same Unix socket, so you can try either runtime on a single machine before using it with a cluster.
+Nautilus is a Linux container runtime written in Rust. It implements the Kubernetes Container Runtime Interface (CRI v1) and runs OCI containers, WebAssembly commands, and OCI containers inside a Pod-level VM. Kubelet and the bundled CLI use the same Unix socket, so you can run a workload locally before deploying it through Kubernetes.
 
 ## What you can run
 
@@ -20,14 +20,28 @@ To enable the VM handler on a Kubernetes node and run a Pod, follow the [Runtime
 
 ### Install from source
 
-Use a Linux machine with systemd and a Rust toolchain with Cargo. The following commands install the dependencies on Debian or Ubuntu and build Nautilus from source.
+Use a Linux machine with systemd and a current stable Rust toolchain with Cargo. On Debian or Ubuntu, install the build and runtime dependencies and check that your Protocol Buffers compiler can read the vendored CRI schema.
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y git build-essential pkg-config protobuf-compiler libelf-dev zlib1g-dev libseccomp-dev libsystemd-dev runc iproute2 iptables containernetworking-plugins
+sudo apt-get install -y git curl ca-certificates python3 build-essential pkg-config protobuf-compiler libelf-dev zlib1g-dev libseccomp-dev libsystemd-dev runc iproute2 iptables containernetworking-plugins
 
 git clone https://github.com/nautilus-runtime/nautilus.git
 cd nautilus
+make check-protoc
+```
+
+The schema uses the Protobuf `debug_redact` field option. Debian 13 ships `protoc` 3.21.12, which fails this check. If the compiler is missing or incompatible, install the pinned upstream 29.3 compiler for your user and select it for the build. The helper supports x86_64 and arm64 Linux.
+
+```sh
+bash scripts/setup_remote_env.sh --protoc-only
+export PROTOC="$HOME/.local/share/nautilus/protoc-29.3/bin/protoc"
+make check-protoc
+```
+
+Build and install the daemon, CLI and systemd service.
+
+```sh
 make install-service
 ```
 
@@ -119,7 +133,7 @@ Run the Rust test suite on a Linux test machine with permission to create namesp
 cargo test --locked --target "$(uname -m)-unknown-linux-gnu"
 ```
 
-The published CRI baseline for `critest` v1.31.1 is 96 passed, 0 failed and 17 skipped. See the [conformance results](docs/CRITEST_RESULTS.md), [architecture guide](docs/ARCHITECTURE.md) and [roadmap](docs/DEVELOPMENT_ROADMAP.md) for details.
+The November 25, 2026 unfiltered `critest` v1.37.0 run completed with **107 passed, 0 failed and 35 skipped**. Kubernetes v1.37.2 has also exercised the VM RuntimeClass and native OCI CPU and memory resizing on a live node. See the [conformance results](docs/CRITEST_RESULTS.md), [architecture guide](docs/ARCHITECTURE.md) and [roadmap](docs/DEVELOPMENT_ROADMAP.md) for coverage and remaining work.
 
 The [containerd comparison](docs/PERFORMANCE.md) measures OCI pod sandbox creation, container creation, startup and workload readiness. It includes the test procedure and per-workload timings.
 

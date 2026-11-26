@@ -6,6 +6,7 @@
 
 # 变量定义
 CARGO := cargo
+PROTOC ?= protoc
 TARGET ?= $(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET),$(shell uname -m)-unknown-linux-gnu)
 CARGO_TARGET_DIR ?= target
 RELEASE_DIR = $(CARGO_TARGET_DIR)/$(TARGET)/release
@@ -24,8 +25,13 @@ build: ## 构建开发版本
 	$(CARGO) build
 	@echo "✅ 构建完成"
 
+.PHONY: check-protoc
+check-protoc: ## 检查 protoc 能否编译 vendored CRI schema
+	@"$(PROTOC)" -I proto --descriptor_set_out=/dev/null proto/cri-api/runtime/v1/api.proto || { \
+		echo 'The CRI schema needs a protoc with debug_redact support. See README.md, Install from source, or set PROTOC to a compatible executable.' >&2; exit 1; }
+
 .PHONY: release
-release: ## 构建生产版本
+release: check-protoc ## 构建生产版本
 	@echo "🚀 构建 Nautilus 生产版本..."
 	$(CARGO) build --locked --release --target $(TARGET) --target-dir $(CARGO_TARGET_DIR)
 	@echo "✅ 生产版本构建完成"

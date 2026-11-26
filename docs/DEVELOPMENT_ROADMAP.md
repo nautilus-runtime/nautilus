@@ -1,76 +1,38 @@
 # Nautilus 开发路线图
 
-> MVP 状态记录于 2026-08-29，性能基线更新于 2026-11-24。**MVP 阶段已完成**(原 2025-10 的 8-10 周阶段计划与
-> 任务分解文档已随阶段结束清理)。现状以本文档与
-> [架构文档](ARCHITECTURE.md)、
-> [critest 测试结果](CRITEST_RESULTS.md)为准。
+## 当前能力
 
-## 📊 当前状态(2026-08,MVP 阶段完成)
+截至 2026-11-25，kubelet 和 Nautilus CLI 通过同一 CRI v1 socket 管理三类工作负载。节点默认可运行原生 OCI 容器和 WASI Preview 1 命令。按 [Pod VM 节点指南](VM_RUNTIMECLASS.md) 配置 KVM、系统级 systemd、Cloud Hypervisor、virtiofsd、guest 镜像和网络后，kubelet 可以通过 RuntimeClass 为每个 Pod 创建独立的 Linux guest。
 
-| 维度 | 现状 | 原目标 |
-|---|---|---|
-| CRI 一致性 | **critest v1.31.1 96/0 全绿**(两连跑确认) | crictl 命令可用 |
-| 单元/集成测试 | cargo test 6 套件 28/28 绿 + e2e 5(e2e 偶发 wait4 挂起待查) | 套件绿色 |
-| 空闲内存 | **PSS 10 MiB**(RSS 11 MiB / 12 线程,release 实测) | < 100MB ✅ 大幅超额 |
-| 容器启动时间 | BusyBox 在 PullImage 解包后，首次创建加启动 P95 为 64.5 ms（压缩层已缓存）和 63.5 ms（本地仓库实际传输），预热串行为 47.3 ms。见[测试口径和数据](PERFORMANCE.md) | < 100 ms (P95)，这三种已测场景达到 |
-| 并发操作 | 预热 BusyBox 四路创建加启动 P95 为 92.2 ms，同轮旧版为 89.3 ms，containerd 为 122.1 ms | 1000+，容量上限待测 |
-| 生产加固 | socket 0660、SIGTERM 优雅退出、registry auth、脚手架删除、警告清零 | — ✅ |
-| 多沙箱 | runc(libcontainer)+ wasmtime 双后端路由、RuntimeClass 路由验证通过 | — ✅ |
-| Wasm 策略引擎 | hooks 热加载 + fuel/timeout 限额,demo 验证通过 | — ✅ |
-| Kubernetes 集成 | kubelet 直连未验证(critest/crictl 全链路已绿) | 1.25+ ⏳ |
+| 范围 | 已验证的行为 |
+|---|---|
+| 运行与交互 | OCI 和 Pod VM 支持连接容器 init 的交互输入、Attach 和 PTY。WASI 命令支持前台标准输入和 CRI 日志。CLI 支持前后台运行与自动回收。[工作负载示例](../README.md#what-you-can-run) |
+| Kubernetes | 在 Kubernetes v1.37.2 上实测了 VM RuntimeClass、Pod 网络、日志、exec 和 daemon 重启恢复。原生 OCI 的 Guaranteed 和 Burstable 容器可以原地调整 CPU 和内存。[节点验收](VM_RUNTIMECLASS.md) · [CRI 验证记录](CRITEST_RESULTS.md) |
+| 镜像和存储 | PullImage 缓存压缩层并准备可复用的镜像树。流式解包覆盖 tar、gzip 和 zstd。21 层镜像的配对测试中，两版各完成 110 个 VM Pod、1,100 次热 ExecSync，清理并发为 4；清场后 daemon PSS 从 705.0 MiB 降到 71.9 MiB。[测量条件](VM_AGENT_LOOP.md#daemon-解包内存复验) |
+| 网络与安全 | 原生 OCI 支持 CNI、hostPort、seccomp 和 AppArmor。Pod VM 当前使用 IPv4 bridge 和 host-local CNI。Wasm 策略可在创建 Pod、创建容器和启动容器时检查请求。[架构](ARCHITECTURE.md) · [VM 设计](VM_RUNTIME.md) |
 
-### 已完成能力(按领域)
+完整未过滤的 `critest` v1.37.0 在同一隔离 Unix socket 上验证 RuntimeService 与 ImageService，结果为 **107 通过、0 失败、35 跳过**。同轮 Linux 串行 Rust 测试 134 通过、0 失败、8 项忽略。两套测试的覆盖范围、可选 `crictl` 交互用例的失败以及历史 v1.31.1 基线均见[验证记录](CRITEST_RESULTS.md)。
 
-- **RuntimeService**:Pod/容器完整生命周期、幂等 stop/remove、
-  stats(单容器/list/pod 聚合)、UpdatePodSandboxResources/Checkpoint/Restore
-  等新 RPC 显式 unimplemented(对齐上游渐进支持惯例)
-- **ImageService**:原生 oci-distribution 拉取(内容寻址层缓存、Basic auth、
-  registry mirror)、docker 语义对齐(ID=config digest、tag 归并、untag 删除)
-- **网络**:CNI chain(loopback/bridge/host-local)、pod netns holder、
-  hostPort 发布、hostNetwork pod 级语义、DNS config
-- **安全**:内置 moby seccomp、AppArmor 全合规、caps 五 set、
-  noNewPrivileges/readonlyRootfs、privileged 继承、sysctls、socket 0660
-- **Streaming**:SPDY exec/attach/portforward 全绿
-- **命名空间**:pod 级 net/pid/ipc holder;NamespaceOption
-  HOST/POD/CONTAINER/NODE 全语义
-- **存储**:rbind/rshared 卷挂载、LogPath 落盘与 rotate reopen、OOMKilled 归因
+## 待完成工作
 
-## 🚀 后续路线
+[CRI 功能跟踪 #36](https://github.com/nautilus-runtime/nautilus/issues/36) 及其子任务按后端定义验收条件。
 
-### 近期(稳定性与度量)
+| 工作 | 剩余范围 |
+|---|---|
+| [CRI 指标 #40](https://github.com/nautilus-runtime/nautilus/issues/40) | VM guest 已上报 CPU 时间、节流、内存分项与页错误。后续补齐文件系统归属、块 I/O、Pod 网络与进程指标，并经 kubelet 核对。 |
+| [资源原地调整 #41](https://github.com/nautilus-runtime/nautilus/issues/41) | 已支持原生 OCI 容器的 CPU 和内存调整。接下来实现 Pod 级通知与 guest 限制更新，分别验证 guest、VMM 和宿主的容量变化。 |
+| [Checkpoint 与 Restore #42](https://github.com/nautilus-runtime/nautilus/issues/42) | 实现原生容器和 Pod 的一致性捕获、恢复和失败回收，再验证 VM 存储及设备的一致性。 |
 
-1. **性能回归与容量测量**已覆盖解包前移前后、压缩层缓存命中、本地 HTTPS 仓库实际传输和四路并发。
-   后续扩大四路长尾样本，跟踪并发启动超时，并补充多层大镜像、跨网络拉取、CNI 和更高并发测试。见[三方对比和原始样本](PERFORMANCE.md)。
-2. **e2e wait4 挂起排查**:`e2e_lifecycle_test` 两次复现阻塞在 wait4
-   (疑与 CPU 饥饿同源),干净环境观察定位
-3. **debug 日志与流式输出隔离**:libcontainer 内部 DEBUG 行泄入 exec 流
-   (生产 INFO 级干净;深挖 tenant 日志路由)
-4. **critest 版本跟进**:v1.31.1 → 上游新版本回归(96/0 基线巩固)
-5. **kubelet 直连验证**:真实 K8s 节点接入(kind 或裸 kubelet),补齐
-   Kubernetes 集成层验证
+性能测试继续覆盖高并发清理、长时间运行和不同镜像的启动分布。2026-11-24 的 BusyBox OCI 对照中，预热串行创建加启动 P95 为 47.3 ms，四路并发为 92.2 ms。Pod VM 单机验收到最多 16 路并发启动。容量上限仍待测量。[原生 OCI 测量](PERFORMANCE.md) · [Pod VM 测量](VM_AGENT_LOOP.md)
 
-### 中期(差异化补全)
+2026 年 8 月还记录了 e2e 等待 `wait4` 偶发挂起、libcontainer 的 DEBUG 日志进入 exec 输出。后续复查应保留负载、日志级别和阻塞点，便于与近期的 VM streaming 及并发回收问题区分。
 
-1. **Wasm 策略 WIT/component 接口**:任意语言写策略(component model),
-   替代现有 raw ABI;per-hook 独立 fuel/timeout 策略
-2. **镜像签名与验签**:Cosign 外挂集成(设计上明确不自研签名协议栈)
-3. **状态存储评估**:sled → redb(sled 已停止维护;接口不变,低优先级)
-4. **attach/PTY 真实化**:attach 从"容器内新起 /bin/sh"演进为主进程
-   stdio 注入;tty 分配真实 PTY
-5. **镜像 GC**:现有 gc 配置项未接实际回收逻辑
+中长期候选方向包括 Wasm 策略的 WIT/component 接口、镜像签名与验签、镜像 GC、状态存储评估、机密计算和兼容性认证。GPU 透传单独跟踪，已有 CPU/KVM 数据的覆盖范围见 [VM 设计](VM_RUNTIME.md)。
 
-### 远期(设计预留)
+## 验证要求
 
-- **Pod 级 microVM 后端**：首个 VMM 为 Cloud Hypervisor。节点探针和 guest agent 启动身份协议已合入。实验性的 Pod VM 由 systemd 托管，在容器、网络及 kubelet 验收完成后开放 RuntimeClass。见 [VM 设计与任务依赖](VM_RUNTIME.md)。
-- **机密计算(CoCo)**:依赖 microVM 后端先行
-- **企业级**:安全审计、兼容性认证、长稳(7x24)测试
+按 [AGENTS.md](../AGENTS.md) 在 Linux 运行 `cargo fmt --check`、`cargo clippy --locked -- -D warnings` 和 `cargo test --locked`。2026-11-25 的严格 Clippy 检查仍有 29 项基线诊断，格式检查涉及 31 个基线文件。
 
-## 🧪 质量门控(现行)
+稳定性回归还需覆盖 [VM 流式交互](https://github.com/nautilus-runtime/nautilus/issues/65)、[多个 VM Pod 的并发回收](https://github.com/nautilus-runtime/nautilus/issues/66) 与 [kubelet 日志轮转](https://github.com/nautilus-runtime/nautilus/issues/68)。各轮环境、结果及限制见[验证记录](CRITEST_RESULTS.md)。
 
-每次提交:
-- `cargo build` / `cargo test` 绿
-- `cargo clippy -- -D warnings`、`cargo fmt --check` 零告警(当前基线)
-- 远程验证脚本 `scripts/verify_remote.sh` 断言全过
-
-阶段收敛(以 critest 为准绳):任何新增 CRI 表面行为改动后,全量 critest
-不回退(当前 96/0);跑前检查 `/proc/pressure/cpu` 与失控进程,排除环境噪声。
+CRI 可见变更还需对实际 daemon 的 Runtime 和 Image socket 运行完整 critest，分别记录通过、失败与跳过数。VM 生命周期变更需记录宿主内核和 VMM 版本，并经 CRI 验证路由、状态及清理。涉及 Kubernetes 可见行为时用真实 kubelet 复测。
