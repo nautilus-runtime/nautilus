@@ -38,6 +38,54 @@ func TestBlockIOPreservesDeviceCountersAndAbsence(t *testing.T) {
 	}
 }
 
+func TestBlockedFilesystemReadDoesNotQueueAnotherSampler(t *testing.T) {
+	c := &container{id: "b9691ea3-8edf-45f5-b12f-27504bc35bc7", dir: t.TempDir()}
+	config := filepath.Join(c.dir, "config.json")
+	if err := unix.Mkfifo(config, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{}
+	known := []*container{c}
+	children := map[string]sample{c.id: {CPU: 42}}
+	deadline := time.Now().Add(time.Second)
+	done := make(chan struct{})
+	go func() {
+		s.sampleFilesystems(known, children, deadline)
+		close(done)
+	}()
+
+	// Keep the reader blocked in a filesystem call past the response deadline.
+	for {
+		writer, err := unix.Open(config, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err == nil {
+			defer unix.Close(writer)
+			break
+		}
+		if err != unix.ENXIO || !time.Now().Before(deadline) {
+			t.Fatalf("waiting for sampler: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("response waited for a blocked storage worker")
+	}
+	if children[c.id].CPU != 42 || children[c.id].Filesystem != nil {
+		t.Fatalf("basic sample was replaced: %+v", children[c.id])
+	}
+	second := make(chan struct{})
+	go func() {
+		s.sampleFilesystems(known, children, time.Now().Add(3*time.Second))
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(time.Second):
+		t.Fatal("second sampler waited behind the blocked worker")
+	}
+}
+
 func TestRootFilesystemCountsOwnedAllocatedBlocks(t *testing.T) {
 	root := t.TempDir()
 	subdir := filepath.Join(root, "subdir")

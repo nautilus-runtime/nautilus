@@ -176,10 +176,11 @@ func readRootFilesystem(dir *os.File, readonly bool, deadline time.Time) *filesy
 	if !readonly {
 		// VM images are materialized as a private rootfs, including the image
 		// blocks. Volume mounts and guest-visible pseudo filesystems are outside it.
-		walk := storageWalk{
-			until: min(deadline, time.Now().Add(100*time.Millisecond)),
-			seen:  make(map[uint64]bool),
+		until := time.Now().Add(100 * time.Millisecond)
+		if deadline.Before(until) {
+			until = deadline
 		}
+		walk := storageWalk{until: until, seen: make(map[uint64]bool)}
 		if walk.directory(dir, 0) {
 			s.UsageBytes = &walk.total
 		}
