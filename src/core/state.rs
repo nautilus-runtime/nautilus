@@ -453,8 +453,7 @@ impl StateManager {
         let key = format!("pod:{}", state.id);
         let value = serde_json::to_vec(state)?;
         db.insert(key.as_bytes(), value)?;
-        db.flush_async().await?;
-        Ok(())
+        Self::flush_pod_commit(&db).await
     }
 
     /// Get pod state from database
@@ -474,7 +473,16 @@ impl StateManager {
         let db = self.db.read().await;
         let key = format!("pod:{}", id);
         db.remove(key.as_bytes())?;
-        db.flush_async().await?;
+        Self::flush_pod_commit(&db).await
+    }
+
+    async fn flush_pod_commit(db: &Db) -> Result<()> {
+        // sled's flush waits for a log write on its I/O pool. Concurrent
+        // flush_async calls can occupy every worker needed to service that write.
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || db.flush())
+            .await
+            .map_err(|e| crate::core::Error::Runtime(format!("Pod state flush task: {e}")))??;
         Ok(())
     }
 

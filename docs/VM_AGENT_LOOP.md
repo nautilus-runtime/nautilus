@@ -73,6 +73,12 @@
 
 进一步在同一镜像上重复原有规模，两版各完成 32 波、110 个 Pod 和 1,100 次热 ExecSync。一次旧版的 16 路同时清理出现长时间阻塞，经重启测试 daemon 后回收了残留 Pod。完成的配对复验仍以最多 16 路并发启动，将两版的清理并发统一为 4。清场后 daemon PSS 从旧版的 705.0 MiB 降到修复版的 71.9 MiB，两轮均无残留 Pod 或容器。
 
+### 16 路并发回收复验
+
+同一 CRI 连接同时停止 16 个真实 VM Pod 时，修复前首波在 6 秒期限内未完成。daemon 的 7 个 sled I/O 线程全部在 `Tree::flush_async` 中等待日志落盘，负责落盘的任务也排在这个线程池。Pod 状态保存和删除改用 Tokio 的阻塞线程等待 `Db::flush`，成功响应时记录已持久化。[Pod 状态提交](../src/core/state.rs) · [持久化回归用例](../tests/pod_cleanup_retry_test.rs)
+
+修复版在 pro6000 的 Linux 6.12.118+deb13-cloud-amd64、Cloud Hypervisor v55.0 节点通过同一并发请求，首波耗时 397 毫秒。随后重复 Stop，并验证删除后的 Stop 和再次 Remove 均成功。原始基准另以 16 路同时启动和回收连续完成 6 波，共 96 个 Pod、960 次热 ExecSync，整波回收 P50 为 735 毫秒、P95 为 812 毫秒。测试 daemon 全程在线，结束时 CRI Pod、容器及本轮 VM 服务、挂载、网络命名空间和 IP 租约均已清空。[基准程序](../tests/vm_agent_loop_benchmark.py) · [问题 #66](https://github.com/nautilus-runtime/nautilus/issues/66)
+
 ## 镜像内的 Pi CLI
 
 同一个 21 层 harness 镜像包含 Node.js v22.22.0 和 Pi v1.5.2。镜像内脚本在首次会话让 Pi 使用 `read` 读取刚生成的随机标识，再用同一会话的历史让 Pi 使用 `write` 将标识写入另一文件。脚本核对两个文件的内容、两次工具成功事件与两轮最终 assistant 状态。Release 构建从创建 PodSandbox 到观察到 Pi 容器以退出码 0 结束耗时 11.45 秒。两轮均收到了成功的最终 assistant 状态，并读写了正确的随机值。开发构建上先前的独立实测为 20.87 秒，两种构建各测一次。[Pi 会话脚本](../tests/vm_agent_loop_pi.sh)
