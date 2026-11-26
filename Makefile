@@ -10,6 +10,7 @@ PROTOC ?= protoc
 TARGET ?= $(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET),$(shell uname -m)-unknown-linux-gnu)
 CARGO_TARGET_DIR ?= target
 RELEASE_DIR = $(CARGO_TARGET_DIR)/$(TARGET)/release
+PACKAGE = nautilus-linux-$(firstword $(subst -, ,$(TARGET))).tar.gz
 SUDO ?= $(if $(DESTDIR),,sudo)
 INSTALL_DIR := /usr/local/bin
 CONFIG_DIR := /etc/nautilus
@@ -33,7 +34,8 @@ check-protoc: ## 检查 protoc 能否编译 vendored CRI schema
 .PHONY: release
 release: check-protoc ## 构建生产版本
 	@echo "🚀 构建 Nautilus 生产版本..."
-	$(CARGO) build --locked --release --target $(TARGET) --target-dir $(CARGO_TARGET_DIR)
+	# Keep install-time make overrides out of Cargo's native dependency builds.
+	env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES $(CARGO) build --locked --release --target $(TARGET) --target-dir $(CARGO_TARGET_DIR)
 	@echo "✅ 生产版本构建完成"
 
 .PHONY: debug
@@ -150,13 +152,14 @@ bench: ## 运行性能基准测试
 
 # 打包和发布
 .PHONY: package
-package: release ## 创建发布包
-	@echo "📦 创建发布包..."
+package: ## 创建包含 daemon、CLI、配置和 systemd 服务的发布包
 	mkdir -p dist
-	tar -czf dist/nautilus-$(shell uname -m).tar.gz -C target/release nautilus
-	cp nautilus.toml dist/
-	cp docs/installation_and_usage.md dist/README.md
-	@echo "✅ 发布包创建完成: dist/nautilus-$(shell uname -m).tar.gz"
+	@set -eu; stage=$$(mktemp -d dist/.package.XXXXXX); trap 'rm -rf "$$stage"' EXIT; \
+		$(MAKE) install-service DESTDIR="$(CURDIR)/$$stage/root" SUDO=; \
+		install -D -m 0644 LICENSE "$$stage/root/usr/share/doc/nautilus/LICENSE"; \
+		tar -czf "$$stage/$(PACKAGE)" -C "$$stage/root" .; \
+		(cd "$$stage" && sha256sum "$(PACKAGE)" > "$(PACKAGE).sha256"); \
+		mv "$$stage/$(PACKAGE)" "$$stage/$(PACKAGE).sha256" dist/
 
 .PHONY: docker
 docker: ## 构建 Docker 镜像

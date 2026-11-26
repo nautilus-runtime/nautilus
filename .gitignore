@@ -27,3 +27,4 @@ target-root/
 
 # Serena MCP (local agent memory/index, not for VCS)
 .serena/
+/dist/
