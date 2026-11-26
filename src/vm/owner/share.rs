@@ -1,10 +1,56 @@
 //! A private virtiofsd and writable OCI bundles for one Pod attempt.
 
 use super::*;
+use nix::mount::{umount2, MntFlags};
+use volume::{mount_id, open_slot, Worker};
 
 const EXPORT: &str = "podfs";
 const SOCKET: &str = "fs.sock";
 const PID_FILE: &str = "fs.sock.pid";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct RootfsMount {
+    container: String,
+    bundle: FileIdentity,
+    placeholder: FileIdentity,
+    root: FileIdentity,
+    mount: u64,
+}
+
+impl RootfsMount {
+    fn worker_bundle(&self, worker: &Worker, share: &Share) -> io::Result<File> {
+        let bundles = pin_directory(&pinned(&worker.root).join("containers"), share.containers)?;
+        pin_directory(&pinned(&bundles).join(&self.container), Some(self.bundle))
+    }
+
+    fn attach(&self, worker: &Worker, share: &Share, view: &File) -> io::Result<()> {
+        let bundle = self.worker_bundle(worker, share)?;
+        let slot = open_slot(&bundle, "rootfs")?;
+        if FileIdentity::from_meta(&slot.metadata()?) != self.placeholder
+            || mount_id(&slot)? != mount_id(&bundle)?
+        {
+            return Err(invalid("VM rootfs placeholder changed before attachment"));
+        }
+        worker.attach(view, &slot)
+    }
+
+    fn detach(&self, worker: &Worker, share: &Share) -> io::Result<()> {
+        if !worker.has_mount(self.mount)? {
+            return Ok(());
+        }
+        let bundle = self.worker_bundle(worker, share)?;
+        let slot = open_slot(&bundle, "rootfs")?;
+        if mount_id(&slot)? != self.mount || FileIdentity::from_meta(&slot.metadata()?) != self.root
+        {
+            return Err(invalid("refusing to detach a replaced VM rootfs"));
+        }
+        worker.in_namespace(|| {
+            nix::unistd::fchdir(bundle.as_raw_fd())?;
+            umount2("rootfs", MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW)?;
+            Ok(())
+        })
+    }
+}
 
 fn no_host_mounts(dir: &Path) -> io::Result<()> {
     crate::storage::snapshot::check_unmounted(&dir.canonicalize()?).map_err(io::Error::other)
@@ -198,9 +244,30 @@ impl Lease {
 }
 
 impl PodVmStore {
+    pub(crate) async fn supports_rootfs_mount(&self, id: &str) -> io::Result<bool> {
+        let Some(lease) = self.lease(id, Operation::Status).await? else {
+            return Ok(false);
+        };
+        Ok(lease
+            .load(id)?
+            .and_then(|o| o.share)
+            .is_some_and(|share| share.volume_catalog_mount.is_some()))
+    }
+
     /// Atomically publish a host-private staged directory on the same filesystem.
     /// Nothing opens guest-supplied paths inside a published bundle.
     pub async fn publish_bundle(&self, id: &str, container: &str, staged: &Path) -> io::Result<()> {
+        self.publish_bundle_with_root(id, container, staged, None)
+            .await
+    }
+
+    pub(crate) async fn publish_bundle_with_root(
+        &self,
+        id: &str,
+        container: &str,
+        staged: &Path,
+        view: Option<File>,
+    ) -> io::Result<()> {
         if !canonical_uuid(container) {
             return Err(invalid("expected canonical container UUID"));
         }
@@ -209,7 +276,7 @@ impl PodVmStore {
             .lease(id, Operation::Remove)
             .await?
             .ok_or_else(missing)?;
-        let owner = lease.load(id)?.ok_or_else(missing)?;
+        let mut owner = lease.load(id)?.ok_or_else(missing)?;
         if owner.removing || owner.boot.is_none() {
             return Err(invalid("VM is not accepting bundles"));
         }
@@ -218,6 +285,29 @@ impl PodVmStore {
             return Err(invalid("staged bundle is not a directory"));
         }
         no_host_mounts(staged)?;
+        let worker = if let Some(view) = &view {
+            let worker = lease.volume_worker(&owner).await?.ok_or_else(missing)?;
+            let receipt = RootfsMount {
+                container: container.into(),
+                bundle: FileIdentity::check(staged)?,
+                placeholder: FileIdentity::check(&staged.join("rootfs"))?,
+                root: FileIdentity::from_meta(&view.metadata()?),
+                mount: mount_id(view)?,
+            };
+            let share = owner.share.as_mut().expect("VM export");
+            if share
+                .rootfs
+                .iter()
+                .any(|mount| mount.container == container)
+            {
+                return Err(invalid("VM container already has a rootfs mount receipt"));
+            }
+            share.rootfs.push(receipt);
+            lease.save(&owner)?;
+            Some(worker)
+        } else {
+            None
+        };
         nix::fcntl::renameat2(
             None,
             staged,
@@ -226,7 +316,16 @@ impl PodVmStore {
             nix::fcntl::RenameFlags::RENAME_NOREPLACE,
         )
         .map_err(io::Error::from)?;
-        bundles.sync_all()
+        bundles.sync_all()?;
+        if let Some((worker, view)) = worker.zip(view) {
+            let share = owner.share.as_ref().expect("VM export");
+            share
+                .rootfs
+                .last()
+                .expect("saved receipt")
+                .attach(&worker, share, &view)?;
+        }
+        Ok(())
     }
 
     pub async fn remove_bundle(&self, id: &str, container: &str) -> io::Result<()> {
@@ -245,10 +344,36 @@ impl PodVmStore {
         // cannot redirect deletion into a different pre-existing mount in this export.
         no_host_mounts(&pinned(&bundles))?;
         let path = pinned(&bundles).join(container);
+        if let Some(share) = &owner.share {
+            if let Some(mount) = share
+                .rootfs
+                .iter()
+                .find(|mount| mount.container == container)
+            {
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_dir() && FileIdentity::from_meta(&meta) == mount.bundle => {
+                    }
+                    Ok(_) => return Err(invalid("refusing to remove a replaced VM bundle")),
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                if let Some(worker) = lease.volume_worker(&owner).await? {
+                    mount.detach(&worker, share)?;
+                }
+                // Keep the receipt until the published bundle is gone.
+            }
+        }
         match fs::remove_dir_all(&path) {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
             Ok(()) => bundles.sync_all(),
+        }?;
+        let share = owner.share.as_mut().expect("VM export");
+        let before = share.rootfs.len();
+        share.rootfs.retain(|mount| mount.container != container);
+        if before != share.rootfs.len() {
+            lease.save(&owner)?;
         }
+        Ok(())
     }
 }

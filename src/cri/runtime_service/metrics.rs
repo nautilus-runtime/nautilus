@@ -970,7 +970,16 @@ impl NautilusRuntimeService {
             let (sample, mut samples) = self.guest_pod_metric_samples(pod).await?;
             let mut container_metrics = Vec::new();
             for container in containers {
-                if let Some(sample) = samples.remove(&container.id) {
+                if let Some(mut sample) = samples.remove(&container.id) {
+                    let bundle = self._config.storage.container_dir.join(&container.id);
+                    // The guest sees the merged view. Attribute writes to this
+                    // container's private upper without charging the shared lower.
+                    if crate::storage::snapshot::has_view(&bundle).map_err(Status::from)? {
+                        sample.filesystem =
+                            tokio::task::spawn_blocking(move || filesystem_stats(&bundle))
+                                .await
+                                .unwrap_or_default();
+                    }
                     let metrics = guest_metrics(&sample, &labels(pod, Some(&container)), false)
                         .map_err(Status::data_loss)?;
                     container_metrics.push(ContainerMetrics {

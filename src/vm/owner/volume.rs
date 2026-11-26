@@ -131,7 +131,7 @@ fn detached(source: &File, readonly: bool, recursive: bool) -> io::Result<File> 
     Ok(tree.into())
 }
 
-fn open_slot(parent: &File, name: &str) -> io::Result<File> {
+pub(super) fn open_slot(parent: &File, name: &str) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
@@ -140,6 +140,7 @@ fn open_slot(parent: &File, name: &str) -> io::Result<File> {
 
 pub(super) struct Worker {
     namespace: File,
+    pub(super) root: File,
     catalog: File,
     process: File,
 }
@@ -165,12 +166,16 @@ impl Worker {
         }
         Ok(Some(Self {
             namespace: ns,
+            root,
             catalog,
             process,
         }))
     }
 
-    fn in_namespace<T: Send>(&self, run: impl FnOnce() -> io::Result<T> + Send) -> io::Result<T> {
+    pub(super) fn in_namespace<T: Send>(
+        &self,
+        run: impl FnOnce() -> io::Result<T> + Send,
+    ) -> io::Result<T> {
         // Tokio's executor and other Pods keep their filesystem context.
         std::thread::scope(|scope| {
             scope
@@ -184,7 +189,7 @@ impl Worker {
         })
     }
 
-    fn attach(&self, tree: &File, slot: &File) -> io::Result<()> {
+    pub(super) fn attach(&self, tree: &File, slot: &File) -> io::Result<()> {
         self.in_namespace(|| {
             LinuxSyscall
                 .move_mount(
@@ -194,8 +199,15 @@ impl Worker {
                     None,
                     linux::MOVE_MOUNT_F_EMPTY_PATH | linux::MOVE_MOUNT_T_EMPTY_PATH,
                 )
-                .map_err(|e| io::Error::other(format!("publish volume in virtiofsd: {e}")))
+                .map_err(|e| io::Error::other(format!("publish mount in virtiofsd: {e}")))
         })
+    }
+
+    pub(super) fn has_mount(&self, id: u64) -> io::Result<bool> {
+        let info = fs::read_to_string(pinned(&self.process).join("mountinfo"))?;
+        Ok(info
+            .lines()
+            .any(|l| l.split_once(' ').and_then(|(id, _)| id.parse::<u64>().ok()) == Some(id)))
     }
 
     pub(super) fn seal_catalog(&self, host: &File) -> io::Result<u64> {
@@ -216,10 +228,7 @@ impl Worker {
         if actual.is_none() || actual == Some(mount_id(&self.catalog)?) {
             // Missing here may also mean the name was replaced or renamed by
             // the host. Don't drop the receipt while our mount survives elsewhere.
-            let info = fs::read_to_string(pinned(&self.process).join("mountinfo"))?;
-            if info.lines().any(|l| {
-                l.split_once(' ').and_then(|(id, _)| id.parse::<u64>().ok()) == Some(binding.mount)
-            }) {
+            if self.has_mount(binding.mount)? {
                 return Err(invalid("volume moved away from its recorded placeholder"));
             }
             return Ok(());
@@ -242,7 +251,7 @@ impl Worker {
 }
 
 impl Lease {
-    async fn volume_worker(&self, owner: &Owner) -> io::Result<Option<Worker>> {
+    pub(super) async fn volume_worker(&self, owner: &Owner) -> io::Result<Option<Worker>> {
         let share = owner
             .share
             .as_ref()

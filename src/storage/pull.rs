@@ -608,14 +608,19 @@ pub async fn materialize_rootfs(
     image_ref: &str,
     rootfs_dir: &Path,
 ) -> Result<ImageWorkload> {
-    prepare_root(config, image_ref, rootfs_dir, false).await
+    prepare_root(config, image_ref, rootfs_dir, None).await
 }
 
 pub(crate) async fn prepare_bundle(config: &Config, image_ref: &str, bundle: &Path, overlay: bool) -> Result<ImageWorkload> {
-    prepare_root(config, image_ref, &bundle.join("rootfs"), overlay && config.storage.overlay.enabled).await
+    prepare_root(config, image_ref, &bundle.join("rootfs"), overlay.then_some(bundle)).await
 }
 
-async fn prepare_root(config: &Config, image_ref: &str, rootfs_dir: &Path, overlay: bool) -> Result<ImageWorkload> {
+pub(crate) async fn prepare_root(
+    config: &Config,
+    image_ref: &str,
+    rootfs_dir: &Path,
+    snapshot_bundle: Option<&Path>,
+) -> Result<ImageWorkload> {
     let reference = resolve_ref(config, image_ref)?;
     // Offline fast path: cached manifest+config and every layer blob present.
     let cached = match load_cached(config, &reference).await {
@@ -638,13 +643,16 @@ async fn prepare_root(config: &Config, image_ref: &str, rootfs_dir: &Path, overl
 
     let workload = cached.workload();
     let root = rootfs_dir.to_owned();
+    let snapshot_bundle = snapshot_bundle
+        .filter(|_| config.storage.overlay.enabled)
+        .map(Path::to_owned);
     let image_dir = config.storage.image_dir.clone();
     let options = config.storage.overlay.mount_options.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let key = cached.snapshot_key()?;
         let unpack = |dst: &Path| cached.unpack(dst, &image_dir);
-        if overlay {
-            super::snapshot::prepare(root.parent().unwrap(), &key, &options, unpack)?;
+        if let Some(bundle) = snapshot_bundle {
+            super::snapshot::prepare(&bundle, &root, &key, &options, unpack)?;
         } else {
             unpack(&root)?;
         }
