@@ -18,6 +18,24 @@ To enable the VM handler on a Kubernetes node and run a Pod, follow the [Runtime
 
 ## Quick start
 
+### Install from GitHub Releases
+
+On a Linux x86-64 or ARM64 machine with systemd and glibc 2.35 or newer, run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nautilus-runtime/nautilus/main/scripts/install.sh | bash
+```
+
+The installer downloads the matching archive from [GitHub Releases](https://github.com/nautilus-runtime/nautilus/releases), checks its SHA-256 checksum, installs both binaries and starts the systemd service on a fresh install. It installs missing networking tools and CNI plugins on Debian and Ubuntu through apt. On other distributions, install `ip`, `iptables` and the `bridge`, `loopback` and `host-local` CNI plugins before running it. The Pod VM handler has [separate node requirements](docs/VM_RUNTIMECLASS.md).
+
+To install a specific release, add the tag after `bash -s --`. For example:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nautilus-runtime/nautilus/v0.1.0/scripts/install.sh | bash -s -- v0.1.0
+```
+
+Rerun the installer to update the binaries. It preserves existing configuration and systemd unit files. After draining workloads, run `sudo systemctl restart nautilusd` to load the updated daemon. Check the installed service with `sudo nautilus version`.
+
 ### Install from source
 
 Use a Linux machine with systemd and a current stable Rust toolchain with Cargo. On Debian or Ubuntu, install the build and runtime dependencies and check that your Protocol Buffers compiler can read the vendored CRI schema.

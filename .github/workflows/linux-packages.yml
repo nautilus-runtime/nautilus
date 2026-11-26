@@ -1,0 +1,79 @@
+name: Linux packages
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libelf-dev zlib1g-dev libseccomp-dev libsystemd-dev
+          rustup update stable --no-self-update
+          bash scripts/setup_remote_env.sh --protoc-only
+          echo "PROTOC=$HOME/.local/share/nautilus/protoc-29.3/bin/protoc" >> "$GITHUB_ENV"
+      - name: Build the release package
+        run: make package
+      - name: Verify the release package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          bash -n scripts/install.sh
+          asset="nautilus-linux-$ARCH.tar.gz"
+          (cd dist && sha256sum -c "$asset.sha256")
+          staging=$(mktemp -d)
+          tar -xzf "dist/$asset" -C "$staging"
+          "$staging/usr/local/bin/nautilus" --help >/dev/null
+          "$staging/usr/local/bin/nautilusd" --help >/dev/null
+          test -s "$staging/etc/nautilus/config.toml"
+          test -s "$staging/etc/systemd/system/nautilusd.service"
+      - name: Test fresh installation and update
+        run: |
+          asset_dir="$PWD/dist"
+          mock=$(mktemp -d)
+          cat > "$mock/curl" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          url="${@: -3:1}"
+          [[ "$url" == https://github.com/nautilus-runtime/nautilus/releases/download/v0.1.0/* ]]
+          [[ "${@: -2:1}" == -o ]]
+          cp "$RELEASE_ASSETS/${url##*/}" "${@: -1}"
+          SH
+          chmod +x "$mock/curl"
+          export PATH="$mock:$PATH" RELEASE_ASSETS="$asset_dir"
+          bash scripts/install.sh v0.1.0
+          for _ in {1..10}; do
+            if sudo /usr/local/bin/nautilus version; then break; fi
+            sleep 1
+          done
+          sudo /usr/local/bin/nautilus version
+          pid=$(systemctl show -p MainPID --value nautilusd)
+          printf '\n# preserved by the updater\n' | sudo tee -a /etc/nautilus/config.toml
+          config=$(sha256sum /etc/nautilus/config.toml)
+          bash scripts/install.sh v0.1.0
+          test "$config" = "$(sha256sum /etc/nautilus/config.toml)"
+          test "$pid" = "$(systemctl show -p MainPID --value nautilusd)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nautilus-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
