@@ -778,10 +778,10 @@ async fn scenario(
     let bundles = root.join("containers");
     let a_pin = bundles.join(&a).join("snapshot.v1");
     let b_pin = bundles.join(&b).join("snapshot.v1");
-    if a_pin.exists()
+    let expect_snapshot = a_pin.exists()
         || b_pin.exists()
-        || std::env::var_os("NAUTILUS_VM_TEST_REQUIRE_SNAPSHOT").is_some()
-    {
+        || std::env::var_os("NAUTILUS_VM_TEST_REQUIRE_SNAPSHOT").is_some();
+    if expect_snapshot {
         let a_pin = fs::metadata(a_pin).context("first VM root must pin the snapshot")?;
         let b_pin = fs::metadata(b_pin).context("second VM root must pin the snapshot")?;
         ensure!((a_pin.dev(), a_pin.ino()) == (b_pin.dev(), b_pin.ino()));
@@ -945,6 +945,23 @@ async fn scenario(
             PathBuf::from(format!("/proc/{pid}/root/volumes")),
         ))
     };
+    let (_, worker_volumes) = fsd(&id)?;
+    let mountinfo = worker_volumes
+        .ancestors()
+        .nth(2)
+        .context("virtiofsd proc directory")?
+        .join("mountinfo");
+    let mounted_root = |container: &str| -> Result<bool> {
+        let suffix = format!("/containers/{container}/rootfs");
+        Ok(fs::read_to_string(&mountinfo)?.lines().any(|line| {
+            line.split_ascii_whitespace()
+                .nth(4)
+                .is_some_and(|path| path.ends_with(&suffix))
+        }))
+    };
+    if expect_snapshot {
+        ensure!(mounted_root(&a)? && mounted_root(&b)?);
+    }
     let (_, mounted) = fsd(&id)?;
     let (_, sibling) = fsd(&other)?;
     for slot in export.read_dir()? {
@@ -1145,8 +1162,10 @@ async fn scenario(
             })
             .await?;
         }
+        if expect_snapshot {
+            ensure!(!mounted_root(c)? && !bundles.join(c).exists());
+        }
         if c == &a {
-            use std::os::unix::fs::MetadataExt;
             ensure!(!staging.exists() && fs::metadata(&foreign)?.ino() == foreign_ino);
             fs::remove_file(&foreign)?;
             ensure!(export.read_dir()?.count() == 1 && fs::read(&hosts)? == b"updated hosts");
