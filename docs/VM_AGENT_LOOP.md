@@ -109,3 +109,27 @@ done
 ```
 
 将上面的 unit、配置与 IPAM 目录替换为测试节点的实际值。模型端点提供兼容的 `/v1/chat/completions` 与 JSON Schema 响应约束，`MODEL_URL` 以 `/v1` 结尾。省略 `--model-url` 可仅测试 CRI 生命周期、热调用和驻留内存。每个会话在自己的容器启动后立即进入 agent。原始 JSON Lines 按波记录推理和 guest 工具的耗时、实际动作、冷启动分段和 PSS。汇总要求预期波数、逐个会话样本、回收成功与最终完成记录全部齐全，若有模型会话失败则返回非零状态。
+
+## OCI rootfs 快照复用 A/B
+
+2026-11-26 在 pro6000 的隔离 Debian 13 KVM 节点复测。使用 Nautilus Release 构建 `8526792` 和 Kata Containers 4.4.0 Rust shim（containerd v2.4.2）。两端均使用同一个 Cloud Hypervisor v55.0 二进制、virtiofsd 1.13.2、crictl v1.37.0 和已预拉取的 `docker.io/library/node@sha256:7cc56ef285a8568121537d17b05e72128f01b89c54607b51acf084a50ef483f3`。宿主内核为 `6.12.118+deb13-cloud-amd64`，测试节点有 12 个 vCPU。每个 VM 有 1 vCPU 和 384 MiB guest 内存，每 Pod 的宿主 cgroup 上限为 1 CPU 和 512 MiB。guest 内核沿用各自的版本，Nautilus 为 `5.15.0-191-generic`，Kata 为 `6.18.62`。[Issue #76](https://github.com/nautilus-runtime/nautilus/issues/76)
+
+每端在 1、4、16 并发下分别运行 20、6、6 波，共 140 个新 Pod、1,400 次热 ExecSync。每对交替运行顺序。所有 Nautilus 样本都固定同一个镜像快照，同时每波内的 upper 互相独立。每波验证了热调用状态、Pod 与容器回收，以及 VM 进程、IPAM 分配消失。
+
+下表各格为 **Nautilus / Kata** 的 P95，单位为毫秒。冷启动覆盖从发出 RunPodSandbox 到首条 ExecSync 返回合法的 boot ID。分段 P95 分别计算。
+
+| 并发 | RunPodSandbox | CreateContainer | StartContainer | 首次 ExecSync | 冷启动总耗时 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,369.0 / 2,170.7 | 138.2 / 38.6 | 38.0 / 94.4 | 53.2 / 68.3 | 1,565.6 / 2,324.1 |
+| 4 | 1,777.8 / 2,701.6 | 141.0 / 27.7 | 28.2 / 68.4 | 46.9 / 51.8 | 1,943.2 / 2,820.8 |
+| 16 | 5,488.9 / 5,438.9 | 385.9 / 39.2 | 53.5 / 124.6 | 155.6 / 107.7 | 5,621.4 / 5,564.8 |
+
+内存为热调用结束后空闲一秒的每 Pod PSS 中位数，计入 VMM、virtiofsd 及 Kata 每 Pod shim。吞吐为每波的聚合 ExecSync 吞吐中位数。整波回收包含 Stop/RemoveContainer 和 Stop/RemovePodSandbox。
+
+| 并发 | 热 ExecSync P95（ms） | 吞吐（次/s） | 每 Pod PSS（MiB） | 整波回收 P95（ms） |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 56.1 / 62.4 | 29.3 / 25.0 | 135.0 / 163.5 | 659.0 / 842.8 |
+| 4 | 34.0 / 41.2 | 138.6 / 123.5 | 129.4 / 141.3 | 802.1 / 1,230.1 |
+| 16 | 74.4 / 85.6 | 289.2 / 254.9 | 127.9 / 136.2 | 1,650.1 / 2,847.6 |
+
+与优化前使用相同镜像和配额的 Nautilus 构建 `4e5c076` 相比，1、4、16 并发的 CreateContainer P95 从 1,579、1,664、4,822 毫秒降到 138、141、386 毫秒。16 并发的冷启动 P95 从 9.90 秒降到 5.62 秒，同轮 Kata 为 5.56 秒。该档位冷启动时间主要用在 RunPodSandbox。
