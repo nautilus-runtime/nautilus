@@ -1434,9 +1434,8 @@ impl RuntimeService for NautilusRuntimeService {
         request: Request<ReopenContainerLogRequest>,
     ) -> Result<Response<ReopenContainerLogResponse>, Status> {
         let req = request.into_inner();
-        // After a rotate (unlink) the runtime must recreate the log file even
-        // before the next line arrives. Recreate the container's host log
-        // destination directly.
+        // The non-VM logger opens the path for each write. Create a missing
+        // destination without discarding records already written after rotation.
         if let Some(c) = self
             .container_manager
             .get_container_state(&req.container_id)
@@ -1445,23 +1444,19 @@ impl RuntimeService for NautilusRuntimeService {
         {
             if c.sandbox_kind == "vm" {
                 self.container_manager.reopen_guest_log(&c.id).await.map_err(Status::from)?;
-                return Ok(Response::new(ReopenContainerLogResponse {}));
-            }
-            if matches!(c.sandbox_kind.as_str(), "wasi" | "wasm") && !c.image_id.is_empty() {
-                if let Some(lp) = c.log_path {
-                    if let Some(parent) = std::path::Path::new(&lp).parent() {
-                        tokio::fs::create_dir_all(parent).await.map_err(|e| Status::internal(e.to_string()))?;
-                    }
-                    tokio::fs::OpenOptions::new().create(true).append(true).open(lp).await
-                        .map_err(|e| Status::internal(e.to_string()))?;
+            } else if let Some(path) = c.log_path {
+                let path = std::path::Path::new(&path);
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(crate::core::Error::from)?;
                 }
-                return Ok(Response::new(ReopenContainerLogResponse {}));
-            }
-            if let Some(lp) = c.log_path {
-                if let Some(parent) = std::path::Path::new(&lp).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::File::create(&lp);
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await
+                    .map_err(crate::core::Error::from)?;
             }
         }
         Ok(Response::new(ReopenContainerLogResponse {}))
@@ -1945,6 +1940,55 @@ impl RuntimeService for NautilusRuntimeService {
         _request: Request<RestorePodRequest>,
     ) -> Result<Response<RestorePodResponse>, Status> {
         Err(Status::unimplemented("pod checkpoint/restore is out of scope for now"))
+    }
+}
+
+#[cfg(test)]
+mod log_reopen_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_reopen_creates_missing_logs_and_preserves_replacement_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/container.log");
+        let mut config = Config::default();
+        config.runtime.state_dir = dir.path().join("runtime");
+        config.storage.image_dir = dir.path().join("images");
+        config.storage.container_dir = dir.path().join("containers");
+        let state = Arc::new(StateManager::new(dir.path().join("db")).unwrap());
+        let container: StoredContainer = serde_json::from_value(serde_json::json!({
+            "id": "native",
+            "pod_id": "pod",
+            "name": "logger",
+            "image": "unused",
+            "status": "Running",
+            "created_at": chrono::Utc::now(),
+            "log_path": path,
+            "sandbox_kind": "runc",
+            "labels": {},
+            "annotations": {}
+        }))
+        .unwrap();
+        state.save_container_state(&container).await.unwrap();
+        let service = NautilusRuntimeService::new(Arc::new(config), state);
+        let reopen = || {
+            service.reopen_container_log(Request::new(ReopenContainerLogRequest {
+                container_id: container.id.clone(),
+            }))
+        };
+
+        reopen().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        std::fs::write(&path, b"new log records\n").unwrap();
+        reopen().await.unwrap();
+        reopen().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new log records\n");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(reopen().await.unwrap_err().code(), tonic::Code::Internal);
+        assert!(path.is_dir());
     }
 }
 
