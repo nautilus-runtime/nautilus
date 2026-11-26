@@ -133,7 +133,7 @@ Run the Rust test suite on a Linux test machine with permission to create namesp
 cargo test --locked --target "$(uname -m)-unknown-linux-gnu"
 ```
 
-The November 25, 2026 unfiltered `critest` v1.37.0 run completed with **107 passed, 0 failed and 35 skipped**. Kubernetes v1.37.2 has also exercised the VM RuntimeClass and native OCI CPU and memory resizing on a live node. See the [conformance results](docs/CRITEST_RESULTS.md), [architecture guide](docs/ARCHITECTURE.md) and [roadmap](docs/DEVELOPMENT_ROADMAP.md) for coverage and remaining work.
+The November 26, 2026 unfiltered `critest` v1.37.0 run completed with **107 passed, 0 failed and 35 skipped**. Kubernetes v1.37.2 has also exercised the VM RuntimeClass and native OCI CPU and memory resizing on a live node. On a KVM test node, new Pod VM exec and attach sessions succeeded on the first attempt after the guest connection recovered, and six consecutive 16-way agent-loop waves completed with no Pods or containers left. See the [conformance results](docs/CRITEST_RESULTS.md), [architecture guide](docs/ARCHITECTURE.md) and [roadmap](docs/DEVELOPMENT_ROADMAP.md) for coverage and remaining work.
 
 The [containerd comparison](docs/PERFORMANCE.md) measures OCI pod sandbox creation, container creation, startup and workload readiness. It includes the test procedure and per-workload timings.
 

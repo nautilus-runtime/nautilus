@@ -4,9 +4,23 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-26 VM Pod 并发清理
+
+在 pro6000 的隔离 Debian 13 KVM 节点复现 16 路 `StopPodSandbox` 在 6 秒期限内阻塞。daemon 的 7 个 sled I/O 线程同时等待由同一线程池负责的落盘任务。修复 `14868c4` 后首波耗时 397 毫秒，重复 Stop、并发 Remove 以及删除后的 Stop 和 Remove 均成功。Cloud Hypervisor 为 `v55.0`，宿主内核为 `6.12.118+deb13-cloud-amd64`，virtiofsd 为 `1.13.2`。连续 6 波各并发 16 个 VM Pod，合计 96 个 Pod、960 次热 ExecSync，整波回收 P95 为 812 毫秒。结束时本轮 Pod、容器、VM 服务、挂载、网络命名空间和 IP 租约均已回收。[基准记录](VM_AGENT_LOOP.md#16-路并发回收复验) · [问题 #66](https://github.com/nautilus-runtime/nautilus/issues/66)
+
+集成日志轮转、VM 流式交互和安装更新后的 `2e41a9f` 在同一个隔离 Unix socket 上通过 Runtime 和 Image 的完整 `critest v1.37.0`，结果为 **107 通过、0 失败、35 跳过**（286.347 秒），结束时 CRI Pod 和容器均为零。Linux Rust 测试 136 通过、0 失败、8 项默认忽略。并发提交回归在旧版 15 秒内受控失败，修复版在 0.06 秒完成并重新打开数据库，确认只保留应存记录。严格 Clippy 的 29 项诊断与基线一致，格式检查仍涉及基线的 31 个文件。
+
+## 2026-11-26 Pod VM 流式交互恢复
+
+在 `pro6000` 的 Debian 13 嵌套 KVM 节点验证 `5ab551a`。宿主运行 Linux `6.12.118+deb13-cloud-amd64`，使用 Cloud Hypervisor `v55.0` 和 virtiofsd `1.13.2`。分别在交互 exec、3 MiB 二进制 stdin 和 attach 前短暂隐藏 guest vsock，并通过 CRI 确认容器状态变为 `Unknown`。恢复原 socket 后，上游 `crictl v1.37.0` 首次请求即成功，三个场景无需先调用 `ContainerStatus` 刷新。另以相同生产代码连续完成 20 次 3 MiB 二进制往返。
+
+未过滤的 `critest v1.37.0` 使用同一个 CRI socket 的 runtime 和 image 端点，结果为 **107 通过、0 失败、35 跳过**（287.442 秒），结束后 Pod 和容器均为零。Linux Rust 测试完整复跑为 134 通过、0 失败、8 项默认忽略。严格 Clippy 与基线相同，仍有 29 项诊断。全库格式检查沿用存量差异。
+
 ## 2026-11-26 原生容器日志轮转
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）通过真实 CRI socket 验证 `ac3fec2`。原生容器在重命名旧日志后先写入一条记录，随后连续请求两次 `ReopenContainerLog`。修复版保留新旧日志各自的内容，后续输出继续进入当前文件。再次移走文件后，reopen 在输出到来前重建文件。目标路径为目录时返回 `Internal`。基线会清空替换文件并对目录返回成功。两轮均清理全部测试 Pod 和容器。[问题 #68](https://github.com/nautilus-runtime/nautilus/issues/68)
+
+另用上游 kubelet `v1.37.2` 和集成候选版 `2e41a9f` 运行原生 CNI 静态 Pod。日志上限 4 KiB，每 3 秒检查一次。kubelet 对同一容器完成 6 次 `ReopenContainerLog`，450 条编号记录跨 6 份归档逐条核对，无丢失或重复，当前日志包含最后一次轮转后写入的完成标记。验收后 CRI Pod 和容器均为零。
 
 Linux 串行 Rust 测试 135 通过、0 失败、8 忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查涉及基线的 31 个文件。未过滤的 `critest` v1.37.0 使用同一隔离 Runtime 和 Image socket，**107 通过、0 失败、35 跳过**，耗时 286.737 秒，无残留 Pod 或容器。
 
@@ -17,12 +31,6 @@ Linux 串行 Rust 测试 135 通过、0 失败、8 忽略。严格 Clippy 保持
 Cloud Hypervisor v55.0、virtiofsd 1.13.2 和真实 CRI 的 VM 工作负载与 daemon 恢复场景通过。附带的可选 `crictl` 交互用例在原版与修复版均复现失败。Linux 串行 Rust 测试 134 通过、0 失败、8 项忽略，覆盖 tar、gzip 和 zstd 的文件读取、whiteout 与硬链接。严格 Clippy 保持基线的 29 项诊断，格式检查涉及基线的 31 个文件。
 
 完整未过滤的 `critest` v1.37.0 对同一隔离 socket 运行 Runtime 和 Image 验收，**107 通过、0 失败、35 跳过**，耗时 314.576 秒，结束时无残留 Pod 或容器。
-
-## 2026-11-26 Pod VM 流式交互恢复
-
-在 `pro6000` 的 Debian 13 嵌套 KVM 节点验证 `5ab551a`。宿主运行 Linux `6.12.118+deb13-cloud-amd64`，使用 Cloud Hypervisor `v55.0` 和 virtiofsd `1.13.2`。分别在交互 exec、3 MiB 二进制 stdin 和 attach 前短暂隐藏 guest vsock，并通过 CRI 确认容器状态变为 `Unknown`。恢复原 socket 后，上游 `crictl v1.37.0` 首次请求即成功，三个场景无需先调用 `ContainerStatus` 刷新。另以相同生产代码连续完成 20 次 3 MiB 二进制往返。
-
-未过滤的 `critest v1.37.0` 使用同一个 CRI socket 的 runtime 和 image 端点，结果为 **107 通过、0 失败、35 跳过**（287.442 秒），结束后 Pod 和容器均为零。Linux Rust 测试完整复跑为 134 通过、0 失败、8 项默认忽略。严格 Clippy 与基线相同，仍有 29 项诊断。全库格式检查沿用存量差异。
 
 ## 2026-11-25 原生 OCI CPU 与内存原地调整
 
