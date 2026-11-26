@@ -4,7 +4,7 @@ use crate::proto::runtime::v1::{
     ContainerMetrics, CpuUsage, MemoryUsage, Metric, MetricDescriptor, MetricType,
     PodSandboxMetrics, UInt64Value,
 };
-use crate::vm::workload::Sample;
+use crate::vm::workload::{FilesystemSample, Sample};
 use futures::StreamExt;
 use pathrs::{error::ErrorKind, flags::OpenFlags, Root};
 use std::collections::{HashMap, HashSet};
@@ -521,6 +521,34 @@ fn devices(stat: &str) -> Vec<DeviceIo> {
         .collect()
 }
 
+fn append_block_metrics(
+    result: &mut Vec<Metric>,
+    family: &Family,
+    labels: &[String],
+    [device, major, minor]: [&str; 3],
+    counter: impl Fn(&str) -> Option<u64>,
+) {
+    match family.source {
+        BlockIo(key) => {
+            if let Some(value) = counter(key) {
+                result.push(family.metric(labels, &[device], value));
+            }
+        }
+        BlockBytes => {
+            for (operation, key) in [
+                ("Read", "rbytes"),
+                ("Write", "wbytes"),
+                ("Discard", "dbytes"),
+            ] {
+                if let Some(value) = counter(key) {
+                    result.push(family.metric(labels, &[device, major, minor, operation], value));
+                }
+            }
+        }
+        _ => unreachable!("expected a block I/O family"),
+    }
+}
+
 const DIRECTORY: OpenFlags = OpenFlags::O_RDONLY
     .union(OpenFlags::O_DIRECTORY)
     .union(OpenFlags::O_NOFOLLOW);
@@ -555,15 +583,22 @@ fn writable_bytes(root: &Root, dev: u64, budget: Duration) -> Option<u64> {
     Some(bytes)
 }
 
-struct BackingFilesystem {
-    device: String,
-    inodes: u64,
-    inodes_free: u64,
-    capacity: u64,
-    usage: Option<u64>,
+fn filesystem_metric(
+    family: &Family,
+    kind: FsValue,
+    filesystem: &FilesystemSample,
+    labels: &[String],
+) -> Option<Metric> {
+    let value = match kind {
+        FsValue::Inodes => filesystem.inodes,
+        FsValue::InodesFree => filesystem.inodes_free,
+        FsValue::Limit => filesystem.capacity_bytes,
+        FsValue::Usage => filesystem.usage_bytes,
+    }?;
+    Some(family.metric(labels, &[&filesystem.device], value))
 }
 
-fn filesystem_stats(bundle: &Path) -> Option<BackingFilesystem> {
+fn filesystem_stats(bundle: &Path) -> Option<FilesystemSample> {
     let bundle_path = bundle.canonicalize().ok()?;
     let bundle = Root::open(&bundle_path).ok()?;
     // OverlayFS charges changes to upper. A non-overlay container owns its
@@ -583,12 +618,12 @@ fn filesystem_stats(bundle: &Path) -> Option<BackingFilesystem> {
     let dev = metadata.dev();
     let stats = nix::sys::statvfs::fstatvfs(&directory).ok()?;
     let root = Root::from_fd(directory);
-    Some(BackingFilesystem {
+    Some(FilesystemSample {
         device: device_name(libc::major(dev), libc::minor(dev)),
-        inodes: stats.files(),
-        inodes_free: stats.files_available(),
-        capacity: stats.blocks().checked_mul(stats.fragment_size())?,
-        usage: writable_bytes(&root, dev, Duration::from_millis(250)).and_then(|bytes| {
+        inodes: Some(stats.files()),
+        inodes_free: Some(stats.files_available()),
+        capacity_bytes: Some(stats.blocks().checked_mul(stats.fragment_size())?),
+        usage_bytes: writable_bytes(&root, dev, Duration::from_millis(250)).and_then(|bytes| {
             crate::storage::snapshot::check_unmounted(&layer).ok()?;
             bytes.checked_add(metadata.blocks().checked_mul(512)?)
         }),
@@ -678,29 +713,15 @@ fn native_metrics(
             }
             continue;
         }
-        if let BlockIo(key) = family.source {
+        if matches!(family.source, BlockIo(_) | BlockBytes) {
             for device in &block {
-                if let Some(&value) = device.counters.get(key) {
-                    result.push(family.metric(labels, &[&device.device], value));
-                }
-            }
-            continue;
-        }
-        if matches!(family.source, BlockBytes) {
-            for device in &block {
-                for (operation, key) in [
-                    ("Read", "rbytes"),
-                    ("Write", "wbytes"),
-                    ("Discard", "dbytes"),
-                ] {
-                    if let Some(&value) = device.counters.get(key) {
-                        result.push(family.metric(
-                            labels,
-                            &[&device.device, &device.major, &device.minor, operation],
-                            value,
-                        ));
-                    }
-                }
+                append_block_metrics(
+                    &mut result,
+                    family,
+                    labels,
+                    [&device.device, &device.major, &device.minor],
+                    |key| device.counters.get(key).copied(),
+                );
             }
             continue;
         }
@@ -752,15 +773,7 @@ fn native_metrics(
             }),
             Filesystem(kind) => {
                 if let Some(filesystem) = &filesystem {
-                    let value = match kind {
-                        FsValue::Inodes => Some(filesystem.inodes),
-                        FsValue::InodesFree => Some(filesystem.inodes_free),
-                        FsValue::Limit => Some(filesystem.capacity),
-                        FsValue::Usage => filesystem.usage,
-                    };
-                    if let Some(value) = value {
-                        result.push(family.metric(labels, &[&filesystem.device], value));
-                    }
+                    result.extend(filesystem_metric(family, kind, filesystem, labels));
                 }
                 continue;
             }
@@ -849,22 +862,70 @@ fn base_metrics(
     .collect()
 }
 
-fn guest_cgroup_metrics(sample: &Sample, labels: &[String]) -> Result<Vec<Metric>, &'static str> {
+fn guest_metrics(
+    sample: &Sample,
+    labels: &[String],
+    pod_scope: bool,
+) -> Result<Vec<Metric>, &'static str> {
     let (cpu, memory) = stats::readings(sample)?;
     let mut metrics = base_metrics(Some(cpu), Some(memory), labels);
     let counter = |file: &str, key: &str| sample.cgroup_counters.get(file)?.get(key).copied();
+    let process = sample.process.as_ref();
     for family in FAMILIES {
-        if matches!(family.source, Faults) {
-            for key in ["pgfault", "pgmajfault"] {
-                if let Some(value) = counter("memory.stat", key) {
-                    metrics.push(family.metric(labels, &[key, "hierarchy"], value));
-                }
-            }
-        }
         let value = match family.source {
             Field(file, key) => counter(file, key),
             Seconds(file, key) if family.name != CPU_USAGE.name => {
                 counter(file, key).map(|us| us / SECOND_US)
+            }
+            Faults => {
+                for key in ["pgfault", "pgmajfault"] {
+                    if let Some(value) = counter("memory.stat", key) {
+                        metrics.push(family.metric(labels, &[key, "hierarchy"], value));
+                    }
+                }
+                None
+            }
+            Processes => process.and_then(|p| p.processes),
+            Fds => process.and_then(|p| p.file_descriptors),
+            Sockets => process.and_then(|p| p.sockets),
+            Number("pids.current") => process.and_then(|p| p.threads),
+            ThreadLimit => process.and_then(|p| p.threads_max),
+            Filesystem(kind) if !pod_scope => {
+                if let Some(filesystem) = &sample.filesystem {
+                    metrics.extend(filesystem_metric(family, kind, filesystem, labels));
+                }
+                None
+            }
+            BlockIo(_) | BlockBytes => {
+                for device in &sample.block_io {
+                    append_block_metrics(
+                        &mut metrics,
+                        family,
+                        labels,
+                        [
+                            &device.device,
+                            &device.major.to_string(),
+                            &device.minor.to_string(),
+                        ],
+                        |key| match key {
+                            "rbytes" => device.read_bytes,
+                            "wbytes" => device.write_bytes,
+                            "dbytes" => device.discard_bytes,
+                            "rios" => device.read_ops,
+                            "wios" => device.write_ops,
+                            _ => None,
+                        },
+                    );
+                }
+                None
+            }
+            Network(index) if pod_scope => {
+                // The guest sends only the first four receive and transmit columns.
+                let column = if index < 8 { index } else { index - 4 };
+                for (name, counters) in &sample.network {
+                    metrics.push(family.metric(labels, &[name], counters[column]));
+                }
+                None
             }
             _ => None,
         };
@@ -906,11 +967,11 @@ impl NautilusRuntimeService {
             .await
             .map_err(Status::from)?;
         if pod.runtime_handler == "vm" {
-            let (sample, mut samples) = self.guest_pod_samples(pod).await?;
+            let (sample, mut samples) = self.guest_pod_metric_samples(pod).await?;
             let mut container_metrics = Vec::new();
             for container in containers {
                 if let Some(sample) = samples.remove(&container.id) {
-                    let metrics = guest_cgroup_metrics(&sample, &labels(pod, Some(&container)))
+                    let metrics = guest_metrics(&sample, &labels(pod, Some(&container)), false)
                         .map_err(Status::data_loss)?;
                     container_metrics.push(ContainerMetrics {
                         container_id: container.id,
@@ -920,7 +981,7 @@ impl NautilusRuntimeService {
             }
             return Ok(PodSandboxMetrics {
                 pod_sandbox_id: pod.id.clone(),
-                metrics: guest_cgroup_metrics(&sample, &labels(pod, None))
+                metrics: guest_metrics(&sample, &labels(pod, None), true)
                     .map_err(Status::data_loss)?,
                 container_metrics,
             });
@@ -971,7 +1032,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn guest_cgroup_metrics_support_legacy_and_extended_samples() {
+    fn guest_metrics_support_legacy_and_extended_samples() {
         let mut sample = serde_json::json!({
             "timestamp": 1,
             "cpuUsageNanos": 2_500_000_000u64,
@@ -983,14 +1044,14 @@ mod tests {
         });
         let labels = LABELS.map(String::from);
         let legacy = serde_json::from_value(sample.clone()).unwrap();
-        assert_eq!(guest_cgroup_metrics(&legacy, &labels).unwrap().len(), 3);
+        assert_eq!(guest_metrics(&legacy, &labels, false).unwrap().len(), 3);
 
         sample["cgroupCounters"] = serde_json::json!({
             "cpu.stat": {"nr_throttled": 0, "throttled_usec": 1_500_000},
             "memory.stat": {"anon": 1024, "pgfault": 7, "pgmajfault": 2},
         });
         let extended = serde_json::from_value(sample).unwrap();
-        let metrics = guest_cgroup_metrics(&extended, &labels).unwrap();
+        let metrics = guest_metrics(&extended, &labels, false).unwrap();
         let value = |name| {
             metrics
                 .iter()
@@ -1018,6 +1079,72 @@ mod tests {
             ["pgmajfault", "hierarchy"]
         );
         assert_eq!(faults[1].value.as_ref().unwrap().value, 2);
+    }
+
+    #[test]
+    fn guest_metrics_preserve_scope_labels_and_optional_values() {
+        let sample = serde_json::from_value(serde_json::json!({
+            "timestamp": 1, "cpuUsageNanos": 1, "memoryUsageBytes": 4096,
+            "workingSetBytes": 3072, "rssBytes": 1024, "pageFaults": 0, "majorPageFaults": 0,
+            "filesystem": {"device": "podfs", "usageBytes": 4096},
+            "blockIo": [{"device": "/dev/vda", "major": 252, "minor": 0, "writeBytes": 8192}],
+            "process": {"processes": 2, "sockets": 0},
+            "network": {"eth0": [12, 2, 0, 0, 34, 3, 0, 0]},
+        }))
+        .unwrap();
+        let labels = LABELS.map(String::from);
+        let container = guest_metrics(&sample, &labels, false).unwrap();
+        let pod = guest_metrics(&sample, &labels, true).unwrap();
+        let value = |metrics: &[Metric], name: &str, extra: &[&str]| {
+            metrics
+                .iter()
+                .find(|m| m.name == name && m.label_values[LABELS.len()..] == *extra)
+                .map(|m| {
+                    assert_eq!(m.label_values[..LABELS.len()], labels);
+                    assert_eq!(m.timestamp, 0);
+                    m.value.as_ref().unwrap().value
+                })
+        };
+        assert_eq!(
+            value(&container, "container_fs_usage_bytes", &["podfs"]),
+            Some(4096)
+        );
+        assert_eq!(value(&pod, "container_fs_usage_bytes", &["podfs"]), None);
+        assert_eq!(
+            value(&container, "container_fs_limit_bytes", &["podfs"]),
+            None
+        );
+        assert_eq!(value(&container, "container_sockets", &[]), Some(0));
+        assert_eq!(value(&pod, "container_processes", &[]), Some(2));
+        assert_eq!(value(&container, "container_file_descriptors", &[]), None);
+        assert_eq!(
+            value(&pod, "container_network_receive_bytes_total", &["eth0"]),
+            Some(12)
+        );
+        assert_eq!(
+            value(&pod, "container_network_transmit_bytes_total", &["eth0"]),
+            Some(34)
+        );
+        assert_eq!(
+            value(
+                &container,
+                "container_network_transmit_bytes_total",
+                &["eth0"]
+            ),
+            None
+        );
+        assert_eq!(
+            value(
+                &container,
+                "container_blkio_device_usage_total",
+                &["/dev/vda", "252", "0", "Write"]
+            ),
+            Some(8192)
+        );
+        assert_eq!(
+            value(&container, "container_fs_reads_total", &["/dev/vda"]),
+            None
+        );
     }
 
     #[test]
@@ -1151,7 +1278,7 @@ mod tests {
                 .blocks()
                 * 512;
         let sampled = filesystem_stats(dir.path()).unwrap();
-        assert_eq!(sampled.usage, Some(expected));
-        assert!(sampled.capacity >= expected);
+        assert_eq!(sampled.usage_bytes, Some(expected));
+        assert!(sampled.capacity_bytes.unwrap() >= expected);
     }
 }

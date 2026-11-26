@@ -9,9 +9,10 @@
 | 运行与交互 | OCI 和 Pod VM 支持连接容器 init 的交互输入、Attach 和 PTY。Pod VM guest 连接恢复后，首次新建交互 exec 或 Attach 即可使用，无需先查询容器状态，且支持二进制标准输入。WASI 命令支持前台标准输入，OCI 打包命令提供 CRI 日志。CLI 支持前后台运行与自动回收。[工作负载示例](../README.md#what-you-can-run) |
 | Kubernetes | 在 kubelet v1.37.2 上实测原生 OCI hostNetwork 和普通 CNI Pod 在 daemon 重启时保留网络模式及运行中的容器，也验证了 VM RuntimeClass、网络、日志、exec 和重启恢复。原生 OCI 的 Guaranteed 和 Burstable 容器可以原地调整 CPU 和内存。[节点验收](VM_RUNTIMECLASS.md) · [CRI 验证记录](CRITEST_RESULTS.md) |
 | 镜像和存储 | PullImage 缓存压缩层并准备可复用的镜像树。流式解包覆盖 tar、gzip 和 zstd。21 层镜像的配对测试中，两版各完成 110 个 VM Pod、1,100 次热 ExecSync，清理并发为 4；清场后 daemon PSS 从 705.0 MiB 降到 71.9 MiB。[测量条件](VM_AGENT_LOOP.md#daemon-解包内存复验) |
+| CRI 指标 | 原生 OCI 和 VM 通过 kubelet 暴露 cAdvisor 兼容指标。VM 包含可归属的 guest 文件系统、进程和 Pod 网卡，设备 I/O 取决于 guest 的块设备。 [CRI 验证记录](CRITEST_RESULTS.md) |
 | 网络与安全 | 原生 OCI 支持 CNI、hostPort、seccomp 和 AppArmor。Pod VM 当前使用 IPv4 bridge 和 host-local CNI。Wasm 策略可在创建 Pod、创建容器和启动容器时检查请求。[架构](ARCHITECTURE.md) · [VM 设计](VM_RUNTIME.md) |
 
-完整未过滤的 `critest` v1.37.0 在同一隔离 Unix socket 上验证 RuntimeService 与 ImageService，结果为 **107 通过、0 失败、35 跳过**。同轮 Linux 串行 Rust 测试 137 通过、0 失败、8 项忽略。Pod VM 流式恢复用上游 `crictl` 另行验证。两套测试的覆盖范围和历史 v1.31.1 基线均见[验证记录](CRITEST_RESULTS.md)。
+完整未过滤的 `critest` v1.37.0 在同一隔离 Unix socket 上验证 RuntimeService 与 ImageService，结果为 **107 通过、0 失败、35 跳过**。同轮 Linux 串行 Rust 测试 138 通过、0 失败、8 项忽略。Pod VM 流式恢复用上游 `crictl` 另行验证。两套测试的覆盖范围和历史 v1.31.1 基线均见[验证记录](CRITEST_RESULTS.md)。
 
 ## 待完成工作
 
@@ -19,7 +20,6 @@
 
 | 工作 | 剩余范围 |
 |---|---|
-| [CRI 指标 #40](https://github.com/nautilus-runtime/nautilus/issues/40) | VM guest 已上报 CPU 时间、节流、内存分项与页错误。后续补齐文件系统归属、块 I/O、Pod 网络与进程指标，并经 kubelet 核对。 |
 | [资源原地调整 #41](https://github.com/nautilus-runtime/nautilus/issues/41) | 已支持原生 OCI 容器的 CPU 和内存调整。接下来实现 Pod 级通知与 guest 限制更新，分别验证 guest、VMM 和宿主的容量变化。 |
 | [Checkpoint 与 Restore #42](https://github.com/nautilus-runtime/nautilus/issues/42) | 实现原生容器和 Pod 的一致性捕获、恢复和失败回收，再验证 VM 存储及设备的一致性。 |
 

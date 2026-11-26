@@ -25,6 +25,18 @@ type sample struct {
 	Faults         uint64                       `json:"pageFaults"`
 	MajorFaults    uint64                       `json:"majorPageFaults"`
 	CgroupCounters map[string]map[string]uint64 `json:"cgroupCounters,omitempty"`
+	Filesystem     *filesystemSample            `json:"filesystem,omitempty"`
+	BlockIO        []blockIOSample              `json:"blockIo,omitempty"`
+	Process        *processSample               `json:"process,omitempty"`
+	Network        map[string][8]uint64         `json:"network,omitempty"`
+}
+
+func (s *sample) clearOptionalMetrics() {
+	s.CgroupCounters = nil
+	s.Filesystem = nil
+	s.BlockIO = nil
+	s.Process = nil
+	s.Network = nil
 }
 
 func counters(path string, names ...string) (map[string]uint64, error) {

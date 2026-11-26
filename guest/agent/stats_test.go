@@ -54,8 +54,17 @@ func TestWorkloadCgroupSample(t *testing.T) {
 
 func TestOversizedCgroupReplyStillReturnsBasicStats(t *testing.T) {
 	counters := map[string]map[string]uint64{"cpu.stat": {"nr_throttled": 9}}
-	child := sample{CPU: 2000, CgroupCounters: counters}
-	res := response{OK: true, Stats: &sample{CPU: 3000, CgroupCounters: counters}, Containers: make(map[string]sample)}
+	throughput := uint64(4096)
+	child := sample{
+		CPU: 2000, CgroupCounters: counters,
+		Filesystem: &filesystemSample{Device: "podfs"},
+		BlockIO:    []blockIOSample{{Device: "/dev/vda", Major: 252, WriteBytes: &throughput}},
+		Process:    &processSample{Threads: new(uint64)},
+	}
+	res := response{OK: true, Stats: &sample{
+		CPU: 3000, CgroupCounters: counters,
+		Network: map[string][8]uint64{"eth0": {4096}},
+	}, Containers: make(map[string]sample)}
 	for i := 0; i < 5200; i++ {
 		res.Containers[fmt.Sprintf("%036d", i)] = child
 	}
@@ -74,9 +83,10 @@ func TestOversizedCgroupReplyStillReturnsBasicStats(t *testing.T) {
 	if err := json.Unmarshal(frame.Bytes(), &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Stats.CPU != 3000 || decoded.Stats.CgroupCounters != nil ||
-		len(decoded.Containers) != len(res.Containers) || decoded.Containers[strings.Repeat("0", 36)].CPU != 2000 ||
-		decoded.Containers[strings.Repeat("0", 36)].CgroupCounters != nil {
+	got := decoded.Containers[strings.Repeat("0", 36)]
+	if decoded.Stats.CPU != 3000 || decoded.Stats.CgroupCounters != nil || decoded.Stats.Network != nil ||
+		len(decoded.Containers) != len(res.Containers) || got.CPU != 2000 ||
+		got.CgroupCounters != nil || got.Filesystem != nil || got.BlockIO != nil || got.Process != nil {
 		t.Fatal("oversized reply did not preserve the basic Pod and container samples")
 	}
 }
