@@ -12,6 +12,7 @@ use std::path::Path;
 const STORE: &str = ".snapshots-v1";
 const PIN: &str = "snapshot.v1";
 const OWNER: &str = ".nautilus-bundle-v1";
+pub(crate) const VM_READONLY_ROOT: &str = ".vm-readonly-root";
 
 fn invalid(msg: &str) -> Error {
     Error::Storage(msg.into())

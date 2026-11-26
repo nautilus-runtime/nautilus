@@ -35,7 +35,7 @@ impl RootfsMount {
     }
 
     fn detach(&self, worker: &Worker, share: &Share) -> io::Result<()> {
-        if !worker.has_mount(self.mount)? {
+        if !worker.has_mount_on_device(self.mount, self.root.device)? {
             return Ok(());
         }
         let bundle = self.worker_bundle(worker, share)?;
@@ -244,6 +244,13 @@ impl Lease {
 }
 
 impl PodVmStore {
+    pub(crate) fn staged_bundle(&self, container: &str) -> io::Result<PathBuf> {
+        if !canonical_uuid(container) {
+            return Err(invalid("expected canonical container UUID"));
+        }
+        Ok(self.root.join(format!(".oci-{container}")))
+    }
+
     pub(crate) async fn supports_rootfs_mount(&self, id: &str) -> io::Result<bool> {
         let Some(lease) = self.lease(id, Operation::Status).await? else {
             return Ok(false);
@@ -286,6 +293,9 @@ impl PodVmStore {
         }
         no_host_mounts(staged)?;
         let worker = if let Some(view) = &view {
+            if staged != self.staged_bundle(container)? {
+                return Err(invalid("unexpected staging path for VM rootfs"));
+            }
             let worker = lease.volume_worker(&owner).await?.ok_or_else(missing)?;
             let receipt = RootfsMount {
                 container: container.into(),
@@ -318,6 +328,7 @@ impl PodVmStore {
         .map_err(io::Error::from)?;
         bundles.sync_all()?;
         if let Some((worker, view)) = worker.zip(view) {
+            File::open(&self.root)?.sync_all()?;
             let share = owner.share.as_ref().expect("VM export");
             share
                 .rootfs
@@ -350,6 +361,22 @@ impl PodVmStore {
                 .iter()
                 .find(|mount| mount.container == container)
             {
+                match FileIdentity::check(&self.staged_bundle(container)?) {
+                    Ok(identity) if identity == mount.bundle => {
+                        // The owned staging inode still exists, so publication
+                        // never happened. Preserve any existing public entry.
+                        owner
+                            .share
+                            .as_mut()
+                            .expect("VM export")
+                            .rootfs
+                            .retain(|mount| mount.container != container);
+                        return lease.save(&owner);
+                    }
+                    Ok(_) => return Err(invalid("VM rootfs staging identity changed")),
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
                 match fs::symlink_metadata(&path) {
                     Ok(meta) if meta.is_dir() && FileIdentity::from_meta(&meta) == mount.bundle => {
                     }

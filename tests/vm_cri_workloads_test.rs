@@ -15,6 +15,7 @@ use nautilus::Config;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -58,6 +59,16 @@ fn cache_image(images: &Path) -> Result<String> {
     h.set_gid(0);
     h.set_mtime(0);
     tar.append_data(&mut h, "bin/busybox", bb.as_slice())?;
+    for path in ["workspace/image-file", "workspace/image-delete"] {
+        let content = b"from-image\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_mode(0o644);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mtime(0);
+        tar.append_data(&mut h, path, content.as_slice())?;
+    }
     let blob = tar.into_inner()?;
     let layer_digest = digest(&blob);
     let arch = if std::env::consts::ARCH == "aarch64" {
@@ -764,6 +775,20 @@ async fn scenario(
     let b = create(cli, &id, &pod, second)
         .await
         .context("create second")?;
+    let bundles = root.join("containers");
+    let a_pin = bundles.join(&a).join("snapshot.v1");
+    let b_pin = bundles.join(&b).join("snapshot.v1");
+    if a_pin.exists()
+        || b_pin.exists()
+        || std::env::var_os("NAUTILUS_VM_TEST_REQUIRE_SNAPSHOT").is_some()
+    {
+        let a_pin = fs::metadata(a_pin).context("first VM root must pin the snapshot")?;
+        let b_pin = fs::metadata(b_pin).context("second VM root must pin the snapshot")?;
+        ensure!((a_pin.dev(), a_pin.ino()) == (b_pin.dev(), b_pin.ino()));
+        let a_upper = fs::metadata(bundles.join(&a).join("upper"))?;
+        let b_upper = fs::metadata(bundles.join(&b).join("upper"))?;
+        ensure!((a_upper.dev(), a_upper.ino()) != (b_upper.dev(), b_upper.ino()));
+    }
     let initial = state(cli, &a).await?;
     ensure!(initial.image_id == image_id && initial.metadata.as_ref().unwrap().attempt == 2);
     for c in [&a, &b] {
@@ -778,6 +803,44 @@ async fn scenario(
                 == format!("{boot_a}\n").as_bytes()
         );
     }
+    exec(
+        cli,
+        &a,
+        "echo copied-up > image-file; /bin/busybox rm image-delete",
+    )
+    .await?;
+    ensure!(exec(cli, &a, "/bin/busybox cat image-file").await? == b"copied-up\n");
+    exec(cli, &a, "test ! -e image-delete").await?;
+    ensure!(
+        exec(cli, &b, "/bin/busybox cat image-file image-delete").await?
+            == b"from-image\nfrom-image\n"
+    );
+    let mut readonly = workload("readonly", image, "exec /bin/busybox sleep 300");
+    readonly
+        .linux
+        .as_mut()
+        .unwrap()
+        .security_context
+        .as_mut()
+        .unwrap()
+        .readonly_rootfs = true;
+    let readonly = create(cli, &id, &pod, readonly).await?;
+    cli.start_container(StartContainerRequest {
+        container_id: readonly.clone(),
+    })
+    .await?;
+    ensure!(
+        exec(
+            cli,
+            &readonly,
+            "if (echo forbidden > image-file) 2>/dev/null; then exit 1; fi; /bin/busybox cat image-file",
+        )
+        .await? == b"from-image\n"
+    );
+    cli.remove_container(RemoveContainerRequest {
+        container_id: readonly,
+    })
+    .await?;
     guest_stats(cli, &id, &other, &a, &b).await?;
     guest_cgroup_metrics(cli, &id, &a, &b).await?;
     ensure!(
@@ -993,6 +1056,12 @@ async fn scenario(
     *daemon_process = new_daemon;
     *cli = new_client;
     ensure!(boot_id(cli, &id).await? == boot_a && boot_id(cli, &other).await? == boot_b);
+    ensure!(exec(cli, &a, "/bin/busybox cat image-file").await? == b"copied-up\n");
+    exec(cli, &a, "test ! -e image-delete").await?;
+    ensure!(
+        exec(cli, &b, "/bin/busybox cat image-file image-delete").await?
+            == b"from-image\nfrom-image\n"
+    );
     ensure!(
         exec(cli, &a, "/bin/busybox cat /projected/key /data/token").await? == b"newfrom-guest\n"
     );
@@ -1222,6 +1291,7 @@ async fn verify_host_cleanup(root: &Path) -> Result<()> {
     for (dir, allowed) in [
         ("state/vms", &[".operations"][..]),
         ("state/vm-network", &[".operations"][..]),
+        ("containers", &[][..]),
         ("netns", &[][..]),
         ("ipam/ntcriw15", &["lock", "last_reserved_ip.0"][..]),
     ] {
@@ -1231,6 +1301,9 @@ async fn verify_host_cleanup(root: &Path) -> Result<()> {
         };
         for entry in entries {
             let entry = entry?;
+            if dir == "containers" && entry.file_name() == ".snapshots-v1" {
+                continue;
+            }
             ensure!(
                 entry.file_type()?.is_file()
                     && allowed.iter().any(|&name| entry.file_name() == name),

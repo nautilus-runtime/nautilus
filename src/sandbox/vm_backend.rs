@@ -27,15 +27,7 @@ impl VmBackend {
     }
 
     fn staging_dir(&self, id: &str) -> Result<std::path::PathBuf> {
-        if !uuid::Uuid::parse_str(id).is_ok_and(|u| !u.is_nil() && u.to_string() == id) {
-            return Err(Error::Container("invalid VM container ID".into()));
-        }
-        Ok(self
-            .config
-            .runtime
-            .state_dir
-            .join("vms")
-            .join(format!(".oci-{id}")))
+        Ok(self.store.staged_bundle(id)?)
     }
 
     pub fn discard_stage(&self, id: &str) -> Result<()> {
@@ -120,6 +112,8 @@ impl VmBackend {
         )
         .await?;
         let security = spec.security.as_ref();
+        let readonly_root = self.config.security.read_only_root_filesystem
+            || security.is_some_and(|s| s.readonly_rootfs);
         let user = image.user.clone();
         let security_context = spec.security.clone();
         let strict_groups = spec.strict_groups;
@@ -127,6 +121,14 @@ impl VmBackend {
             let overlay = use_snapshot && snapshot::has_view(&backing)?;
             if use_snapshot && !overlay {
                 snapshot::remove(&backing)?;
+            }
+            if overlay {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o700))?;
+            }
+            if overlay && readonly_root {
+                std::fs::File::create(backing.join(snapshot::VM_READONLY_ROOT))?.sync_all()?;
+                std::fs::File::open(&backing)?.sync_all()?;
             }
             snapshot::with_view(&backing, || {
                 let path = if overlay {
@@ -220,7 +222,7 @@ impl VmBackend {
         }
         let mut spec_json = json!({
             "ociVersion":"1.1.0", "mounts":mounts,
-            "root":{"path":"rootfs", "readonly": self.config.security.read_only_root_filesystem || security.is_some_and(|s| s.readonly_rootfs)},
+            "root":{"path":"rootfs", "readonly": readonly_root},
             "annotations":{"io.nautilus.stdin":spec.open_stdin.to_string(),"io.nautilus.stdinOnce":spec.stdin_once.to_string()},
             "process":{"terminal":spec.tty,"user":{"uid":uid,"gid":gid,"additionalGids":groups},
               "args":argv,"env":image.env,"cwd":cwd,"noNewPrivileges":true,"capabilities":{}},

@@ -210,6 +210,16 @@ impl Worker {
             .any(|l| l.split_once(' ').and_then(|(id, _)| id.parse::<u64>().ok()) == Some(id)))
     }
 
+    pub(super) fn has_mount_on_device(&self, id: u64, device: u64) -> io::Result<bool> {
+        let info = fs::read_to_string(pinned(&self.process).join("mountinfo"))?;
+        let device = format!("{}:{}", libc::major(device), libc::minor(device));
+        Ok(info.lines().any(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            fields.next().and_then(|field| field.parse::<u64>().ok()) == Some(id)
+                && fields.nth(1) == Some(device.as_str())
+        }))
+    }
+
     pub(super) fn seal_catalog(&self, host: &File) -> io::Result<u64> {
         // The guest cannot replace or rename a mountpoint in this read-only
         // directory. The node keeps its own writable view for creating slots.
