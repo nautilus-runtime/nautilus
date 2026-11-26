@@ -84,13 +84,17 @@ fn pod_status(pod: PodState, state: PodSandboxState) -> PodSandboxStatus {
             ..Default::default()
         })
     } else if matches!(pod.runtime_handler.as_str(), "" | "runc") {
-        let network = if pod.host_network {
-            NamespaceMode::Node
-        } else {
-            NamespaceMode::Pod
+        let mode = |host| {
+            if host {
+                NamespaceMode::Node as i32
+            } else {
+                NamespaceMode::Pod as i32
+            }
         };
         Some(NamespaceOption {
-            network: network as i32,
+            network: mode(pod.host_network),
+            pid: mode(pod.host_pid),
+            ipc: mode(pod.host_ipc),
             ..Default::default()
         })
     } else {
@@ -2019,14 +2023,18 @@ mod sandbox_status_tests {
 
     #[test]
     fn native_sandbox_reports_persisted_network_mode() {
-        for (handler, host_network, expected) in [
-            ("runc", true, NamespaceMode::Node),
-            ("runc", false, NamespaceMode::Pod),
-            ("", true, NamespaceMode::Node),
+        use NamespaceMode::{Node, Pod};
+
+        for (handler, [network, pid, ipc]) in [
+            ("runc", [Node, Pod, Node]),
+            ("runc", [Pod, Node, Pod]),
+            ("", [Node, Pod, Pod]),
         ] {
             let pod = PodState {
                 runtime_handler: handler.into(),
-                host_network,
+                host_network: network == Node,
+                host_pid: pid == Node,
+                host_ipc: ipc == Node,
                 ..Default::default()
             };
             let status = pod_status(pod, PodSandboxState::SandboxReady);
@@ -2035,7 +2043,11 @@ mod sandbox_status_tests {
                 .and_then(|linux| linux.namespaces)
                 .and_then(|namespaces| namespaces.options)
                 .expect("native sandbox reports its namespace options");
-            assert_eq!(options.network(), expected, "handler {handler:?}");
+            assert_eq!(
+                [options.network(), options.pid(), options.ipc()],
+                [network, pid, ipc],
+                "handler {handler:?}"
+            );
         }
     }
 
