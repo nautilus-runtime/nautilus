@@ -7,6 +7,7 @@
 #
 # Usage (from the repo checkout):
 #   ssh <host> 'bash -s' < scripts/setup_remote_env.sh
+#   bash scripts/setup_remote_env.sh --protoc-only  # install for the current user
 #
 # Hosts behind restricted networks cannot reach GitHub directly: export
 # NAUTILUS_PROXY (e.g. http://<proxy-host>:<port>) before piping this script
@@ -18,14 +19,47 @@ PROXY="${NAUTILUS_PROXY:-}"
 
 CRICTL_VERSION="v1.31.1"
 CNI_VERSION="v1.5.1"
-PROTOC_VERSION="v29.3"
+PROTOC_VERSION="29.3"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64)        GOARCH="amd64"; PROTOC_ARCH="linux-x86_64" ;;
-    aarch64|arm64) GOARCH="arm64"; PROTOC_ARCH="linux-aarch_64" ;;
+    x86_64)
+        GOARCH="amd64"
+        PROTOC_ARCH="linux-x86_64"
+        PROTOC_SHA256="3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a"
+        ;;
+    aarch64|arm64)
+        GOARCH="arm64"
+        PROTOC_ARCH="linux-aarch_64"
+        PROTOC_SHA256="6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32"
+        ;;
     *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
+
+# Optional command prefix (sudo) is used only for the system-wide install.
+install_protoc() (
+    local prefix=$1 tmp archive
+    shift
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    archive="protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+    curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${archive}" -o "$tmp/$archive"
+    (cd "$tmp" && printf '%s  %s\n' "$PROTOC_SHA256" "$archive" | sha256sum -c -)
+    python3 -m zipfile -e "$tmp/$archive" "$tmp/unpacked"
+    "$@" install -d "$prefix/bin" "$prefix/include"
+    "$@" install -m 0755 "$tmp/unpacked/bin/protoc" "$prefix/bin/protoc"
+    "$@" cp -R "$tmp/unpacked/include/." "$prefix/include/"
+    "$prefix/bin/protoc" --version
+)
+
+if [ "$#" -gt 0 ]; then
+    if [ "$#" != 1 ] || [ "$1" != --protoc-only ]; then
+        echo "Usage: $0 [--protoc-only]" >&2
+        exit 2
+    fi
+    install_protoc "$HOME/.local/share/nautilus/protoc-$PROTOC_VERSION"
+    exit
+fi
 
 if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
     echo "need root or passwordless sudo" >&2
@@ -90,11 +124,7 @@ ls /opt/cni/bin | head -3
 
 echo "== protoc >= 29 (upstream CRI proto uses debug_redact; apt's is too old) =="
 if ! command -v protoc > /dev/null 2>&1 || [ "$(protoc --version | awk '{print $2}' | cut -d. -f1)" -lt 29 ]; then
-    cd /tmp
-    curl -fsSLO "https://github.com/protocolbuffers/protobuf/releases/download/${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
-    sudo python3 -c "import zipfile;zipfile.ZipFile('protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip').extractall('/usr/local')"
-    sudo chmod +x /usr/local/bin/protoc
-    rm -f "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+    install_protoc /usr/local sudo
 fi
 protoc --version
 
