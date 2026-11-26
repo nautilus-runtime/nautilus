@@ -108,17 +108,29 @@ def upgrade():
 
 assert upgrade() == 101 and upgrade() != 101, "streaming URL was not single-use"
 
-# Detach the owning guest transport while the Pod and its CRI endpoint are alive.
+# Detach only the owning guest transport while the Pod and CRI stay alive.
 transport = Path(endpoint).parent / "state" / "vms" / pod / "vsock.sock"
 detached = transport.with_name("spdy-offline.sock")
-transport.rename(detached)
-try:
-    result = run(["exec", target, *shell, "echo unexpected"])
-    observed = run(["inspect", target])
+
+
+@contextlib.contextmanager
+def guest_disconnected():
+    transport.rename(detached)
+    try:
+        yield
+    finally:
+        detached.rename(transport)
+
+
+def observe_unknown(container_id):
+    observed = run(["inspect", container_id])
     assert observed.returncode == 0, observed.stderr
     assert json.loads(observed.stdout)["status"]["state"] == "CONTAINER_UNKNOWN"
-finally:
-    detached.rename(transport)
+
+
+with guest_disconnected():
+    result = run(["exec", target, *shell, "echo unexpected"])
+    observe_unknown(target)
 assert result.returncode != 0 and (
     b"guest" in result.stderr.lower() or b"vsock" in result.stderr.lower()
 ), result
@@ -138,7 +150,10 @@ with child(
     assert p.returncode == 35 or b"35" in stderr, (stderr, p.returncode)
 
 
-# Binary stdio spans many SPDY and vsock frames in both directions.
+# Reconnect independently for the binary path, where the telemetry update
+# can otherwise race with the first exec's exit.
+with guest_disconnected():
+    observe_unknown(target)
 payload = bytes(range(256)) * (12 * 1024)
 echo = subprocess.run(
     base + ["exec", "-i", target, "/bin/busybox", "cat"],
@@ -182,6 +197,8 @@ terminal(
     resize,
 )
 
+with guest_disconnected():
+    observe_unknown(console)
 for count in [1, 2]:
 
     def attach(fd, p, count=count):
