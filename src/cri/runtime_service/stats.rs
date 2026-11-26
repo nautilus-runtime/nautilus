@@ -310,6 +310,19 @@ impl NautilusRuntimeService {
         Ok((sample, reply.containers))
     }
 
+    pub(super) async fn guest_pod_metric_samples(
+        &self,
+        pod: &PodState,
+    ) -> Result<(Sample, HashMap<String, Sample>), Status> {
+        match self.guest_sample(&pod.id, "", Operation::PodMetrics).await {
+            Ok((sample, reply)) => Ok((sample, reply.containers)),
+            Err(error) if error.code() == tonic::Code::Unimplemented => {
+                self.guest_pod_samples(pod).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) async fn guest_pod_stats(
         &self,
         pod: &PodState,

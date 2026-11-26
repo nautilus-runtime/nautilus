@@ -7,13 +7,23 @@ import (
 )
 
 func initWorkloadAccounting() error {
-	if err := os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control", []byte("+memory"), 0600); err != nil {
+	rootControl := "/sys/fs/cgroup/cgroup.subtree_control"
+	if err := os.WriteFile(rootControl, []byte("+memory"), 0600); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(podCgroup, 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(podCgroup, "cgroup.subtree_control"), []byte("+memory"), 0600)
+	podControl := filepath.Join(podCgroup, "cgroup.subtree_control")
+	if err := os.WriteFile(podControl, []byte("+memory"), 0600); err != nil {
+		return err
+	}
+	for _, controller := range []string{"+io", "+pids"} {
+		if os.WriteFile(rootControl, []byte(controller), 0600) == nil {
+			_ = os.WriteFile(podControl, []byte(controller), 0600)
+		}
+	}
+	return nil
 }
 
 // Caller holds c.mu so the cgroup cannot be removed or its history replaced.
@@ -25,7 +35,7 @@ func (c *container) sample() (sample, error) {
 	return data, err
 }
 
-func (s *server) podStats() response {
+func (s *server) podStats(extended bool) response {
 	s.mu.Lock()
 	known := make([]*container, 0, len(s.containers))
 	for _, c := range s.containers {
@@ -33,11 +43,20 @@ func (s *server) podStats() response {
 	}
 	s.mu.Unlock()
 
+	deadline := time.Now().Add(250 * time.Millisecond)
 	children := make(map[string]sample)
 	for _, c := range known {
 		c.mu.Lock()
 		if c.current().State == "running" {
 			data, err := c.sample()
+			if err == nil && extended {
+				group := filepath.Join(podCgroup, c.id)
+				data.BlockIO = readBlockIO(group)
+				data.Process = readProcessSample(group, deadline)
+				if time.Now().Before(deadline) {
+					data.Filesystem = readContainerFilesystem(c.id, c.dir)
+				}
+			}
 			c.mu.Unlock()
 			if err != nil {
 				return fail("unavailable", err)
@@ -54,5 +73,10 @@ func (s *server) podStats() response {
 		return fail("unavailable", err)
 	}
 	s.cpu.update(&parent, time.Now())
+	if extended {
+		parent.BlockIO = readBlockIO(podCgroup)
+		parent.Process = readProcessSample(podCgroup, deadline)
+		parent.Network = readPodNetwork()
+	}
 	return response{OK: true, Stats: &parent, Containers: children}
 }

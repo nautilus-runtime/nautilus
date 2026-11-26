@@ -48,6 +48,7 @@ pub(crate) enum Operation<'a> {
     Status,
     Stats,
     PodStats,
+    PodMetrics,
     Exec {
         argv: &'a [String],
         #[serde(rename = "timeoutMs")]
@@ -90,6 +91,45 @@ pub(crate) struct Sample {
     pub major_page_faults: u64,
     #[serde(default)]
     pub cgroup_counters: HashMap<String, HashMap<String, u64>>,
+    pub filesystem: Option<FilesystemSample>,
+    #[serde(default)]
+    pub block_io: Vec<BlockIoSample>,
+    pub process: Option<ProcessSample>,
+    #[serde(default)]
+    pub network: HashMap<String, [u64; 8]>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FilesystemSample {
+    pub device: String,
+    pub capacity_bytes: Option<u64>,
+    pub inodes: Option<u64>,
+    pub inodes_free: Option<u64>,
+    pub usage_bytes: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BlockIoSample {
+    pub device: String,
+    pub major: u32,
+    pub minor: u32,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub discard_bytes: Option<u64>,
+    pub read_ops: Option<u64>,
+    pub write_ops: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProcessSample {
+    pub processes: Option<u64>,
+    pub file_descriptors: Option<u64>,
+    pub sockets: Option<u64>,
+    pub threads: Option<u64>,
+    pub threads_max: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -181,7 +221,7 @@ impl Channel {
 
     async fn exchange(&mut self, id: &str, operation: Operation<'_>) -> io::Result<Reply> {
         if !(super::guest::canonical_uuid(id)
-            || (matches!(operation, Operation::PodStats) && id.is_empty()))
+            || (matches!(operation, Operation::PodStats | Operation::PodMetrics) && id.is_empty()))
         {
             return Err(invalid("invalid container ID"));
         }

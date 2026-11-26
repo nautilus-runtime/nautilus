@@ -141,9 +141,11 @@ func (s *server) serve(f *os.File) {
 	}
 	var req request
 	var res response
-	if err := strictJSON(b, &req); err != nil {
+	err := strictJSON(b, &req)
+	podOp := req.Op == "podStats" || req.Op == "podMetrics"
+	if err != nil {
 		res = fail("invalid", err)
-	} else if req.Version != 1 || !validID(req.ID) || (req.Op == "podStats" && req.Container != "") || (req.Op != "podStats" && !validID(req.Container)) {
+	} else if req.Version != 1 || !validID(req.ID) || (podOp && req.Container != "") || (!podOp && !validID(req.Container)) {
 		res = fail("invalid", "invalid version or ID")
 	} else if req.identity != s.identity {
 		res = fail("identity", "guest launch identity mismatch")
