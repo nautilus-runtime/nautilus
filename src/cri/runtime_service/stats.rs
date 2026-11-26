@@ -8,6 +8,7 @@ use pathrs::{flags::OpenFlags, Root};
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::Path;
+use std::time::Duration;
 use tonic::Status;
 
 pub(super) fn container_attributes(c: &ContainerState) -> rt::ContainerAttributes {
@@ -314,13 +315,19 @@ impl NautilusRuntimeService {
         &self,
         pod: &PodState,
     ) -> Result<(Sample, HashMap<String, Sample>), Status> {
-        match self.guest_sample(&pod.id, "", Operation::PodMetrics).await {
-            Ok((sample, reply)) => Ok((sample, reply.containers)),
-            Err(error) if error.code() == tonic::Code::Unimplemented => {
-                self.guest_pod_samples(pod).await
+        tokio::time::timeout(Duration::from_secs(5), async {
+            match self.guest_sample(&pod.id, "", Operation::PodMetrics).await {
+                Ok((sample, reply)) => Ok((sample, reply.containers)),
+                Err(error) if error.code() == tonic::Code::Unimplemented => {
+                    self.guest_pod_samples(pod).await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+        })
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(format!("guest metrics for Pod {} timed out", pod.id))
+        })?
     }
 
     pub(super) async fn guest_pod_stats(
