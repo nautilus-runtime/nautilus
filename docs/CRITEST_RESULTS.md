@@ -4,6 +4,14 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-26 原生 OCI 沙箱网络命名空间
+
+在 pro6000 的隔离 Debian 13 节点（Linux `6.12.118+deb13-cloud-amd64`、systemd 257）使用上游 kubelet `v1.37.2` 并排运行 `hostNetwork: true` 和普通 CNI 静态 Pod。旧版原生沙箱缺少 `linux.namespaces.options`，kubelet 判定网络模式不匹配并停止 hostNetwork 容器。修复版 `9795fce` 从已持久化的 Pod 状态报告 `NODE` 和 `POD`，同时核对两种容器的实际网络命名空间分别与宿主相同和独立。
+
+保持 kubelet 运行，通过 `systemctl restart` 重启 daemon。两种 Pod 的 sandbox ID、容器 ID、init PID 和启动时间保持不变，CRI 持续返回相同网络模式，CNI Pod 的地址保持不变，两条容器心跳均从 1 增至 10。清场后 CRI Pod 和容器均为零。[问题 #73](https://github.com/nautilus-runtime/nautilus/issues/73)
+
+未过滤的 `critest v1.37.0` 在同一隔离 Unix socket 上测试 Runtime 和 Image，**107 通过、0 失败、35 跳过**（322.293 秒），结束时 CRI Pod 和容器均为零。Linux Rust 测试 137 通过、0 失败、8 项默认忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查仍涉及基线的 31 个文件。
+
 ## 2026-11-26 VM Pod 并发清理
 
 在 pro6000 的隔离 Debian 13 KVM 节点复现 16 路 `StopPodSandbox` 在 6 秒期限内阻塞。daemon 的 7 个 sled I/O 线程同时等待由同一线程池负责的落盘任务。修复 `14868c4` 后首波耗时 397 毫秒，重复 Stop、并发 Remove 以及删除后的 Stop 和 Remove 均成功。Cloud Hypervisor 为 `v55.0`，宿主内核为 `6.12.118+deb13-cloud-amd64`，virtiofsd 为 `1.13.2`。连续 6 波各并发 16 个 VM Pod，合计 96 个 Pod、960 次热 ExecSync，整波回收 P95 为 812 毫秒。结束时本轮 Pod、容器、VM 服务、挂载、网络命名空间和 IP 租约均已回收。[基准记录](VM_AGENT_LOOP.md#16-路并发回收复验) · [问题 #66](https://github.com/nautilus-runtime/nautilus/issues/66)
