@@ -4,6 +4,12 @@
 - 各轮使用的 kubernetes-sigs/cri-tools 版本和默认跳过数列于对应验证记录。
 - 跑法:`critest --runtime-endpoint=unix:///run/nautilus/nautilus.sock --image-endpoint=unix:///run/nautilus/nautilus.sock`
 
+## 2026-11-26 原生容器日志轮转
+
+在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）通过真实 CRI socket 验证 `ac3fec2`。原生容器在重命名旧日志后先写入一条记录，随后连续请求两次 `ReopenContainerLog`。修复版保留新旧日志各自的内容，后续输出继续进入当前文件。再次移走文件后，reopen 在输出到来前重建文件。目标路径为目录时返回 `Internal`。基线会清空替换文件并对目录返回成功。两轮均清理全部测试 Pod 和容器。[问题 #68](https://github.com/nautilus-runtime/nautilus/issues/68)
+
+Linux 串行 Rust 测试 135 通过、0 失败、8 忽略。严格 Clippy 保持基线的 29 项诊断，全库格式检查涉及基线的 31 个文件。未过滤的 `critest` v1.37.0 使用同一隔离 Runtime 和 Image socket，**107 通过、0 失败、35 跳过**，耗时 286.737 秒，无残留 Pod 或容器。
+
 ## 2026-11-25 OCI 镜像层流式解包
 
 在 pro6000 的隔离 Debian 13 节点（Linux 6.12.118）验证 Release 构建 `b5f9af9`。同一 21 层镜像依次运行 4、8、16 并发 Pod VM，全部 28 个 Pod 清理后，daemon PSS 由原版的 447.4 MiB 降到 62.9 MiB。96 MiB 的单波 PSS 增量预算在原版返回失败，在修复版通过。[分配器诊断及前后对照](VM_AGENT_LOOP.md#daemon-解包内存复验)

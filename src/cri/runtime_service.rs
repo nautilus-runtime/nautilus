@@ -1434,8 +1434,8 @@ impl RuntimeService for NautilusRuntimeService {
         request: Request<ReopenContainerLogRequest>,
     ) -> Result<Response<ReopenContainerLogResponse>, Status> {
         let req = request.into_inner();
-        // The non-VM logger opens the path for each write. Create a missing
-        // destination without discarding records already written after rotation.
+        // A writer may already have appended to the current path after rotation.
+        // Create a missing destination without discarding those records.
         if let Some(c) = self
             .container_manager
             .get_container_state(&req.container_id)
