@@ -210,13 +210,26 @@ impl Worker {
             .any(|l| l.split_once(' ').and_then(|(id, _)| id.parse::<u64>().ok()) == Some(id)))
     }
 
-    pub(super) fn has_mount_on_device(&self, id: u64, device: u64) -> io::Result<bool> {
+    pub(super) fn has_snapshot_mount(
+        &self,
+        id: u64,
+        device: u64,
+        container: &str,
+    ) -> io::Result<bool> {
         let info = fs::read_to_string(pinned(&self.process).join("mountinfo"))?;
         let device = format!("{}:{}", libc::major(device), libc::minor(device));
+        let upper = format!("/{container}/upper");
         Ok(info.lines().any(|line| {
-            let mut fields = line.split_ascii_whitespace();
+            let Some((mount, options)) = line.split_once(" - overlay overlay ") else {
+                return false;
+            };
+            let mut fields = mount.split_ascii_whitespace();
             fields.next().and_then(|field| field.parse::<u64>().ok()) == Some(id)
                 && fields.nth(1) == Some(device.as_str())
+                // Both mount IDs and anonymous device minors can be recycled.
+                && options.split(',').any(|option| {
+                    option.strip_prefix("upperdir=").is_some_and(|path| path.ends_with(&upper))
+                })
         }))
     }
 

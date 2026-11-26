@@ -15,6 +15,8 @@ pub(super) struct RootfsMount {
     placeholder: FileIdentity,
     root: FileIdentity,
     mount: u64,
+    #[serde(default)]
+    unpublished: bool,
 }
 
 impl RootfsMount {
@@ -35,7 +37,7 @@ impl RootfsMount {
     }
 
     fn detach(&self, worker: &Worker, share: &Share) -> io::Result<()> {
-        if !worker.has_mount_on_device(self.mount, self.root.device)? {
+        if !worker.has_snapshot_mount(self.mount, self.root.device, &self.container)? {
             return Ok(());
         }
         let bundle = self.worker_bundle(worker, share)?;
@@ -303,6 +305,7 @@ impl PodVmStore {
                 placeholder: FileIdentity::check(&staged.join("rootfs"))?,
                 root: FileIdentity::from_meta(&view.metadata()?),
                 mount: mount_id(view)?,
+                unpublished: false,
             };
             let share = owner.share.as_mut().expect("VM export");
             if share
@@ -356,21 +359,20 @@ impl PodVmStore {
         no_host_mounts(&pinned(&bundles))?;
         let path = pinned(&bundles).join(container);
         if let Some(share) = &owner.share {
-            if let Some(mount) = share
+            if let Some(index) = share
                 .rootfs
                 .iter()
-                .find(|mount| mount.container == container)
+                .position(|mount| mount.container == container)
             {
+                let mount = &share.rootfs[index];
+                if mount.unpublished {
+                    return Ok(());
+                }
                 match FileIdentity::check(&self.staged_bundle(container)?) {
                     Ok(identity) if identity == mount.bundle => {
-                        // The owned staging inode still exists, so publication
-                        // never happened. Preserve any existing public entry.
-                        owner
-                            .share
-                            .as_mut()
-                            .expect("VM export")
-                            .rootfs
-                            .retain(|mount| mount.container != container);
+                        // Keep the proof through retries after staging is removed.
+                        // This entry was never published. Pod teardown retires it.
+                        owner.share.as_mut().expect("VM export").rootfs[index].unpublished = true;
                         return lease.save(&owner);
                     }
                     Ok(_) => return Err(invalid("VM rootfs staging identity changed")),
