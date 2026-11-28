@@ -25,7 +25,12 @@
         <p class="eyebrow">Linux runtime / Kubernetes CRI v1</p>
         <h1 id="hero-title"><em>OCI Containers</em>,<br><em>WASI</em> and <em>Pod VMs.</em></h1>
         <p class="lead">Try workloads with the Nautilus CLI and deploy them with Kubernetes through the same CRI v1 runtime. Run OCI images directly on Linux or in a dedicated VM per Pod, and WASI commands with Wasmtime.</p>
-        <a class="button" href="https://github.com/nautilus-runtime/nautilus#install-from-github-releases">Install Nautilus</a>
+        <p class="install-label" id="install-label">Install Nautilus on Linux</p>
+        <div class="install-command" role="group" aria-labelledby="install-label">
+          <pre><code id="install-code">curl -fsSL https://raw.githubusercontent.com/nautilus-runtime/nautilus/main/scripts/install.sh | bash</code></pre>
+          <button class="install-copy" type="button" aria-label="Copy installation command" hidden>Copy</button>
+        </div>
+        <p class="install-status" role="status"></p>
       </div>
       <div class="art">
         <img src="assets/nautilus-mascot-small.png" width="800" height="800" alt="Nautilus mascot with a spiral shell made of iridescent shipping containers">
@@ -75,5 +80,26 @@
     </section>
   </main>
   <footer class="wrap"><span>Nautilus</span><a href="https://github.com/nautilus-runtime/nautilus/blob/main/LICENSE">Apache License 2.0</a></footer>
+  <script>
+    const command = document.getElementById("install-code");
+    const copyButton = document.querySelector(".install-copy");
+    const copyStatus = document.querySelector(".install-status");
+
+    copyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(command.textContent);
+        copyStatus.textContent = "Command copied.";
+      } catch {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(command);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        copyStatus.textContent = "Copy the selected command manually.";
+      }
+    });
+
+    copyButton.hidden = false;
+  </script>
 </body>
 </html>
