@@ -19,6 +19,26 @@ rtk proxy "$bin_dir/nautilus-pod-probe" "$probe_dir/assets" "$probe_dir"
 
 A successful run prints a `PASS` line. The `Probe data` line identifies the run directory and its guest serial log. Asset preparation verifies the pinned Kata kernel archive, Apple `vminit` layer, and arm64 runc before creating the boot files.
 
+## Run workloads
+
+`run` creates an implicit sandbox and VM for one container. An optional command after `--` replaces the image entrypoint and command.
+
+```sh
+rtk proxy "$bin_dir/nautilus-pod-probe" run "$probe_dir/assets" "$probe_dir" \
+  docker.io/library/busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec \
+  -- /bin/sh -c 'cat /proc/sys/kernel/random/boot_id; exit 23'
+```
+
+`pod ASSETS WORK_PARENT MANIFEST.json` creates an explicit sandbox. The manifest lists `containers` in start order and names the `foreground` container. Each member has an `id`, an OCI `image`, and optional `arguments`, `environment` (`NAME=value` strings), and `workingDirectory`. If `arguments` is absent, the image's entrypoint and command are used. Members share loopback and a guest-only `/workspace` tmpfs, with separate writable roots and PID namespaces.
+
+The foreground command streams stdout, prints initial sandbox status and diagnostics to stderr, returns the selected container's exit code, and stops and removes its sandbox before returning. Internally, the sandbox exposes status, per-member start, wait and exec, and idempotent stop and remove. The local process owns the VM for the lifetime of the invocation.
+
+```sh
+rtk proxy "$bin_dir/nautilus-pod-probe" verify-lifecycle "$probe_dir/assets" "$probe_dir"
+```
+
+The lifecycle acceptance exercises two independent live VMs, stopping one while the other responds, and an application that writes and reads real data from Redis over loopback. It also checks workspace sharing, distinct PID namespaces, the application exit code, and fresh VM identity when rebuilding the same sandbox.
+
 ## M0 validation
 
 On 2026-11-28, an Apple M4 running macOS 27.2.1 (Darwin 27.2.0) passed two signed runs built with macOS SDK 27.2 and Swift 6.4.2. Both runs used Kata's Linux 6.18.56 kernel from release 4.3.1, Apple `vminit` 0.57.0, and runc 1.5.3. BusyBox served a per-run token over guest loopback, and Alpine retrieved it and exited with code 23. Both containers reported `Seccomp: 2` and one active filter. The final run reported guest boot ID `2d6f50ac-533e-4b2e-a6e7-fc4c67031aa6` for both containers, and the VM reached `.stopped`.

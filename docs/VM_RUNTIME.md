@@ -136,6 +136,8 @@ macOS 的 M0 探针以 Apple Containerization `0.57.0` 的 `LinuxPod` 管理组�
 
 探针核对同组两个不同 OCI 镜像的独立可写 rootfs、同一 guest boot ID、组内 loopback、进程退出码、seccomp 和 VM 停止状态。对应的 Linux CRI 验收是通过 `RunPodSandbox` 创建 sandbox，再在其中分别用 `CreateContainer` 和 `StartContainer` 启动两个镜像，核对容器归属、执行结果和私有文件，最后通过 `StopPodSandbox` 和 `RemovePodSandbox` 验证回收。两端的跨组用例还需同时运行两个 sandbox，检查不同 boot ID，并验证停止其中一组时另一组仍能执行。M0 在 Mac 节点直接运行探针，后续里程碑通过 [Linux CRI 工作负载测试](../tests/vm_cri_workloads_test.rs)复验两端语义。
 
+M1 的本地进程持有 VZ 对象。每次创建生成独立 sandbox ID 和工作目录，容器启动前准备各自的 OCI 根盘。单容器入口创建隐式 sandbox，显式清单在同一个 sandbox 中声明多个成员。组内提供 guest loopback 和共用的 tmpfs，每个容器有独立 PID namespace。采用 Kata 4.4.0 的 sandbox 归属方式，停止某个 attempt 不影响其他 attempt。Firecracker v1.18.0 的 jailer 为每个实例建沙箱目录，Mac 采用本地进程持有 VZ 和独立的根盘目录。CRI 对照用例是在两个 Ready 的 sandbox 中同时执行 `ExecSync`，调用 `StopPodSandbox` 停止第一个后再次执行第二个的命令，最后重复 `RemovePodSandbox`。[M1 复现](../platform/macos/README.md#run-workloads) · [Kata Pod 模型](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture_4.0/architecture.md) · [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/jailer.md)
+
 ## Guest 工作负载统计
 
 Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 并读取统计。Firecracker v1.18.0 的 metrics 接口由 VMM 输出设备与控制面计数。Nautilus 选用 guest cgroup v2 作为 CRI 工作负载用量来源。宿主 systemd cgroup 继续用于 VMM 的限制和节点运维。[Kata agent StatsContainer](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/agent/src/rpc.rs#L1035-L1073) · [Firecracker metrics](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/metrics.md) · [CRI CPU 和内存字段](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto)

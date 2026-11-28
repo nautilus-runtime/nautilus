@@ -187,7 +187,15 @@ func runProbe() async throws {
 }
 
 do {
-    try await runProbe()
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    switch arguments.first {
+    case "run", "pod":
+        exit(try await runWorkload(arguments))
+    case "verify-lifecycle":
+        try await verifyLifecycle(arguments)
+    default:
+        try await runProbe()
+    }
 } catch {
     FileHandle.standardError.write(Data("Probe failed: \(error)\n".utf8))
     exit(EXIT_FAILURE)
