@@ -1,5 +1,6 @@
 import Containerization
 import Foundation
+import NIOPosix
 import Synchronization
 import Virtualization
 
@@ -131,7 +132,9 @@ actor PodSandbox {
                 try await images.remove()
             }
             let kernel = Kernel(path: assetsDirectory.appendingPathComponent("kernel"), platform: .linuxArm)
-            let vmm = VZVirtualMachineManager(kernel: kernel, initialFilesystem: prepared.initialFilesystem)
+            let vmm = VZVirtualMachineManager(
+                kernel: kernel, initialFilesystem: prepared.initialFilesystem, group: MultiThreadedEventLoopGroup.singleton
+            )
             let pod = try LinuxPod(id, vmm: vmm, vm: VMResources(cpus: 2, memoryInBytes: 512 * 1024 * 1024)) { config in
                 try configurePod(work, &config)
                 config.ociRuntimePath = "/sbin/runc"

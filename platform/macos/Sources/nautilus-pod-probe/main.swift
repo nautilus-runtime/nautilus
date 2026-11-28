@@ -193,6 +193,8 @@ do {
         exit(try await runWorkload(arguments))
     case "verify-lifecycle":
         try await verifyLifecycle(arguments)
+    case "verify-policy":
+        try await verifyPolicy(arguments)
     default:
         try await runProbe()
     }

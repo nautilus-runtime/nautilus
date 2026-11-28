@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v26)],
     dependencies: [
         .package(url: "https://github.com/apple/containerization.git", exact: "0.57.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.105.2"),
     ],
     targets: [
         .executableTarget(
@@ -13,6 +14,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationOCI", package: "containerization"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ]
         ),
     ]
