@@ -140,6 +140,8 @@ M1 的本地进程持有 VZ 对象。每次创建生成独立 sandbox ID 和工�
 
 M2 的 VZ sandbox 默认没有 guest 网卡或宿主目录挂载。每个 sandbox 独立分配资源和 guest tmpfs，宿主显式提供的单个输入文件通过只读 virtiofs 副本传入，产物通过前台容器的有界 stdout 导出。Kata 4.4.0 在发布卷前设置只读标记，Firecracker v1.18.0 由宿主 jailer 约束 VMM 的文件与命名空间。Mac 用 VZ 设备配置限定 guest 可见的宿主资源，用进程生命周期与工作目录锁确定回收归属。取消命令时停止专用容器的私有 PID namespace。对应的 CRI 验收用例为同一 Pod 内让两个容器读取授权的只读文件，确认写入失败，再通过 `StopContainer` 停止其中一个容器，在另一容器中执行 `ExecSync` 核实服务可用。另建 sandbox 验证文件不可见。[M2 复现](../platform/macos/README.md#workload-policy) · [Kata 卷只读设置](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/runtime/virtcontainers/fs_share_linux.go#L428-L468) · [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/jailer.md)
 
+M3 用同一份 Redis 与 BusyBox 清单对照 macOS VZ 和 Linux CRI。两端验证只读输入、同组 loopback、前台退出码 `23`、产物字节和回收。验收同时记录两端的超时接口、网络和 seccomp 行为。[M3 对照与复现](PODSANDBOX_PARITY.md)
+
 ## Guest 工作负载统计
 
 Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 并读取统计。Firecracker v1.18.0 的 metrics 接口由 VMM 输出设备与控制面计数。Nautilus 选用 guest cgroup v2 作为 CRI 工作负载用量来源。宿主 systemd cgroup 继续用于 VMM 的限制和节点运维。[Kata agent StatsContainer](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/agent/src/rpc.rs#L1035-L1073) · [Firecracker metrics](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/metrics.md) · [CRI CPU 和内存字段](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto)

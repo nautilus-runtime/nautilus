@@ -64,6 +64,8 @@ On 2026-11-28, an Apple M4 running macOS 27.2.1 (Darwin 27.2.0) passed two signe
 
 The same Apple M4 host passed `verify-lifecycle`, `verify-policy` and `verify-owner-exit.py` with Virtualization.framework build `308.2.7`. The policy test completed all 20 cleanup cycles and verified both a failed container start and a rejected guest boot. The owner-exit test associated the owner’s guest disks with the VZ provider process, observed that process exit after `SIGKILL` of the owner, and confirmed stale storage was reclaimed while the peer workload finished normally. The signed CLI also returned exit code `23` for `run`, accepted a two-member `pod` manifest with an explicit environment and working directory, round-tripped the approved file to a mode-0600 export, and returned `124` after timeout and cleanup.
 
+M3 runs shared Redis and BusyBox fixtures on this CLI and the Linux CRI VM handler. [Fixtures, reproduction, and observed differences](../../docs/PODSANDBOX_PARITY.md)
+
 ## References
 
 - Lima documents native Linux guest boot under Apple virtualization. Colima shows how to select and configure VZ through Lima. [Lima VZ backend](https://lima-vm.io/docs/config/vmtype/vz/) · [Colima's Lima configuration](https://github.com/abiosoft/colima/blob/main/environment/vm/lima/yaml.go)
