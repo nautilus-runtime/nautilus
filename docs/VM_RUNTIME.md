@@ -130,6 +130,12 @@ nautilus vm probe --vmm /opt/cloud-hypervisor/bin/cloud-hypervisor \
 
 2026-11-24 用完整的 Linux x86_64 CLI 和本仓库构造的 initramfs 做了两次 KVM 验证。原生宿主 Linux 5.15.0-191 + VMM v54.1 返回 `PONG 1`；同机启动的临时 Debian Linux 6.12.118 嵌套 KVM 宿主 + VMM v55.0 也返回 `PONG 1`。两次探测的目标 guest 均使用 Linux 5.15.0-191。无效 VMM 可用 `--vmm /bin/false` 验证：命令应快速报告 VMM 已退出，返回非零状态。错误应答与未应答的回归测试可用 `cargo test --locked --lib vm::tests` 运行。
 
+### Apple Silicon PodSandbox 探针
+
+macOS 的 M0 探针以 Apple Containerization `0.57.0` 的 `LinuxPod` 管理组内的 OCI 容器，直接用 Virtualization.framework 启动 guest。宿主引导和生命周期参考 Lima 的 VZ 后端、Colima 的 Lima 配置和 Kiri 的宿主与 guest 分工。PodSandbox 的 VM 归属参考 Kata Containers 4.4.0 的 Kubernetes Pod 模型。Firecracker v1.18.0 以 Linux KVM 和宿主 UNIX socket 提供虚拟化与 vsock，Mac 探针使用 Apple 的 VZ 设备接口。[探针与复现命令](../platform/macos/README.md) · [Kata 架构](https://github.com/kata-containers/kata-containers/blob/4.4.0/docs/design/architecture/README.md) · [Firecracker vsock](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/vsock.md) · [Apple Virtualization](https://developer.apple.com/documentation/virtualization)
+
+探针核对同组两个不同 OCI 镜像的独立可写 rootfs、同一 guest boot ID、组内 loopback、进程退出码、seccomp 和 VM 停止状态。对应的 Linux CRI 验收是通过 `RunPodSandbox` 创建 sandbox，再在其中分别用 `CreateContainer` 和 `StartContainer` 启动两个镜像，核对容器归属、执行结果和私有文件，最后通过 `StopPodSandbox` 和 `RemovePodSandbox` 验证回收。两端的跨组用例还需同时运行两个 sandbox，检查不同 boot ID，并验证停止其中一组时另一组仍能执行。M0 在 Mac 节点直接运行探针，后续里程碑通过 [Linux CRI 工作负载测试](../tests/vm_cri_workloads_test.rs)复验两端语义。
+
 ## Guest 工作负载统计
 
 Kata Containers 4.4.0 的 agent 在 guest 中按容器 ID 查找 cgroup manager 并读取统计。Firecracker v1.18.0 的 metrics 接口由 VMM 输出设备与控制面计数。Nautilus 选用 guest cgroup v2 作为 CRI 工作负载用量来源。宿主 systemd cgroup 继续用于 VMM 的限制和节点运维。[Kata agent StatsContainer](https://github.com/kata-containers/kata-containers/blob/4.4.0/src/agent/src/rpc.rs#L1035-L1073) · [Firecracker metrics](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/metrics.md) · [CRI CPU 和内存字段](https://github.com/kubernetes/cri-api/blob/v0.37.2/pkg/apis/runtime/v1/api.proto)
