@@ -10,11 +10,23 @@ Nautilus is a Linux container runtime written in Rust. It implements the Kuberne
 | --- | --- | --- |
 | Linux container | `runc` (default) | An OCI image from a registry. Nautilus pulls and caches the layers and runs the container with libcontainer. |
 | WebAssembly command | `wasi` or `wasm` | A WASI Preview 1 module exporting `_start`, supplied as a local file or an OCI image. Wasmtime runs it inside the daemon. |
-| Pod VM | `vm` (opt-in) | OCI images run inside one Linux guest per Pod. Requires KVM, Cloud Hypervisor and virtiofsd. |
+| Pod VM | `vm` (experimental, opt-in) | OCI images run inside one Linux guest per Pod. Requires KVM, Cloud Hypervisor and virtiofsd. |
 
 OCI containers support CNI pod networking, host port mappings, resource limits, logs and exec. You can also load a Wasm policy to allow or deny pod creation, container creation or container start. The [example policy](examples/policy-deny-label) rejects workloads carrying the `nautilus.policy/deny` label.
 
-To enable the VM handler on a Kubernetes node and run a Pod, follow the [RuntimeClass guide](docs/VM_RUNTIMECLASS.md). The [VM design](docs/VM_RUNTIME.md) also covers the standalone boot probe and recovery tests. See the [CPU agent benchmark](docs/VM_AGENT_LOOP.md) for tool latency, memory per Pod and tested concurrency.
+## Why Nautilus
+
+- **One runtime from local development to Kubernetes.** `nautilusd` implements CRI v1 directly. The bundled CLI and kubelet use the same socket, so you can try an OCI image locally with the same runtime handler you plan to use in Kubernetes.
+- **VM isolation for existing OCI workloads.** Run an agent tool workspace in a dedicated Linux guest per Pod. Containers within a Pod share the guest kernel and Pod network. Repeated tool calls can use the same workspace for the life of the container.
+- **Reuse image data across launches.** On supported hosts, Pod VM containers share a read-only OCI image snapshot and keep their own writable layers. Concurrent launches can reuse the unpacked image while keeping writes separate.
+
+## Pod VM support
+
+The experimental `vm` handler is disabled by default. To enable it, prepare a Linux KVM node with systemd, cgroup v2, Cloud Hypervisor, virtiofsd, and a guest kernel with a Nautilus workload initramfs. Follow the [node setup and RuntimeClass guide](docs/VM_RUNTIMECLASS.md) to select `runtimeClassName: nautilus-vm` in Kubernetes, or [run an OCI image locally with `--runtime vm`](#run-a-container-in-a-pod-vm).
+
+On a real Kubernetes node, Pod VMs were tested with `kubectl exec`, `attach`, `logs`, and `port-forward`. The tests also checked that running guests retained their boot IDs and Pod IPs across a `nautilusd` restart. [Kubelet acceptance results](docs/CRITEST_RESULTS.md#2026-11-24-真实-kubelet-和-runtimeclass) · [VM lifecycle design](docs/VM_RUNTIME.md)
+
+In a single-node benchmark with a pre-pulled Node.js image and 16 concurrent Pods, OCI snapshot reuse reduced the P95 time from starting a new Pod sandbox to the first successful exec from **9.90 s to 5.62 s**. [VM benchmarks and methodology](docs/VM_AGENT_LOOP.md#oci-rootfs-快照复用-ab)
 
 ## Quick start
 
