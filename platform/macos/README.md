@@ -39,9 +39,30 @@ rtk proxy "$bin_dir/nautilus-pod-probe" verify-lifecycle "$probe_dir/assets" "$p
 
 The lifecycle acceptance exercises two independent live VMs, stopping one while the other responds, and an application that writes and reads real data from Redis over loopback. It also checks workspace sharing, distinct PID namespaces, the application exit code, and fresh VM identity when rebuilding the same sandbox.
 
+## Workload policy
+
+Each sandbox gets 2 vCPUs, 512 MiB of memory, and a private 16 MiB guest tmpfs. Each container has a one-core CPU quota, a 128 MiB memory limit, a 128-task limit, default seccomp and `no_new_privs`. The guest has loopback only. The host downloads OCI images and provides the guest control connection. Host files, environment variables, and sockets are excluded from the container configuration by default.
+
+Pass `--input FILE` to stage a single regular file, at most 1 MiB, in a private runtime directory. The container sees its read-only copy at `/input/file`. Pass `--output NEW_FILE` to export the selected foreground container's stdout, at most 1 MiB, to a new mode-0600 file. Paths are selected by the caller through command-line options. Pod manifests control container images, commands, and guest environment values.
+
+Use `--timeout SECONDS` to stop the foreground command container and its descendants, then return exit status `124` after cleaning up the sandbox. When using the PodSandbox API directly, stopping a command container preserves its siblings. The cancellation boundary is the private PID namespace of a predeclared command container. A command run via `exec` inside a long-lived container has single-process signal semantics.
+
+Concurrent invocations with the same `WORK_PARENT` hold an exclusive lock on each live session directory. The next invocation collects unlocked session directories left by an abruptly exited owner. Run on a private local filesystem.
+
+```sh
+rtk proxy "$bin_dir/nautilus-pod-probe" verify-policy "$probe_dir/assets" "$probe_dir"
+rtk proxy python3 ./verify-owner-exit.py "$bin_dir/nautilus-pod-probe" "$probe_dir/assets" "$probe_dir"
+```
+
+Policy acceptance checks the guest network, host file and socket visibility, read-only input, explicit artifact export, guest and container resource settings, seccomp, detached-child cancellation, startup failures and 20 consecutive VM cleanup cycles. The owner-exit test uses two live VMs, stops one host process with `SIGKILL`, and checks stale storage recovery and the surviving workload.
+
 ## M0 validation
 
 On 2026-11-28, an Apple M4 running macOS 27.2.1 (Darwin 27.2.0) passed two signed runs built with macOS SDK 27.2 and Swift 6.4.2. Both runs used Kata's Linux 6.18.56 kernel from release 4.3.1, Apple `vminit` 0.57.0, and runc 1.5.3. BusyBox served a per-run token over guest loopback, and Alpine retrieved it and exited with code 23. Both containers reported `Seccomp: 2` and one active filter. The final run reported guest boot ID `2d6f50ac-533e-4b2e-a6e7-fc4c67031aa6` for both containers, and the VM reached `.stopped`.
+
+## M1 and M2 validation
+
+The same Apple M4 host passed `verify-lifecycle`, `verify-policy` and `verify-owner-exit.py` with Virtualization.framework build `308.2.7`. The policy test completed all 20 cleanup cycles and verified both a failed container start and a rejected guest boot. The owner-exit test associated the owner’s guest disks with the VZ provider process, observed that process exit after `SIGKILL` of the owner, and confirmed stale storage was reclaimed while the peer workload finished normally. The signed CLI also returned exit code `23` for `run`, accepted a two-member `pod` manifest with an explicit environment and working directory, round-tripped the approved file to a mode-0600 export, and returned `124` after timeout and cleanup.
 
 ## References
 
