@@ -23,8 +23,8 @@
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="intro">
         <p class="eyebrow">Linux runtime / Kubernetes CRI v1</p>
-        <h1 id="hero-title">OCI containers,<br>WASI and <em>Pod VMs.</em></h1>
-        <p class="lead">Run OCI containers directly on Linux or in a dedicated VM per Pod. Run WASI commands with Wasmtime. The Nautilus CLI and kubelet use the same CRI socket.</p>
+        <h1 id="hero-title"><em>OCI Containers</em>,<br><em>WASI</em> and <em>Pod VMs.</em></h1>
+        <p class="lead">Try workloads with the Nautilus CLI and deploy them with Kubernetes through the same CRI v1 runtime. Run OCI images directly on Linux or in a dedicated VM per Pod, and WASI commands with Wasmtime.</p>
         <a class="button" href="https://github.com/nautilus-runtime/nautilus#install-from-github-releases">Install Nautilus</a>
       </div>
       <div class="art">
@@ -47,17 +47,27 @@
           </article>
           <article>
             <h3>Pod VMs</h3>
-            <p>On a KVM node with the <code>vm</code> handler enabled, run BusyBox inside its own Linux guest and print the guest kernel version.</p>
+            <p>On a KVM node with <a href="#pod-vms">Pod VM support</a> enabled, run an OCI image in a dedicated Linux guest and print the guest kernel version.</p>
             <pre><code>sudo nautilus run --rm --runtime vm busybox:1.36 uname -r</code></pre>
           </article>
         </div>
       </div>
     </section>
+    <section class="docs wrap" id="pod-vms" aria-labelledby="pod-vm-title">
+      <div>
+        <h2 id="pod-vm-title">Pod VM support</h2>
+        <p class="lead">Give each Pod its own Linux guest. Containers in a Pod share the guest kernel and network, and repeated tool calls can work in the same workspace.</p>
+      </div>
+      <ul>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/VM_RUNTIMECLASS.md">Enable Pod VMs</a><span>The experimental VM handler is opt-in on Linux KVM nodes. Set up Cloud Hypervisor, virtiofsd and the guest boot files, then use <code>--runtime vm</code> in the CLI or <code>runtimeClassName: nautilus-vm</code> in Kubernetes.</span></li>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/CRITEST_RESULTS.md#2026-11-24-真实-kubelet-和-runtimeclass">Kubernetes acceptance tests</a><span>Kubelet tests covered exec, attach, logs and port forwarding. Running guests kept their boot IDs and Pod IPs across a daemon restart.</span></li>
+        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/VM_AGENT_LOOP.md#oci-rootfs-快照复用-ab">Pod VM benchmarks</a><span>On supported nodes, containers reuse a read-only OCI image snapshot and keep private writable layers. In a single-node test with a pre-pulled Node.js image and 16 concurrent Pods, snapshot reuse reduced P95 time from starting a new Pod sandbox to the first successful exec from 9.90 s to 5.62 s.</span></li>
+      </ul>
+    </section>
     <section class="docs wrap" id="docs" aria-labelledby="docs-title">
       <h2 id="docs-title">Project documentation</h2>
       <ul>
         <li><a href="https://github.com/nautilus-runtime/nautilus#quick-start">Quick start</a><span>Install a release or build from source.</span></li>
-        <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/VM_RUNTIMECLASS.md">Pod VM setup</a><span>Configure Cloud Hypervisor and virtiofsd, then select the VM RuntimeClass.</span></li>
         <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/ARCHITECTURE.md">Architecture</a><span>Follow a CRI request through the runtime.</span></li>
         <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/CRITEST_RESULTS.md">CRI test results</a><span>The November 26, 2026 cri-tools v1.37.0 run passed 107 tests, failed none, and skipped 35.</span></li>
         <li><a href="https://github.com/nautilus-runtime/nautilus/blob/main/docs/DEVELOPMENT_ROADMAP.md">Roadmap</a><span>See verified runtime behavior and the CRI work still in progress.</span></li>
